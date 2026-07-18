@@ -1,0 +1,54 @@
+[workspace]
+members = [
+    "crates/harness-core",
+    "crates/harness-responses-api",
+    "crates/harness-tui",
+    "crates/harness-cli",
+    "crates/harness-web",
+    "crates/harness-fuzz",
+    "crates/token_inspector",
+]
+resolver = "2"
+
+[profile.release]
+panic = "abort"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+publish = false
+version = "0.1.0"
+
+[workspace.dependencies]
+anyhow = "1"
+bytes = "1"
+crossfire = { version = "3.1.16", features = ["tokio"] }
+crossterm = { version = "0.28", features = ["event-stream"] }
+futures-util = "0.3"
+harness-core = { path = "crates/harness-core" }
+harness-web = { path = "crates/harness-web" }
+fff_search = { package = "fff-search", git = "https://github.com/dmtrkovalenko/fff" }
+harness-responses-api = { path = "crates/harness-responses-api" }
+harness-tui = { path = "crates/harness-tui" }
+http = "1"
+http-body-util = "0.1"
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "tls12", "webpki-roots"] }
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "http1", "tokio"] }
+libc = "0.2"
+ratatui = "0.29"
+object = { version = "0.36", default-features = false, features = ["elf", "read_core", "std"] }
+postcard = { version = "1", features = ["alloc"] }
+portable-pty = "0.9.0"
+criterion = "0.5"
+serde = { version = "1", features = ["derive"] }
+sonic-rs = "0.5.8"
+syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
+thiserror = "2"
+tiktoken-rs = "0.12.0"
+tokio = { version = "1", features = ["fs", "macros", "net", "rt", "sync", "time"] }
+tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
+unicode-segmentation = "1"
+unicode-width = "0.2"
+url = "2"
+zstd = "0.13"

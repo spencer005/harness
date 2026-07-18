@@ -1,0 +1,27 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Frontend files
+/frontend/
+
+.harness
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+*.data
+
+# Editor and IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db

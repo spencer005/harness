@@ -1,0 +1,27 @@
+[package]
+name = "harness-fuzz"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "harness-fuzz"
+path = "src/main.rs"
+
+[dependencies]
+harness-core.workspace = true
+harness-responses-api.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper-rustls.workspace = true
+hyper-util.workspace = true
+serde.workspace = true
+serde_json = "1"
+sonic-rs.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+url.workspace = true

@@ -1,0 +1,23 @@
+[package]
+name = "harness-web"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "harness-web"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+harness-core.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+serde.workspace = true
+sonic-rs.workspace = true
+thiserror.workspace = true
+tokio.workspace = true

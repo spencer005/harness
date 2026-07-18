@@ -1,0 +1,21 @@
+[package]
+name = "harness-cli"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "new_harness"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+harness-core.workspace = true
+harness-tui.workspace = true
+http.workspace = true
+libc.workspace = true
+serde.workspace = true
+sonic-rs.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
