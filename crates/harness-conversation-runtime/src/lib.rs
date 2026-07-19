@@ -10,18 +10,23 @@ use std::{
 };
 
 use harness_model_api::{
-    ModelAttempt, ModelEvent, ModelRequest, ModelSelection, ModelTerminalOutcome, ModelTransport,
-    ResolvedModelRoute,
+    ModelAttempt, ModelCancellation, ModelEvent, ModelFailure, ModelFailureKind, ModelInterruption,
+    ModelRequest, ModelSelection, ModelTerminalOutcome, ModelTransport, ResolvedModelRoute,
 };
 
-use harness_runtime_api::{RuntimeCommand, RuntimeEvent};
-use harness_session_store::{
-    AppendReceipt, Durability, SessionPayload, SessionStore, SessionStoreError, SessionWriter,
-    TurnOutcome,
+use harness_runtime_api::{
+    MessageRole, RuntimeCommand, RuntimeEvent, TranscriptPayload, TranscriptSnapshotEntry,
 };
-use harness_tool_api::{ToolExecutor, ToolRegistry};
+use harness_session_store::{
+    AppendReceipt, Durability, PageSize, SessionPayload, SessionStore, SessionStoreError,
+    SessionWriter, TranscriptPage as StoredTranscriptPage, TurnOutcome,
+};
+use harness_tool_api::{
+    ToolExecutionId, ToolExecutionPolicy, ToolExecutionRequest, ToolExecutor, ToolFailure, ToolName,
+    ToolRegistry,
+};
 use thiserror::Error;
-use tokio::task::JoinHandle;
+use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 
@@ -88,9 +93,17 @@ pub enum ConversationPhase {
     /// A tool call is being committed before execution.
     PersistingToolCall { turn_id: u64, call_id: String },
     /// A tool is executing outside the reducer.
-    ExecutingTool { turn_id: u64, execution_id: u64 },
+    ExecutingTool {
+        turn_id: u64,
+        execution_id: u64,
+        call_id: String,
+    },
     /// A tool result is being committed.
-    PersistingToolResult { turn_id: u64, execution_id: u64 },
+    PersistingToolResult {
+        turn_id: u64,
+        execution_id: u64,
+        call_id: String,
+    },
     /// Continuation request is being prepared.
     PreparingContinuation { turn_id: u64 },
     /// Active model work is being cancelled.
@@ -163,7 +176,7 @@ impl ActiveModelAttempt {
 }
 
 /// Purpose assigned to every supervised asynchronous job.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum JobPurpose {
     /// Root model attempt.
     RootModelAttempt { attempt_id: u64 },
@@ -182,6 +195,8 @@ pub enum JobPurpose {
 pub enum JobCompletion {
     /// Model event from a registered attempt.
     ModelEvent {
+        /// Turn identity.
+        turn_id: u64,
         /// Attempt identity.
         attempt_id: u64,
         /// Provider event.
@@ -189,12 +204,16 @@ pub enum JobCompletion {
     },
     /// Tool execution result.
     ToolResult {
+        /// Turn identity.
+        turn_id: u64,
         /// Execution identity.
         execution_id: u64,
+        /// Model tool-call identity.
+        call_id: String,
         /// Result or failure.
         result: Result<harness_tool_api::ToolResult, harness_tool_api::ToolFailure>,
     },
-    /// A job completes without a payload.
+    /// A job completes after sending every payload.
     Finished {
         /// Job purpose.
         purpose: JobPurpose,
@@ -204,12 +223,11 @@ pub enum JobCompletion {
 /// Registry of every asynchronous job owned by the runtime.
 #[derive(Debug, Default)]
 pub struct JobRegistry {
-    jobs: BTreeMap<u64, SupervisedJob>,
+    jobs: BTreeMap<JobPurpose, SupervisedJob>,
 }
 
 #[derive(Debug)]
 struct SupervisedJob {
-    purpose: JobPurpose,
     cancellation: CancellationToken,
     handle: JoinHandle<()>,
 }
@@ -220,21 +238,19 @@ impl JobRegistry {
         Self::default()
     }
 
-    /// Registers a job and rejects duplicate identities.
+    /// Registers a job and rejects duplicate purposes.
     pub fn register(
         &mut self,
-        job_id: u64,
         purpose: JobPurpose,
         cancellation: CancellationToken,
         handle: JoinHandle<()>,
     ) -> Result<(), RuntimeError> {
-        if self.jobs.contains_key(&job_id) {
+        if self.jobs.contains_key(&purpose) {
             return Err(RuntimeError::DuplicateJob);
         }
         self.jobs.insert(
-            job_id,
+            purpose,
             SupervisedJob {
-                purpose,
                 cancellation,
                 handle,
             },
@@ -249,23 +265,25 @@ impl JobRegistry {
         }
     }
 
+    /// Requests cancellation for one registered job.
+    pub fn cancel(&self, purpose: JobPurpose) -> Result<(), RuntimeError> {
+        self.jobs
+            .get(&purpose)
+            .ok_or(RuntimeError::UnknownJob)?
+            .cancellation
+            .cancel();
+        Ok(())
+    }
+
     /// Returns whether every supervised job has been retired or joined.
     pub fn is_empty(&self) -> bool {
         self.jobs.is_empty()
     }
 
-    /// Returns the purpose of a registered job.
-    pub fn purpose(&self, job_id: u64) -> Result<JobPurpose, RuntimeError> {
-        self.jobs
-            .get(&job_id)
-            .map(|job| job.purpose)
-            .ok_or(RuntimeError::UnknownJob)
-    }
-
     /// Removes a completed job exactly once.
-    pub fn retire(&mut self, job_id: u64) -> Result<JoinHandle<()>, RuntimeError> {
+    pub fn retire(&mut self, purpose: JobPurpose) -> Result<JoinHandle<()>, RuntimeError> {
         self.jobs
-            .remove(&job_id)
+            .remove(&purpose)
             .map(|job| job.handle)
             .ok_or(RuntimeError::UnknownJob)
     }
@@ -326,6 +344,9 @@ pub struct ConversationRuntime {
     writer: Option<RuntimeSessionWriter>,
     canonical_history: Vec<SessionPayload>,
     transient_assistant: String,
+    pending_tool_inputs: BTreeMap<String, String>,
+    pending_tool_calls: Vec<harness_model_api::ToolCall>,
+    active_tool_call: Option<harness_model_api::ToolCall>,
     next_execution_id: u64,
     persist_state: PersistState,
     queued_steering: Vec<String>,
@@ -356,6 +377,9 @@ impl ConversationRuntime {
             writer: None,
             canonical_history: Vec::new(),
             transient_assistant: String::new(),
+            pending_tool_inputs: BTreeMap::new(),
+            pending_tool_calls: Vec::new(),
+            active_tool_call: None,
             next_turn_id: 1,
             next_execution_id: 1,
             persist_state: PersistState::Disabled,
@@ -503,8 +527,14 @@ impl ConversationRuntime {
 
     /// Persists exact prompt source before changing canonical conversation state.
     pub async fn submit_prompt(&mut self, text: String) -> Result<AppendReceipt, RuntimeError> {
-        if self.lifecycle != RuntimeLifecycle::Ready || self.phase != ConversationPhase::Idle {
+        if self.lifecycle != RuntimeLifecycle::Ready {
+            return Err(RuntimeError::InvalidLifecycle);
+        }
+        if self.phase != ConversationPhase::Idle {
             return Err(RuntimeError::InvalidPhase);
+        }
+        if text.is_empty() {
+            return Err(RuntimeError::EmptyCommandText);
         }
 
         let turn_id = self.next_turn_id;
@@ -562,14 +592,30 @@ impl ConversationRuntime {
             turn_id,
             attempt_id,
         }];
+        let mut request_history = Vec::with_capacity(self.canonical_history.len() + records.len());
+        request_history.extend_from_slice(&self.canonical_history);
+        request_history.extend_from_slice(&records);
 
-        let result = self
+        let request = self.configuration.ports.request_builder.build(
+            next_revision,
+            &self.configuration.model,
+            &request_history,
+            &self.queued_steering,
+        )?;
+        if request.provider_generation != self.configuration.ports.model_route.generation {
+            return Err(RuntimeError::ProviderGenerationMismatch);
+        }
+        if request.history_revision != next_revision {
+            return Err(RuntimeError::RequestRevisionMismatch);
+        }
+
+        match self
             .writer
             .as_mut()
             .ok_or(RuntimeError::InvalidLifecycle)?
             .append(&records, Durability::Durable)
-            .await;
-        match result {
+            .await
+        {
             Ok(_) => {}
             Err(error) => {
                 self.phase = ConversationPhase::Failed {
@@ -582,37 +628,8 @@ impl ConversationRuntime {
 
         self.canonical_history.extend(records);
         self.canonical_revision = next_revision;
-
-        let request = match self.configuration.ports.request_builder.build(
-            self.canonical_revision,
-            &self.configuration.model,
-            &self.canonical_history,
-            &self.queued_steering,
-        ) {
-            Ok(request) => request,
-            Err(error) => {
-                self.phase = ConversationPhase::Failed {
-                    turn_id: Some(turn_id),
-                    message: error.to_string(),
-                };
-                return Err(error);
-            }
-        };
-        if request.provider_generation != self.configuration.ports.model_route.generation {
-            self.phase = ConversationPhase::Failed {
-                turn_id: Some(turn_id),
-                message: String::from("model request and route use different generations"),
-            };
-            return Err(RuntimeError::ProviderGenerationMismatch);
-        }
-        if request.history_revision != self.canonical_revision {
-            self.phase = ConversationPhase::Failed {
-                turn_id: Some(turn_id),
-                message: String::from("model request does not match canonical history revision"),
-            };
-            return Err(RuntimeError::RequestRevisionMismatch);
-        }
-
+        self.pending_tool_inputs.clear();
+        self.pending_tool_calls.clear();
         self.take_queued_steering();
         let attempt_id = harness_model_api::ModelAttemptId(attempt_id);
         self.phase = ConversationPhase::AwaitingModel {
@@ -670,6 +687,97 @@ impl ConversationRuntime {
         Ok(())
     }
 
+    /// Applies one typed model event to the active attempt.
+    pub async fn dispatch_model_event(
+        &mut self,
+        turn_id: u64,
+        attempt_id: u64,
+        event: ModelEvent,
+    ) -> Result<Vec<RuntimeEffect>, RuntimeError> {
+        match event {
+            ModelEvent::Started
+                if matches!(
+                    &self.phase,
+                    ConversationPhase::Streaming {
+                        turn_id: active_turn,
+                        attempt_id: active_attempt,
+                    } if *active_turn == turn_id && *active_attempt == attempt_id
+                ) =>
+            {
+                Err(RuntimeError::DuplicateModelStart)
+            }
+            ModelEvent::Started => {
+                self.begin_streaming(turn_id, attempt_id)?;
+                Ok(vec![RuntimeEffect::Emit(RuntimeEvent::ResponseStarted)])
+            }
+            ModelEvent::AssistantTextDelta(delta) => {
+                self.record_assistant_delta(turn_id, attempt_id, delta.clone())?;
+                Ok(vec![RuntimeEffect::Emit(RuntimeEvent::AssistantTextDelta(
+                    delta,
+                ))])
+            }
+            ModelEvent::ToolInputDelta(delta) => {
+                self.ensure_streaming_attempt(turn_id, attempt_id)?;
+                self.pending_tool_inputs
+                    .entry(delta.call_id)
+                    .or_default()
+                    .push_str(&delta.fragment);
+                Ok(Vec::new())
+            }
+            ModelEvent::ToolCall(call) => {
+                self.ensure_streaming_attempt(turn_id, attempt_id)?;
+                if self
+                    .pending_tool_calls
+                    .iter()
+                    .any(|pending| pending.call_id == call.call_id)
+                {
+                    return Err(RuntimeError::DuplicateToolCall);
+                }
+                self.pending_tool_inputs.remove(&call.call_id);
+                self.pending_tool_calls.push(call);
+                Ok(Vec::new())
+            }
+            ModelEvent::Metadata(_) | ModelEvent::Usage(_) => {
+                self.ensure_streaming_attempt(turn_id, attempt_id)?;
+                Ok(Vec::new())
+            }
+            ModelEvent::Terminal(_) if !self.pending_tool_inputs.is_empty() => {
+                Err(RuntimeError::IncompleteToolInput)
+            }
+            ModelEvent::Terminal(outcome) => {
+                self.finish_model_attempt(turn_id, attempt_id, outcome.clone())
+                    .await?;
+                Ok(vec![RuntimeEffect::Emit(RuntimeEvent::ResponseFinished(
+                    outcome,
+                ))])
+            }
+        }
+    }
+
+    fn ensure_streaming_attempt(
+        &mut self,
+        turn_id: u64,
+        attempt_id: u64,
+    ) -> Result<(), RuntimeError> {
+        match &self.phase {
+            ConversationPhase::AwaitingModel {
+                turn_id: active_turn,
+                attempt_id: active_attempt,
+            } if *active_turn == turn_id && *active_attempt == attempt_id => {
+                self.phase = ConversationPhase::Streaming {
+                    turn_id,
+                    attempt_id,
+                };
+                Ok(())
+            }
+            ConversationPhase::Streaming {
+                turn_id: active_turn,
+                attempt_id: active_attempt,
+            } if *active_turn == turn_id && *active_attempt == attempt_id => Ok(()),
+            _ => Err(RuntimeError::InvalidPhase),
+        }
+    }
+
     /// Persists the accumulated assistant text before allowing continuation.
     pub async fn commit_assistant(
         &mut self,
@@ -689,16 +797,10 @@ impl ConversationRuntime {
             .canonical_revision
             .checked_add(1)
             .ok_or(RuntimeError::IdExhausted)?;
-        let records = vec![
-            SessionPayload::AssistantMessage {
-                turn_id,
-                text: self.transient_assistant.clone(),
-            },
-            SessionPayload::TurnFinished {
-                turn_id,
-                outcome: TurnOutcome::Completed,
-            },
-        ];
+        let records = vec![SessionPayload::AssistantMessage {
+            turn_id,
+            text: self.transient_assistant.clone(),
+        }];
         self.phase = ConversationPhase::PersistingAssistant {
             turn_id,
             attempt_id,
@@ -723,18 +825,51 @@ impl ConversationRuntime {
         self.canonical_history.extend(records);
         self.canonical_revision = next_revision;
         self.transient_assistant.clear();
+        self.pending_interrupt = None;
         self.phase = ConversationPhase::PreparingContinuation { turn_id };
         Ok(receipt)
     }
 
-    /// Completes durable assistant handling and returns to idle for continuation.
-    pub fn prepare_continuation(&mut self, turn_id: u64) -> Result<(), RuntimeError> {
+    /// Persists turn completion after assistant and tool work finish.
+    pub async fn complete_turn(
+        &mut self,
+        turn_id: u64,
+    ) -> Result<AppendReceipt, RuntimeError> {
         if self.phase != (ConversationPhase::PreparingContinuation { turn_id }) {
             return Err(RuntimeError::InvalidPhase);
         }
-
-        self.phase = ConversationPhase::Idle;
-        Ok(())
+        if !self.pending_tool_calls.is_empty() {
+            return Err(RuntimeError::PendingToolCalls);
+        }
+        let next_revision = self
+            .canonical_revision
+            .checked_add(1)
+            .ok_or(RuntimeError::IdExhausted)?;
+        let records = vec![SessionPayload::TurnFinished {
+            turn_id,
+            outcome: TurnOutcome::Completed,
+        }];
+        match self
+            .writer
+            .as_mut()
+            .ok_or(RuntimeError::InvalidLifecycle)?
+            .append(&records, Durability::Durable)
+            .await
+        {
+            Ok(receipt) => {
+                self.canonical_history.extend(records);
+                self.canonical_revision = next_revision;
+                self.phase = ConversationPhase::Idle;
+                Ok(receipt)
+            }
+            Err(error) => {
+                self.phase = ConversationPhase::Failed {
+                    turn_id: Some(turn_id),
+                    message: error.to_string(),
+                };
+                Err(error.into())
+            }
+        }
     }
 
     /// Requests cancellation for the active model attempt.
@@ -756,6 +891,7 @@ impl ConversationRuntime {
             }
             _ => Err(RuntimeError::InvalidPhase),
         }
+    }
 
     /// Persists a terminal non-completion outcome before returning to idle.
     pub async fn finish_model_attempt(
@@ -766,10 +902,14 @@ impl ConversationRuntime {
     ) -> Result<(), RuntimeError> {
         let active = matches!(
             &self.phase,
-            ConversationPhase::Streaming {
+            ConversationPhase::AwaitingModel {
                 turn_id: active_turn,
                 attempt_id: active_attempt,
             }
+                | ConversationPhase::Streaming {
+                    turn_id: active_turn,
+                    attempt_id: active_attempt,
+                }
                 | ConversationPhase::Cancelling {
                     turn_id: active_turn,
                     attempt_id: active_attempt,
@@ -832,9 +972,9 @@ impl ConversationRuntime {
         self.canonical_history.extend(records);
         self.canonical_revision = next_revision;
         self.transient_assistant.clear();
+        self.pending_interrupt = None;
         self.phase = ConversationPhase::Idle;
         Ok(())
-    }
     }
 
     /// Returns the explicit persist-mode state.
@@ -881,10 +1021,24 @@ impl ConversationRuntime {
                 if self.lifecycle != RuntimeLifecycle::Ready {
                     return Err(RuntimeError::InvalidLifecycle);
                 }
+                if text.is_empty() {
+                    return Err(RuntimeError::EmptyCommandText);
+                }
+                if !matches!(
+                    &self.phase,
+                    ConversationPhase::AwaitingModel { .. }
+                        | ConversationPhase::Streaming { .. }
+                        | ConversationPhase::PreparingContinuation { .. }
+                ) {
+                    return Err(RuntimeError::InvalidPhase);
+                }
                 self.queued_steering.push(text);
                 Ok(Vec::new())
             }
             RuntimeCommand::Interrupt { text } => {
+                if text.is_empty() {
+                    return Err(RuntimeError::EmptyCommandText);
+                }
                 let (turn_id, attempt_id) = match &self.phase {
                     ConversationPhase::AwaitingModel {
                         turn_id,
@@ -904,14 +1058,24 @@ impl ConversationRuntime {
                 if self.lifecycle != RuntimeLifecycle::Ready {
                     return Err(RuntimeError::InvalidLifecycle);
                 }
+                if self.phase != ConversationPhase::Idle {
+                    return Err(RuntimeError::InvalidPhase);
+                }
+                if self.configuration.ports.model_route.selection != selection {
+                    return Err(RuntimeError::ModelRouteSelectionMismatch);
+                }
                 self.configuration.model = selection;
                 Ok(Vec::new())
             }
-            RuntimeCommand::LoadOlderTranscript { .. } => {
+            RuntimeCommand::LoadOlderTranscript { before_sequence } => {
                 if self.lifecycle != RuntimeLifecycle::Ready {
                     return Err(RuntimeError::InvalidLifecycle);
                 }
-                Ok(Vec::new())
+                Ok(vec![RuntimeEffect::LoadTranscriptPage {
+                    session_id: self.configuration.session_id.clone(),
+                    before_sequence,
+                    page_size: PageSize::DEFAULT,
+                }])
             }
             RuntimeCommand::Shutdown => {
                 self.begin_shutdown()?;
@@ -922,17 +1086,24 @@ impl ConversationRuntime {
     }
 
 
-    /// Persists a tool call before allowing its executor to run.
-    pub async fn accept_tool_call(
+    /// Persists the next queued tool call before allowing its executor to run.
+    pub async fn accept_next_tool_call(
         &mut self,
         turn_id: u64,
-        call_id: String,
-        name: String,
-        input: String,
     ) -> Result<AppendReceipt, RuntimeError> {
         if self.phase != (ConversationPhase::PreparingContinuation { turn_id }) {
             return Err(RuntimeError::InvalidPhase);
         }
+        let call = self
+            .pending_tool_calls
+            .first()
+            .ok_or(RuntimeError::NoPendingToolCall)?
+            .clone();
+        let tool = ToolName::new(call.name.clone()).map_err(|_| RuntimeError::UnknownTool)?;
+        if self.configuration.ports.tool_registry.get(&tool).is_none() {
+            return Err(RuntimeError::UnknownTool);
+        }
+        let call_id = call.call_id.clone();
 
         let execution_id = self.next_execution_id;
         self.next_execution_id = execution_id
@@ -947,8 +1118,8 @@ impl ConversationRuntime {
             SessionPayload::ToolCallAccepted {
                 turn_id,
                 call_id: call_id.clone(),
-                name,
-                input,
+                name: call.name.clone(),
+                input: call.input.as_str().to_owned(),
             },
             SessionPayload::ToolExecutionStarted {
                 turn_id,
@@ -957,7 +1128,7 @@ impl ConversationRuntime {
         ];
         self.phase = ConversationPhase::PersistingToolCall {
             turn_id,
-            call_id,
+            call_id: call_id.clone(),
         };
         let receipt = match self
             .writer
@@ -977,11 +1148,39 @@ impl ConversationRuntime {
         };
         self.canonical_history.extend(records);
         self.canonical_revision = next_revision;
+        self.pending_tool_calls.remove(0);
+        self.active_tool_call = Some(call);
         self.phase = ConversationPhase::ExecutingTool {
             turn_id,
             execution_id,
+            call_id,
         };
         Ok(receipt)
+    }
+
+    /// Builds an execution request for the durably accepted active tool call.
+    pub fn active_tool_execution_request(
+        &self,
+        policy: ToolExecutionPolicy,
+    ) -> Result<ToolExecutionRequest, RuntimeError> {
+        let execution_id = match &self.phase {
+            ConversationPhase::ExecutingTool { execution_id, .. } => *execution_id,
+            _ => return Err(RuntimeError::InvalidPhase),
+        };
+        let call = self
+            .active_tool_call
+            .as_ref()
+            .ok_or(RuntimeError::InvalidPhase)?;
+        let tool = ToolName::new(call.name.clone()).map_err(|_| RuntimeError::UnknownTool)?;
+        if self.configuration.ports.tool_registry.get(&tool).is_none() {
+            return Err(RuntimeError::UnknownTool);
+        }
+        Ok(ToolExecutionRequest {
+            execution_id: ToolExecutionId(execution_id),
+            tool,
+            input: call.input.clone(),
+            policy,
+        })
     }
 
     /// Persists a tool result before allowing a continuation request.
@@ -996,6 +1195,7 @@ impl ConversationRuntime {
             != (ConversationPhase::ExecutingTool {
                 turn_id,
                 execution_id,
+                call_id: call_id.clone(),
             })
         {
             return Err(RuntimeError::InvalidPhase);
@@ -1007,12 +1207,13 @@ impl ConversationRuntime {
             .ok_or(RuntimeError::IdExhausted)?;
         let records = vec![SessionPayload::ToolExecutionFinished {
             turn_id,
-            call_id,
+            call_id: call_id.clone(),
             output,
         }];
         self.phase = ConversationPhase::PersistingToolResult {
             turn_id,
             execution_id,
+            call_id,
         };
         let receipt = match self
             .writer
@@ -1032,8 +1233,52 @@ impl ConversationRuntime {
         };
         self.canonical_history.extend(records);
         self.canonical_revision = next_revision;
+        self.active_tool_call = None;
         self.phase = ConversationPhase::PreparingContinuation { turn_id };
         Ok(receipt)
+    }
+
+    /// Projects one persisted page into exactly representable frontend entries.
+    pub fn apply_transcript_page(&self, page: StoredTranscriptPage) -> RuntimeEffect {
+        let entries = page
+            .entries
+            .into_iter()
+            .filter_map(|record| {
+                let payload = match record.payload {
+                    SessionPayload::InputMessage { text, .. } => TranscriptPayload::Message {
+                        role: MessageRole::User,
+                        text,
+                    },
+                    SessionPayload::AssistantMessage { text, .. } => TranscriptPayload::Message {
+                        role: MessageRole::Assistant,
+                        text,
+                    },
+                    SessionPayload::ToolExecutionFinished {
+                        call_id, output, ..
+                    } => TranscriptPayload::ToolResult { call_id, output },
+                    SessionPayload::Metadata(_)
+                    | SessionPayload::ProviderBinding(_)
+                    | SessionPayload::TurnStarted { .. }
+                    | SessionPayload::ModelAttemptStarted { .. }
+                    | SessionPayload::ToolCallAccepted { .. }
+                    | SessionPayload::ToolExecutionStarted { .. }
+                    | SessionPayload::TurnFinished { .. }
+                    | SessionPayload::SessionClosed => return None,
+                };
+                Some(TranscriptSnapshotEntry {
+                    sequence: Some(record.sequence),
+                    payload,
+                })
+            })
+            .collect();
+
+        RuntimeEffect::Emit(RuntimeEvent::TranscriptPageLoaded(
+            harness_runtime_api::TranscriptPage {
+                entries,
+                next_before_sequence: page.next_before,
+                reached_start: page.reached_start,
+            },
+        ))
     }
 
     pub fn canonical_history(&self) -> &[SessionPayload] {
@@ -1072,6 +1317,12 @@ impl ConversationRuntime {
     pub fn take_pending_interrupt(&mut self) -> Option<String> {
         self.pending_interrupt.take()
     }
+
+    /// Returns partial tool inputs retained for active model calls.
+    pub fn pending_tool_inputs(&self) -> &BTreeMap<String, String> {
+        &self.pending_tool_inputs
+    }
+
 
     /// Returns the canonical history revision used by compaction and model requests.
     pub fn canonical_revision(&self) -> u64 {
@@ -1163,6 +1414,30 @@ pub enum RuntimeError {
     /// A model request does not represent the current canonical revision.
     #[error("model request does not match the canonical history revision")]
     RequestRevisionMismatch,
+    /// A terminal event arrives while tool input remains incomplete.
+    #[error("model stream ended with incomplete tool input")]
+    IncompleteToolInput,
+    /// A model attempt emits the same completed tool call more than once.
+    #[error("model attempt emitted a duplicate completed tool call")]
+    DuplicateToolCall,
+    /// A continuation cannot return idle while completed tool calls remain.
+    #[error("completed tool calls remain pending")]
+    PendingToolCalls,
+    /// No completed tool call is available for durable acceptance.
+    #[error("no completed tool call is pending")]
+    NoPendingToolCall,
+    /// A model requests a tool that is not registered.
+    #[error("model requested an unknown tool")]
+    UnknownTool,
+    /// A selected model does not match the configured provider route.
+    #[error("selected model does not match the configured provider route")]
+    ModelRouteSelectionMismatch,
+    /// A prompt, steering command, or interrupt contains no text.
+    #[error("runtime command text is empty")]
+    EmptyCommandText,
+    /// A model attempt emits more than one start event.
+    #[error("model attempt emitted a duplicate start event")]
+    DuplicateModelStart,
 }
 
 /// Port that builds immutable model requests from canonical state.
@@ -1193,6 +1468,15 @@ pub enum RuntimeEffect {
         attempt: Arc<ModelAttempt>,
         /// Route selected for this attempt.
         route: ResolvedModelRoute,
+    },
+    /// Loads one older transcript page outside the reducer.
+    LoadTranscriptPage {
+        /// Session to query.
+        session_id: harness_session_store::SessionId,
+        /// Exclusive sequence cursor.
+        before_sequence: Option<u64>,
+        /// Bounded page size.
+        page_size: PageSize,
     },
     /// Emit one frontend event.
     Emit(RuntimeEvent),

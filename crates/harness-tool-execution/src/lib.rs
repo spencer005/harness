@@ -60,6 +60,7 @@ impl WorkspaceRoot {
         }
         Ok(WorkspaceRelativePath { value })
     }
+}
 
 /// Validated path relative to one workspace capability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,9 +68,9 @@ pub struct WorkspaceRelativePath<'a> {
     value: &'a str,
 }
 
-impl WorkspaceRelativePath<'_> {
+impl<'a> WorkspaceRelativePath<'a> {
     /// Returns the validated relative path.
-    pub fn as_str(self) -> &'_ str {
+    pub fn as_str(&self) -> &'a str {
         self.value
     }
 }
@@ -142,9 +143,9 @@ pub struct OutputRing {
 
 impl OutputRing {
     /// Creates a bounded output ring.
-    pub fn new(capacity: usize) -> Result<Self, OutputRingError> {
+    pub fn new(capacity: usize) -> Result<Self, PtyError> {
         if capacity == 0 {
-            return Err(OutputRingError::ZeroCapacity);
+            return Err(PtyError::ZeroCapacity);
         }
         Ok(Self {
             capacity,

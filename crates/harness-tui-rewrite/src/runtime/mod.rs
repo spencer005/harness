@@ -11,7 +11,7 @@ use crossterm::event::{
 use futures_util::StreamExt;
 use harness_core::{
     UiSnapshot,
-    actors::{ActorHandle, ActorReceiver, RuntimeCommand, RuntimeEvent},
+    actors::{ActorHandle, ActorReceiver, ActorSendError, RuntimeCommand, RuntimeEvent},
 };
 
 use crate::{
@@ -78,7 +78,7 @@ pub async fn run_with_runtime(
                 },
             };
 
-            if !execute_effects(&mut application, &mut terminal, &commands, effects).await? {
+            if !execute_effects(&mut application, &mut terminal, &commands, effects)? {
                 break;
             }
         }
@@ -402,7 +402,7 @@ fn flush_assistant_delta(application: &mut Application, pending_delta: &mut Opti
     }
 }
 
-async fn execute_effects(
+fn execute_effects(
     application: &mut Application,
     terminal: &mut TerminalSession,
     commands: &ActorHandle<RuntimeCommand>,
@@ -413,22 +413,20 @@ async fn execute_effects(
             AppEffect::Runtime {
                 request,
                 completion,
-            } => {
-                match commands
-                    .send(adapter::export_runtime_request(request))
-                    .await
-                {
-                    Ok(()) => application.delivery_accepted(completion),
-                    Err(error) => {
-                        application.delivery_failed(
-                            completion,
-                            format!("runtime command delivery failed: {error}"),
-                        );
-                        application.runtime_disconnected();
-                        return Ok(false);
-                    }
+            } => match commands.try_send(adapter::export_runtime_request(request)) {
+                Ok(()) => application.delivery_accepted(completion),
+                Err(ActorSendError::Full) => {
+                    application.delivery_failed(completion, "runtime command mailbox is full");
                 }
-            }
+                Err(ActorSendError::Closed) => {
+                    application.delivery_failed(
+                        completion,
+                        "runtime command delivery failed: actor mailbox closed",
+                    );
+                    application.runtime_disconnected();
+                    return Ok(false);
+                }
+            },
             AppEffect::Clipboard(text) => terminal.copy_to_clipboard(&text)?,
         }
     }

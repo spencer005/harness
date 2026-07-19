@@ -25,3 +25,5 @@
 # OS files
 .DS_Store
 Thumbs.db
+
+dhat_heap.json

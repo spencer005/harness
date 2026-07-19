@@ -39,6 +39,9 @@ pub type SessionSequence = u64;
 pub struct PageSize(u32);
 
 impl PageSize {
+    /// Default bounded transcript page size.
+    pub const DEFAULT: Self = Self(100);
+
     /// Creates a nonzero page size.
     pub fn new(value: u32) -> Result<Self, InvalidPageSize> {
         if value == 0 {

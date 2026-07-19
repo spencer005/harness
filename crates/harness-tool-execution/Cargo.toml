@@ -2,7 +2,6 @@
 name = "harness-tool-execution"
 edition.workspace = true
 license.workspace = true
-publish.workspace = false
 version.workspace = true
 
 [dependencies]

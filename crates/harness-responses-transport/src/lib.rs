@@ -149,6 +149,7 @@ where
             receiver,
             cancellation,
             attempt_id,
+            terminal_seen: false,
         })
     }
 

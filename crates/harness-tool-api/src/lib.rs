@@ -82,6 +82,15 @@ pub enum ToolInput {
     /// Serialized function arguments.
     FunctionJson(String),
 }
+impl ToolInput {
+    /// Returns the exact model-provided input representation.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Freeform(input) | Self::FunctionJson(input) => input,
+        }
+    }
+}
+
 
 /// Identifier that correlates a tool call with its result.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]

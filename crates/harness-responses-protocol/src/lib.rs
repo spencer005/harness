@@ -86,7 +86,8 @@ impl SseDecoder {
         if line.is_empty() {
             if !self.data.is_empty() {
                 let data = std::mem::take(&mut self.data);
-                let data = String::from_utf8(data).map_err(SseDecodeError::InvalidUtf8)?;
+                let data = String::from_utf8(data)
+                    .map_err(|error| SseDecodeError::InvalidUtf8(error.utf8_error()))?;
                 events.push(SseEvent { data });
             }
             return Ok(());

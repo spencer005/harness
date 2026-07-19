@@ -2,10 +2,19 @@
 members = [
     "crates/harness-core",
     "crates/harness-responses-api",
-    "crates/harness-tui",
+    "crates/harness-tui-rewrite",
+    "crates/harness-tool-api",
+    "crates/harness-model-api",
+    "crates/harness-runtime-api",
+    "crates/harness-responses-protocol",
+    "crates/harness-session-store",
+    "crates/harness-conversation-runtime",
+    "crates/harness-provider",
+    "crates/harness-responses-transport",
+    "crates/harness-session-service",
+    "crates/harness-tool-execution",
     "crates/harness-cli",
     "crates/harness-web",
-    "crates/harness-fuzz",
     "crates/token_inspector",
 ]
 resolver = "2"
@@ -24,12 +33,28 @@ anyhow = "1"
 bytes = "1"
 crossfire = { version = "3.1.16", features = ["tokio"] }
 crossterm = { version = "0.28", features = ["event-stream"] }
-futures-util = "0.3"
 harness-core = { path = "crates/harness-core" }
 harness-web = { path = "crates/harness-web" }
 fff_search = { package = "fff-search", git = "https://github.com/dmtrkovalenko/fff" }
 harness-responses-api = { path = "crates/harness-responses-api" }
-harness-tui = { path = "crates/harness-tui" }
+harness-tui-rewrite = { path = "crates/harness-tui-rewrite" }
+harness-tool-api = { path = "crates/harness-tool-api" }
+harness-model-api = { path = "crates/harness-model-api" }
+harness-runtime-api = { path = "crates/harness-runtime-api" }
+harness-responses-protocol = { path = "crates/harness-responses-protocol" }
+harness-session-store = { path = "crates/harness-session-store" }
+harness-conversation-runtime = { path = "crates/harness-conversation-runtime" }
+harness-provider = { path = "crates/harness-provider" }
+harness-responses-transport = { path = "crates/harness-responses-transport" }
+harness-session-service = { path = "crates/harness-session-service" }
+harness-tool-execution = { path = "crates/harness-tool-execution" }
+
+
+
+
+futures-util = "0.3"
+tokio-util = { version = "0.7", features = ["rt"] }
+
 http = "1"
 http-body-util = "0.1"
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "tls12", "webpki-roots"] }
@@ -42,6 +67,7 @@ postcard = { version = "1", features = ["alloc"] }
 portable-pty = "0.9.0"
 criterion = "0.5"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 sonic-rs = "0.5.8"
 syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
 thiserror = "2"

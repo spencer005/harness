@@ -33,7 +33,7 @@ pub struct TerminalManager {
 struct TerminalInner {
     next_terminal_id: AtomicI32,
     next_chunk_id: AtomicU64,
-    terminals: Mutex<HashMap<i32, TerminalEntry>>,
+    terminals: Mutex<HashMap<i32, Arc<Mutex<TerminalEntry>>>>,
 }
 
 struct TerminalEntry {
@@ -152,10 +152,11 @@ impl TerminalManager {
         .await
         .map_err(|source| TerminalError::Join { source })?
     }
-    /// Terminate all persistent terminal sessions owned by this manager.
+    /// Terminates all persistent terminal sessions owned by this manager.
     pub fn shutdown(&self) {
         let entries = std::mem::take(&mut *self.inner.terminals.lock().unwrap());
-        for (_, mut entry) in entries {
+        for (_, entry) in entries {
+            let mut entry = entry.lock().unwrap();
             let _ = entry.child.kill();
         }
     }
@@ -234,11 +235,11 @@ impl TerminalManager {
         if exit_code.is_none() {
             self.inner.terminals.lock().unwrap().insert(
                 terminal_id,
-                TerminalEntry {
+                Arc::new(Mutex::new(TerminalEntry {
                     child,
                     writer,
                     output: Arc::clone(&output),
-                },
+                })),
             );
         }
 
@@ -255,26 +256,24 @@ impl TerminalManager {
         let args = parse_terminal_write_args(input)?;
         let submitted_input = submitted_terminal_input(&args.input);
         let chunk_id = self.next_chunk_id();
-        let mut remove_terminal = false;
-        let output = {
-            let mut terminals = self.inner.terminals.lock().unwrap();
-            let entry = terminals
-                .get_mut(&args.terminal_id)
-                .ok_or(TerminalError::MissingTerminal(args.terminal_id))?;
-
+        let terminal = self.terminal(args.terminal_id)?;
+        let (output, remove_terminal) = {
+            let mut entry = terminal.lock().unwrap();
             if let Some(status) = entry.child.try_wait().map_err(|source| TerminalError::Io {
                 context: "failed to poll terminal status".to_string(),
                 source,
             })? {
                 wait_for_reader_flush();
-                remove_terminal = true;
-                TerminalOutput {
-                    chunk_id,
-                    raw_output: consume_output(&entry.output),
-                    echoed_input: None,
-                    terminal_id: None,
-                    exit_code: Some(status.exit_code()),
-                }
+                (
+                    TerminalOutput {
+                        chunk_id,
+                        raw_output: consume_output(&entry.output),
+                        echoed_input: None,
+                        terminal_id: None,
+                        exit_code: Some(status.exit_code()),
+                    },
+                    true,
+                )
             } else {
                 entry
                     .writer
@@ -284,30 +283,29 @@ impl TerminalManager {
                         context: format!("failed to write input for terminal {}", args.terminal_id),
                         source,
                     })?;
+                let output_buffer = Arc::clone(&entry.output);
                 let exit_code = wait_for_terminal_activity(
                     &mut *entry.child,
-                    &entry.output,
+                    &output_buffer,
                     DEFAULT_TERMINAL_ACTIVITY_WAIT,
                 )?;
                 if exit_code.is_some() {
                     wait_for_reader_flush();
-                    remove_terminal = true;
                 }
-                TerminalOutput {
-                    chunk_id,
-                    raw_output: consume_output(&entry.output),
-                    echoed_input: Some(submitted_input),
-                    terminal_id: exit_code.is_none().then_some(args.terminal_id),
-                    exit_code,
-                }
+                (
+                    TerminalOutput {
+                        chunk_id,
+                        raw_output: consume_output(&entry.output),
+                        echoed_input: Some(submitted_input),
+                        terminal_id: exit_code.is_none().then_some(args.terminal_id),
+                        exit_code,
+                    },
+                    exit_code.is_some(),
+                )
             }
         };
         if remove_terminal {
-            self.inner
-                .terminals
-                .lock()
-                .unwrap()
-                .remove(&args.terminal_id);
+            self.remove_terminal(args.terminal_id, &terminal);
         }
         Ok(format_terminal_output(output))
     }
@@ -315,41 +313,56 @@ impl TerminalManager {
     fn terminal_read(&self, input: &str) -> Result<NativeToolExecutionOutput, TerminalError> {
         let args = parse_terminal_read_args(input)?;
         let chunk_id = self.next_chunk_id();
-        let mut remove_terminal = false;
-        let output = {
-            let mut terminals = self.inner.terminals.lock().unwrap();
-            let entry = terminals
-                .get_mut(&args.terminal_id)
-                .ok_or(TerminalError::MissingTerminal(args.terminal_id))?;
-            let terminal_exit_code = match args.poll_after {
+        let terminal = self.terminal(args.terminal_id)?;
+        let (output, remove_terminal) = {
+            let mut entry = terminal.lock().unwrap();
+            let output_buffer = Arc::clone(&entry.output);
+            let exit_code = match args.poll_after {
                 Some(poll_after) => wait_for_poll_interval(&mut *entry.child, poll_after)?,
                 None => wait_for_terminal_activity(
                     &mut *entry.child,
-                    &entry.output,
+                    &output_buffer,
                     DEFAULT_TERMINAL_ACTIVITY_WAIT,
                 )?,
             };
-            if terminal_exit_code.is_some() {
+            if exit_code.is_some() {
                 wait_for_reader_flush();
-                remove_terminal = true;
             }
-            let exit_code = terminal_exit_code;
-            TerminalOutput {
-                chunk_id,
-                raw_output: consume_output(&entry.output),
-                echoed_input: None,
-                terminal_id: terminal_exit_code.is_none().then_some(args.terminal_id),
-                exit_code: exit_code.or(terminal_exit_code),
-            }
+            (
+                TerminalOutput {
+                    chunk_id,
+                    raw_output: consume_output(&entry.output),
+                    echoed_input: None,
+                    terminal_id: exit_code.is_none().then_some(args.terminal_id),
+                    exit_code,
+                },
+                exit_code.is_some(),
+            )
         };
         if remove_terminal {
-            self.inner
-                .terminals
-                .lock()
-                .unwrap()
-                .remove(&args.terminal_id);
+            self.remove_terminal(args.terminal_id, &terminal);
         }
         Ok(format_terminal_output(output))
+    }
+
+    fn terminal(&self, terminal_id: i32) -> Result<Arc<Mutex<TerminalEntry>>, TerminalError> {
+        self.inner
+            .terminals
+            .lock()
+            .unwrap()
+            .get(&terminal_id)
+            .cloned()
+            .ok_or(TerminalError::MissingTerminal(terminal_id))
+    }
+
+    fn remove_terminal(&self, terminal_id: i32, terminal: &Arc<Mutex<TerminalEntry>>) {
+        let mut terminals = self.inner.terminals.lock().unwrap();
+        if terminals
+            .get(&terminal_id)
+            .is_some_and(|active| Arc::ptr_eq(active, terminal))
+        {
+            terminals.remove(&terminal_id);
+        }
     }
 
     fn next_chunk_id(&self) -> String {
