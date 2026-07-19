@@ -1,0 +1,12 @@
+[package]
+name = "harness-responses-protocol"
+edition.workspace = true
+license.workspace = true
+publish.workspace = false
+version.workspace = true
+
+[dependencies]
+harness-model-api.workspace = true
+harness-tool-api.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

@@ -173,7 +173,14 @@ impl From<sonic_rs::Error> for CliError {
     }
 }
 
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
 fn main() -> anyhow::Result<()> {
+    #[cfg(feature = "dhat-heap")]
+    let _profiler = dhat::Profiler::new_heap();
+
     configure_memory_allocator();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -480,7 +487,7 @@ async fn run_tui(auth_mode: AuthMode, resume: ResumeSelection) -> CliResult<()> 
     };
 
     let final_snapshot =
-        harness_tui::run_with_runtime(snapshot, runtime.commands, runtime.events).await?;
+        harness_tui_rewrite::run_with_runtime(snapshot, runtime.commands, runtime.events).await?;
     println!("resume session: {}", final_snapshot.session_id);
     Ok(())
 }
@@ -907,7 +914,10 @@ fn resumed_session_startup(root: &Path, summary: SessionSummary) -> CliResult<Se
         initial_transcript_entries: page
             .lines
             .into_iter()
-            .map(|line| UiTranscriptEntry::SessionRecord(line.kind))
+            .map(|line| UiTranscriptEntry::SessionRecord {
+                source_sequence: Some(line.seq),
+                record: line.kind,
+            })
             .collect(),
         provider_binding,
     })

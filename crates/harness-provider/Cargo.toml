@@ -1,0 +1,11 @@
+[package]
+name = "harness-provider"
+edition.workspace = true
+license.workspace = true
+publish.workspace = false
+version.workspace = true
+
+[dependencies]
+harness-model-api.workspace = true
+thiserror.workspace = true
+

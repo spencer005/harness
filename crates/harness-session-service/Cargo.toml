@@ -1,0 +1,12 @@
+[package]
+name = "harness-session-service"
+edition.workspace = true
+license.workspace = true
+publish.workspace = false
+version.workspace = true
+
+[dependencies]
+futures-util.workspace = true
+harness-session-store.workspace = true
+thiserror.workspace = true
+tokio.workspace = true

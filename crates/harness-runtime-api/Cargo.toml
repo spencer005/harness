@@ -1,0 +1,11 @@
+[package]
+name = "harness-runtime-api"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[dependencies]
+harness-model-api.workspace = true
+harness-tool-api.workspace = true
+tokio.workspace = true

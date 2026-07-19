@@ -9,10 +9,14 @@ version.workspace = true
 name = "new_harness"
 path = "src/main.rs"
 
+[features]
+dhat-heap = []
+
 [dependencies]
 anyhow.workspace = true
+dhat = "0.3.3"
 harness-core.workspace = true
-harness-tui.workspace = true
+harness-tui-rewrite.workspace = true
 http.workspace = true
 libc.workspace = true
 serde.workspace = true

@@ -1,0 +1,9 @@
+[package]
+name = "harness-tool-api"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[dependencies]
+thiserror.workspace = true

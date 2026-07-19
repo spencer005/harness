@@ -37,13 +37,23 @@ pub mod tools;
 
 use serde::{Deserialize, Serialize};
 
-/// Renderable transcript entry consumed by the TUI.
+/// Renderable transcript entry consumed and returned by a UI.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UiTranscriptEntry {
-    /// Plain transcript text.
-    Text(String),
-    /// Typed durable session record.
-    SessionRecord(sessions::SessionRecordKind),
+    /// Plain UI transcript text with optional persisted source identity.
+    Text {
+        /// Persisted session sequence when this text originates from storage.
+        source_sequence: Option<u64>,
+        /// Plain transcript text.
+        text: String,
+    },
+    /// Typed durable session record with optional persisted source identity.
+    SessionRecord {
+        /// Persisted session sequence when known.
+        source_sequence: Option<u64>,
+        /// Structured session record.
+        record: sessions::SessionRecordKind,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,0 +1,12 @@
+[package]
+name = "harness-tool-execution"
+edition.workspace = true
+license.workspace = true
+publish.workspace = false
+version.workspace = true
+
+[dependencies]
+harness-tool-api.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true

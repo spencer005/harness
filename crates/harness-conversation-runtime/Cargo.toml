@@ -1,0 +1,15 @@
+[package]
+name = "harness-conversation-runtime"
+edition.workspace = true
+license.workspace = true
+publish.workspace = false
+version.workspace = true
+
+[dependencies]
+harness-model-api.workspace = true
+harness-runtime-api.workspace = true
+harness-session-store.workspace = true
+harness-tool-api.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true

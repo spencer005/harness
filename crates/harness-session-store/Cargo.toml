@@ -1,0 +1,10 @@
+[package]
+name = "harness-session-store"
+edition.workspace = true
+license.workspace = true
+publish.workspace = false
+version.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
