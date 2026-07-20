@@ -12,14 +12,36 @@ path = "src/main.rs"
 [features]
 dhat-heap = []
 
+[lints.clippy]
+print_stdout = "deny"
+print_stderr = "deny"
+
 [dependencies]
 anyhow.workspace = true
+crossfire.workspace = true
 dhat = "0.3.3"
-harness-core.workspace = true
+harness-model-api.workspace = true
+harness-responses-api.workspace = true
+harness-responses-protocol.workspace = true
+harness-responses-transport.workspace = true
+harness-runtime-api.workspace = true
 harness-tui-rewrite.workspace = true
+harness-tool-api.workspace = true
+harness-provider.workspace = true
+harness-openai-chat-transport.workspace = true
+harness-session-store.workspace = true
+harness-conversation-runtime.workspace = true
+harness-tool-execution.workspace = true
 http.workspace = true
 libc.workspace = true
 serde.workspace = true
 sonic-rs.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+bytes.workspace = true
+serde_json.workspace = true
+http-body-util.workspace = true
+hyper-rustls.workspace = true
+hyper-util.workspace = true
+hyper.workspace = true
+futures-util.workspace = true

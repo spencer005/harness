@@ -6,10 +6,10 @@
 
 use std::path::{Path, PathBuf};
 
-use harness_tool_api::{
-    ToolExecutionRequest, ToolExecutor, ToolFailure, ToolResult,
-};
+use harness_tool_api::{ToolExecutionRequest, ToolExecutor, ToolFailure, ToolResult};
 use thiserror::Error;
+
+pub mod edit_file;
 
 /// Opened workspace capability used to scope tool operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,9 +83,7 @@ pub trait WorkspaceToolBackend: Send + Sync {
         workspace: &WorkspaceRoot,
         request: ToolExecutionRequest,
     ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<ToolResult, ToolFailure>> + Send + '_,
-        >,
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolFailure>> + Send + '_>,
     >;
 }
 

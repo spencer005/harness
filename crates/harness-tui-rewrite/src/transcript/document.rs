@@ -106,6 +106,46 @@ impl TranscriptDocument {
         self.insert_tail(None, payload)
     }
 
+    pub(super) fn insert_snapshot(
+        &mut self,
+        entry: TranscriptSnapshotEntry,
+    ) -> Result<TranscriptEntryId, TranscriptError> {
+        if let Some(sequence) = entry.sequence
+            && let Some(existing_id) = self.sequence_index.get(&sequence).copied()
+        {
+            let existing = self
+                .entry(existing_id)
+                .expect("sequence index references a current entry");
+            if existing.payload == entry.payload {
+                return Ok(existing_id);
+            }
+            return Err(TranscriptError::ConflictingSequence(sequence));
+        }
+        Ok(self.insert_tail(entry.sequence, entry.payload))
+    }
+
+    pub(super) fn attach_sequence(
+        &mut self,
+        id: TranscriptEntryId,
+        sequence: u64,
+    ) -> Result<(), TranscriptError> {
+        let index = self.index_of(id).ok_or(TranscriptError::UnknownEntry(id))?;
+        if let Some(existing_id) = self.sequence_index.get(&sequence)
+            && *existing_id != id
+        {
+            return Err(TranscriptError::ConflictingSequence(sequence));
+        }
+        let entry = &mut self.entries[index];
+        if let Some(existing_sequence) = entry.source_sequence
+            && existing_sequence != sequence
+        {
+            return Err(TranscriptError::ConflictingSequence(sequence));
+        }
+        entry.source_sequence = Some(sequence);
+        self.sequence_index.insert(sequence, id);
+        Ok(())
+    }
+
     pub(super) fn append_assistant_text(
         &mut self,
         id: TranscriptEntryId,
@@ -118,6 +158,25 @@ impl TranscriptDocument {
             text,
         } = &mut entry.payload
         else {
+            return Err(TranscriptError::UnknownEntry(id));
+        };
+        text.append(delta);
+        entry.revision = entry
+            .revision
+            .checked_add(1)
+            .expect("transcript entry revision space is not exhausted");
+        self.bump_revision();
+        Ok(())
+    }
+
+    pub(super) fn append_thinking_text(
+        &mut self,
+        id: TranscriptEntryId,
+        delta: &ExternalText,
+    ) -> Result<(), TranscriptError> {
+        let index = self.index_of(id).ok_or(TranscriptError::UnknownEntry(id))?;
+        let entry = &mut self.entries[index];
+        let TranscriptPayload::Thinking(text) = &mut entry.payload else {
             return Err(TranscriptError::UnknownEntry(id));
         };
         text.append(delta);

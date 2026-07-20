@@ -5,8 +5,6 @@ use std::{future::Future, pin::Pin, sync::Arc};
 use harness_tool_api::ToolDefinition;
 use thiserror::Error;
 
-
-
 /// Identifier for a semantic model request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ModelRequestId(pub u64);
@@ -40,7 +38,6 @@ impl ProviderId {
 #[error("provider identifier is empty")]
 pub struct InvalidProviderId;
 
-
 /// Generation of a resolved provider instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProviderGeneration(pub u64);
@@ -58,30 +55,21 @@ pub struct ModelSelection {
     pub service_tier: Option<String>,
 }
 impl ModelSelection {
-    /// Creates a model selection with a nonempty model identifier.
+    /// Creates a provider-neutral selection without applying provider policy.
     pub fn new(
         provider: ProviderId,
         model: impl Into<String>,
         reasoning_effort: Option<String>,
         service_tier: Option<String>,
-    ) -> Result<Self, InvalidModelSelection> {
-        let model = model.into();
-        if model.is_empty() {
-            return Err(InvalidModelSelection);
-        }
-        Ok(Self {
+    ) -> Self {
+        Self {
             provider,
-            model,
+            model: model.into(),
             reasoning_effort,
             service_tier,
-        })
+        }
     }
 }
-
-/// Failure returned when a model selection has an empty model identifier.
-#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
-#[error("model identifier is empty")]
-pub struct InvalidModelSelection;
 
 /// Capabilities exposed by a model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -108,10 +96,7 @@ impl ContextLimits {
         max_input_tokens: u64,
         compact_at_tokens: u64,
     ) -> Result<Self, InvalidContextLimits> {
-        if max_input_tokens == 0
-            || compact_at_tokens == 0
-            || compact_at_tokens > max_input_tokens
-        {
+        if max_input_tokens == 0 || compact_at_tokens == 0 || compact_at_tokens > max_input_tokens {
             return Err(InvalidContextLimits);
         }
         Ok(Self {
@@ -126,27 +111,68 @@ impl ContextLimits {
 #[error("context limits must be nonzero and compaction must not exceed maximum input")]
 pub struct InvalidContextLimits;
 
-
-/// Provider-neutral input message.
+/// Provider-neutral canonical model input.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ModelInput {
-    /// Role of the input message.
-    pub role: ModelInputRole,
-    /// Message text.
-    pub text: String,
+pub enum ModelInput {
+    /// A text message authored by a conversation participant.
+    Message {
+        /// Role of the message.
+        role: ModelMessageRole,
+        /// Exact message text.
+        text: String,
+    },
+    /// An assistant request to invoke a function tool.
+    AssistantToolCall {
+        /// Provider call identity.
+        call_id: String,
+        /// Advertised tool name.
+        name: String,
+        /// Exact serialized JSON arguments.
+        arguments: String,
+    },
+    /// An assistant request to invoke a native freeform/custom tool.
+    FreeformToolCall {
+        /// Provider call identity.
+        call_id: String,
+        /// Advertised tool name.
+        name: String,
+        /// Exact raw tool input.
+        input: String,
+    },
+    /// Model-visible output correlated with one assistant tool call.
+    ToolResult {
+        /// Provider call identity.
+        call_id: String,
+        /// Exact model-visible output.
+        output: String,
+    },
+    /// Result returned for a native freeform/custom tool call.
+    FreeformToolResult {
+        /// Provider call identity.
+        call_id: String,
+        /// Exact model-visible output.
+        output: String,
+    },
+    /// Reasoning item retained for a subsequent Responses request.
+    Reasoning {
+        /// Raw reasoning content, when exposed.
+        content: Option<String>,
+        /// Opaque encrypted reasoning content.
+        encrypted_content: Option<String>,
+        /// Reasoning summary, when exposed.
+        summary: Option<String>,
+    },
 }
 
-/// Role used by provider-neutral model input.
+/// Role used by provider-neutral text messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ModelInputRole {
+pub enum ModelMessageRole {
     /// Developer instruction.
     Developer,
     /// User message.
     User,
     /// Assistant message.
     Assistant,
-    /// Tool result.
-    Tool,
 }
 
 /// Immutable semantic model request.
@@ -165,7 +191,6 @@ pub struct ModelRequest {
     /// Tool definitions included in this request.
     pub tools: Arc<[ToolDefinition]>,
 }
-
 
 /// Reason a model request is attempted again.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -331,6 +356,17 @@ pub enum ModelTerminalOutcome {
     Failed(ModelFailure),
 }
 
+/// Reasoning item returned by a model response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelReasoning {
+    /// Raw reasoning content, when the provider exposes it.
+    pub content: Option<String>,
+    /// Provider-defined encrypted reasoning payload.
+    pub encrypted_content: Option<String>,
+    /// Human-readable reasoning summary, when the provider exposes it.
+    pub summary: Option<String>,
+}
+
 /// Incremental model event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelEvent {
@@ -340,6 +376,12 @@ pub enum ModelEvent {
     Metadata(ModelResponseMetadata),
     /// Incremental assistant text.
     AssistantTextDelta(String),
+    /// Incremental reasoning summary text.
+    ReasoningSummaryDelta(String),
+    /// Incremental raw reasoning content text.
+    ReasoningContentDelta(String),
+    /// Completed reasoning item metadata.
+    ReasoningItem(ModelReasoning),
     /// Incremental tool input.
     ToolInputDelta(ToolInputDelta),
     /// Complete tool call.
@@ -388,7 +430,6 @@ pub struct ModelTransportOutcome {
     pub outcome: ModelTerminalOutcome,
 }
 
-
 /// Model transport contract.
 ///
 /// Implementations start a request and return a stream handle. The handle owns
@@ -398,15 +439,9 @@ pub trait ModelTransport: Send + Sync {
     fn start(
         &self,
         attempt: Arc<ModelAttempt>,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = Result<Box<dyn ModelAttemptHandle>, ModelFailure>> + Send + '_,
-        >,
-    >;
+    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn ModelAttemptHandle>, ModelFailure>> + Send + '_>>;
     /// Cancels and joins every request owned by the transport.
-    fn shutdown(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<(), ModelFailure>> + Send + '_>>;
+    fn shutdown(&self) -> Pin<Box<dyn Future<Output = Result<(), ModelFailure>> + Send + '_>>;
 }
 
 /// Active model attempt contract.

@@ -71,6 +71,13 @@ enum AssistantStream {
     Active { entry: Option<TranscriptEntryId> },
 }
 
+/// Runtime reasoning-summary stream state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThinkingStream {
+    Idle,
+    Active { entry: Option<TranscriptEntryId> },
+}
+
 /// Persisted history request state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PageRequestState {
@@ -194,6 +201,7 @@ pub(crate) struct Transcript {
     viewport: ViewportState,
     selection: Option<TranscriptSelection>,
     stream: AssistantStream,
+    thinking: ThinkingStream,
     page_request: PageRequestState,
     before_sequence: Option<u64>,
 }
@@ -215,6 +223,7 @@ impl Transcript {
             } else {
                 AssistantStream::Idle
             },
+            thinking: ThinkingStream::Idle,
             page_request: PageRequestState::Idle,
             before_sequence,
         })
@@ -268,20 +277,69 @@ impl Transcript {
         Ok(())
     }
 
-    /// Completes the active response stream.
+    /// Appends a reasoning delta to the active thinking block.
+    pub(crate) fn append_thinking_delta(
+        &mut self,
+        delta: crate::domain::ExternalText,
+    ) -> Result<(), TranscriptError> {
+        let entry = match self.thinking {
+            ThinkingStream::Active { entry: Some(entry) } => {
+                self.document.append_thinking_text(entry, &delta)?;
+                entry
+            }
+            ThinkingStream::Active { entry: None } | ThinkingStream::Idle => {
+                let entry = self.document.push(TranscriptPayload::Thinking(delta));
+                self.thinking = ThinkingStream::Active { entry: Some(entry) };
+                entry
+            }
+        };
+        self.layout.invalidate_entry(entry);
+        self.after_tail_mutation();
+        Ok(())
+    }
+
+    /// Completes the active response and reasoning streams.
     pub(crate) fn complete_response_stream(&mut self) -> Result<(), TranscriptError> {
         if self.stream == AssistantStream::Idle {
             return Err(TranscriptError::CompletionOutsideStream);
         }
         self.stream = AssistantStream::Idle;
+        self.thinking = ThinkingStream::Idle;
         Ok(())
     }
 
-    /// Appends one semantic transcript payload.
+    /// Appends one semantic transcript payload without persisted identity.
     pub(crate) fn append(&mut self, payload: TranscriptPayload) -> TranscriptEntryId {
         let entry = self.document.push(payload);
         self.after_tail_mutation();
         entry
+    }
+
+    /// Appends one runtime entry while preserving its persisted identity.
+    pub(crate) fn append_snapshot(
+        &mut self,
+        entry: TranscriptSnapshotEntry,
+    ) -> Result<TranscriptEntryId, TranscriptError> {
+        let id = self.document.insert_snapshot(entry)?;
+        self.after_tail_mutation();
+        Ok(id)
+    }
+
+    /// Assigns persisted identities to entries that were streamed before commit.
+    pub(crate) fn reconcile_commit(
+        &mut self,
+        reasoning_sequence: Option<u64>,
+        assistant_sequence: u64,
+    ) -> Result<(), TranscriptError> {
+        if let Some(sequence) = reasoning_sequence
+            && let ThinkingStream::Active { entry: Some(id) } = self.thinking
+        {
+            self.document.attach_sequence(id, sequence)?;
+        }
+        if let AssistantStream::Active { entry: Some(id) } = self.stream {
+            self.document.attach_sequence(id, assistant_sequence)?;
+        }
+        Ok(())
     }
 
     /// Marks a historical page request as in flight when the retained start is

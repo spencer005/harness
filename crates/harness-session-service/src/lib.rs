@@ -9,10 +9,8 @@ use std::sync::Arc;
 use harness_session_store::{
     PageSize, SessionId, SessionSequence, SessionStore, SessionStoreError, TranscriptPage,
 };
-
 use thiserror::Error;
 use tokio::sync::Semaphore;
-
 
 /// Query sent to the session service.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,9 +86,9 @@ impl SessionReadService {
                         maximum_entries,
                     )?))
                 }
-                SessionQuery::SessionPath { session_id } => Ok(SessionQueryResponse::Path(
-                    store.session_path(session_id)?,
-                )),
+                SessionQuery::SessionPath { session_id } => {
+                    Ok(SessionQueryResponse::Path(store.session_path(session_id)?))
+                }
             }
         })
         .await
@@ -102,9 +100,7 @@ impl SessionReadService {
 pub async fn serve_requests(
     service: Arc<SessionReadService>,
     requests: impl futures_util::Stream<Item = SessionQuery> + Send + 'static,
-    responses: tokio::sync::mpsc::Sender<
-        Result<SessionQueryResponse, SessionServiceError>,
-    >,
+    responses: tokio::sync::mpsc::Sender<Result<SessionQueryResponse, SessionServiceError>>,
     maximum_in_flight: usize,
 ) -> Result<(), SessionServiceError> {
     if maximum_in_flight == 0 {
@@ -151,7 +147,6 @@ pub async fn serve_requests(
     Ok(())
 }
 
-
 /// One request/response boundary for a long-lived session listener.
 pub trait SessionRequestListener: Send + Sync {
     /// Handles one decoded request and returns its response or typed error.
@@ -160,9 +155,8 @@ pub trait SessionRequestListener: Send + Sync {
         request: SessionQuery,
     ) -> std::pin::Pin<
         Box<
-            dyn std::future::Future<
-                    Output = Result<SessionQueryResponse, SessionServiceError>,
-                > + Send
+            dyn std::future::Future<Output = Result<SessionQueryResponse, SessionServiceError>>
+                + Send
                 + '_,
         >,
     >;
@@ -174,9 +168,8 @@ impl SessionRequestListener for SessionReadService {
         request: SessionQuery,
     ) -> std::pin::Pin<
         Box<
-            dyn std::future::Future<
-                    Output = Result<SessionQueryResponse, SessionServiceError>,
-                > + Send
+            dyn std::future::Future<Output = Result<SessionQueryResponse, SessionServiceError>>
+                + Send
                 + '_,
         >,
     > {

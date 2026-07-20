@@ -3,14 +3,13 @@
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use tokio::net::TcpStream;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
-
-use crate::{
+use harness_responses_api::{
     ResponsesApiError, ResponsesStreamEvent, is_response_terminal_event,
     map_wrapped_websocket_error, protocol_error, protocol_source_error, response_completed_id,
     websocket_error, websocket_source_error,
 };
+use tokio::net::TcpStream;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
 
 const IDLE_WEBSOCKET_CONTROL_POLL_TIMEOUT: Duration = Duration::from_millis(1);
 const IDLE_WEBSOCKET_CONTROL_SEND_TIMEOUT: Duration = Duration::from_secs(1);
@@ -23,7 +22,7 @@ pub(crate) struct ConnectionContext;
 
 impl ConnectionContext {
     /// Build the pool partition key for one request.
-    pub(crate) fn from_headers(_headers: &crate::CodexHeaders) -> Self {
+    pub(crate) fn from_headers(_headers: &harness_responses_api::CodexHeaders) -> Self {
         // The pool itself is already scoped to one provider, auth source, and
         // default Codex identity header set. Request-specific Codex headers do
         // not partition idle sockets: current per-request metadata is stamped

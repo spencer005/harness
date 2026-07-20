@@ -39,9 +39,9 @@ pub struct InvalidToolName;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GrammarSyntax {
     /// A grammar represented by a regular expression.
-    RegularExpression,
-    /// A grammar represented by a provider-specific formal grammar.
-    FormalGrammar,
+    Regex,
+    /// A grammar represented by Lark context-free grammar syntax.
+    Lark,
 }
 
 /// JSON schema used to describe function arguments.
@@ -90,7 +90,6 @@ impl ToolInput {
         }
     }
 }
-
 
 /// Identifier that correlates a tool call with its result.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -178,6 +177,74 @@ pub struct ToolDefinition {
     pub capabilities: ToolCapabilities,
 }
 
+/// Native tool specification constructed by a tool module.
+///
+/// The native construction API accepts Lark grammars. JSON Schema remains part
+/// of [`ToolDefinition`] for provider compatibility, but native tool modules do
+/// not construct their definitions through a JSON Schema builder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolSpec {
+    definition: ToolDefinition,
+    executor: ToolExecutorRoute,
+}
+
+impl ToolSpec {
+    /// Creates a native tool specification whose default route is its name.
+    pub fn new(name: impl Into<String>) -> Result<Self, InvalidToolName> {
+        let name = ToolName::new(name)?;
+        let executor = ToolExecutorRoute {
+            identifier: name.as_str().to_owned(),
+        };
+        Ok(Self {
+            definition: ToolDefinition {
+                name,
+                description: String::new(),
+                input_schema: ToolInputSchema::FreeformGrammar {
+                    syntax: GrammarSyntax::Lark,
+                    definition: String::new(),
+                },
+                capabilities: ToolCapabilities::default(),
+            },
+            executor,
+        })
+    }
+
+    /// Sets the model-facing description.
+    pub fn description(mut self, description: impl Into<String>) -> Self {
+        self.definition.description = description.into();
+        self
+    }
+
+    /// Sets the native Lark grammar loaded by the tool module.
+    pub fn lark(mut self, definition: impl Into<String>) -> Self {
+        self.definition.input_schema = ToolInputSchema::FreeformGrammar {
+            syntax: GrammarSyntax::Lark,
+            definition: definition.into(),
+        };
+        self
+    }
+
+    /// Sets the tool execution capabilities.
+    pub fn capabilities(mut self, capabilities: ToolCapabilities) -> Self {
+        self.definition.capabilities = capabilities;
+        self
+    }
+
+    /// Overrides the executor route assigned to this tool.
+    pub fn route(mut self, route: impl Into<String>) -> Result<Self, EmptyExecutorRoute> {
+        self.executor = ToolExecutorRoute::new(route)?;
+        Ok(self)
+    }
+
+    /// Converts this construction specification into a provider registration.
+    pub fn build(self) -> AdvertisedTool {
+        AdvertisedTool {
+            definition: self.definition,
+            executor: self.executor,
+        }
+    }
+}
+
 /// Executor route assigned to an advertised tool.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolExecutorRoute {
@@ -217,6 +284,11 @@ impl ToolRegistry {
         Self::default()
     }
 
+    /// Creates a builder for native tool specifications.
+    pub fn builder() -> ToolRegistryBuilder {
+        ToolRegistryBuilder::default()
+    }
+
     /// Registers a tool and rejects duplicate names.
     pub fn register(&mut self, tool: AdvertisedTool) -> Result<(), DuplicateToolName> {
         let name = tool.definition.name.clone();
@@ -248,6 +320,29 @@ impl ToolRegistry {
     }
 }
 
+/// Builder for a provider-facing registry of native tool specifications.
+#[derive(Debug, Default)]
+pub struct ToolRegistryBuilder {
+    tools: Vec<ToolSpec>,
+}
+
+impl ToolRegistryBuilder {
+    /// Adds one native tool specification.
+    pub fn tool(mut self, tool: ToolSpec) -> Self {
+        self.tools.push(tool);
+        self
+    }
+
+    /// Builds the registry and rejects duplicate names.
+    pub fn build(self) -> Result<ToolRegistry, DuplicateToolName> {
+        let mut registry = ToolRegistry::new();
+        for tool in self.tools {
+            registry.register(tool.build())?;
+        }
+        Ok(registry)
+    }
+}
+
 /// Stable identifier for one tool execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ToolExecutionId(pub u64);
@@ -268,6 +363,8 @@ pub struct ToolExecutionRequest {
     pub execution_id: ToolExecutionId,
     /// Advertised tool name.
     pub tool: ToolName,
+    /// Executor route selected when the tool was registered.
+    pub route: ToolExecutorRoute,
     /// Tool input.
     pub input: ToolInput,
     /// Execution policy.
@@ -281,9 +378,7 @@ pub trait ToolExecutor: Send + Sync {
         &self,
         request: ToolExecutionRequest,
     ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<ToolResult, ToolFailure>> + Send + '_,
-        >,
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolFailure>> + Send + '_>,
     >;
 }
 /// Failure returned when a tool call identifier is empty.

@@ -1,14 +1,12 @@
 [package]
-name = "harness-provider"
+name = "harness-openai-chat-protocol"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
 
 [dependencies]
 harness-model-api.workspace = true
+harness-responses-protocol.workspace = true
+harness-tool-api.workspace = true
+sonic-rs.workspace = true
 thiserror.workspace = true
-serde = { workspace = true }
-
-[dev-dependencies]
-tokio = { workspace = true, features = ["macros"] }
-

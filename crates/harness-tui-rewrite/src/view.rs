@@ -892,9 +892,9 @@ mod tests {
     #[test]
     fn notice_uses_sanitized_cell_width_for_right_aligned_overlay() {
         let mut application = application("");
-        application.apply_domain_event(DomainEvent::ProtocolViolation(ExternalText::new(
-            "好好\nsecond\u{1b}[31m\u{202e}",
-        )));
+        application.apply_domain_event(DomainEvent::Failure(
+            "好好\nsecond\u{1b}[31m\u{202e}".to_string(),
+        ));
         let document = prepare_notice(&application, 5).expect("notice is prepared");
         let line = &document.lines()[0];
         let text = line.runs().iter().map(|run| run.text()).collect::<String>();
@@ -1008,7 +1008,7 @@ mod tests {
             status: ActivityStatus::Running,
             detail: Some(ExternalText::new(hostile)),
         }));
-        application.apply_domain_event(DomainEvent::ProtocolViolation(ExternalText::new(hostile)));
+        application.apply_domain_event(DomainEvent::Failure(hostile.to_string()));
 
         let width = 40;
         let height = 12;

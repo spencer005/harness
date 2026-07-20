@@ -4,31 +4,27 @@
 //! credentials, or implement PTYs. The session store remains behind its
 //! current-format adapter until the final user-run migration phase.
 
-use std::{
-    collections::BTreeMap,
-    sync::Arc,
-};
+use std::{collections::BTreeMap, sync::Arc};
 
 use harness_model_api::{
-    ModelAttempt, ModelCancellation, ModelEvent, ModelFailure, ModelFailureKind, ModelInterruption,
-    ModelRequest, ModelSelection, ModelTerminalOutcome, ModelTransport, ResolvedModelRoute,
+    ModelAttempt, ModelEvent, ModelRequest, ModelSelection, ModelTerminalOutcome, ModelTransport,
+    ProviderGeneration, ResolvedModelRoute,
 };
-
 use harness_runtime_api::{
-    MessageRole, RuntimeCommand, RuntimeEvent, TranscriptPayload, TranscriptSnapshotEntry,
+    MessageRole, RuntimeCommand, RuntimeEvent, RuntimeFailureCategory, TranscriptPayload,
+    TranscriptSnapshotEntry,
 };
 use harness_session_store::{
-    AppendReceipt, Durability, PageSize, SessionPayload, SessionStore, SessionStoreError,
-    SessionWriter, TranscriptPage as StoredTranscriptPage, TurnOutcome,
+    AppendReceipt, Durability, PageSize, SessionErrorCategory, SessionPayload, SessionStore,
+    SessionStoreError, SessionWriter, TranscriptPage as StoredTranscriptPage, TurnOutcome,
 };
 use harness_tool_api::{
-    ToolExecutionId, ToolExecutionPolicy, ToolExecutionRequest, ToolExecutor, ToolFailure, ToolName,
+    ToolExecutionId, ToolExecutionPolicy, ToolExecutionRequest, ToolExecutor, ToolName,
     ToolRegistry,
 };
 use thiserror::Error;
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-
 
 /// Lifecycle of the conversation runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,10 +80,9 @@ pub enum ConversationPhase {
     PersistingInput { turn_id: u64 },
     /// A model request is being assembled.
     PreparingAttempt { turn_id: u64 },
-    /// The transport is starting an attempt.
+    /// The active model attempt accepts events from the composition root.
     AwaitingModel { turn_id: u64, attempt_id: u64 },
-    /// Assistant deltas are being received.
-    Streaming { turn_id: u64, attempt_id: u64 },
+
     /// Assistant output is being committed.
     PersistingAssistant { turn_id: u64, attempt_id: u64 },
     /// A tool call is being committed before execution.
@@ -111,7 +106,10 @@ pub enum ConversationPhase {
     /// A compaction job is active.
     Compacting { compaction_id: u64 },
     /// A turn or lifecycle operation failed and is returning to idle.
-    Failed { turn_id: Option<u64>, message: String },
+    Failed {
+        turn_id: Option<u64>,
+        message: String,
+    },
 }
 
 /// One immutable model attempt supervised by the runtime.
@@ -161,6 +159,11 @@ impl ActiveModelAttempt {
                 self.phase = AttemptPhase::Streaming;
                 self.assistant_text.push_str(&delta);
             }
+            ModelEvent::ReasoningSummaryDelta(_)
+            | ModelEvent::ReasoningContentDelta(_)
+            | ModelEvent::ReasoningItem(_) => {
+                self.phase = AttemptPhase::Streaming;
+            }
             ModelEvent::ToolInputDelta(_) | ModelEvent::ToolCall(_) => {
                 self.phase = AttemptPhase::Streaming;
             }
@@ -169,7 +172,6 @@ impl ActiveModelAttempt {
                 self.phase = AttemptPhase::Terminal;
                 self.terminal_outcome = Some(outcome);
             }
-
         }
         Ok(())
     }
@@ -293,10 +295,10 @@ impl JobRegistry {
         self.cancel_all();
         let mut first_error = None;
         for (_, job) in self.jobs {
-            if let Err(error) = job.handle.await {
-                if first_error.is_none() {
-                    first_error = Some(RuntimeError::JobJoin(error.to_string()));
-                }
+            if let Err(error) = job.handle.await
+                && first_error.is_none()
+            {
+                first_error = Some(RuntimeError::JobJoin(error.to_string()));
             }
         }
         match first_error {
@@ -304,7 +306,6 @@ impl JobRegistry {
             None => Ok(()),
         }
     }
-
 }
 
 /// Ports injected into the conversation runtime composition layer.
@@ -314,15 +315,13 @@ pub struct RuntimePorts {
     /// Provider-independent tool registry.
     pub tool_registry: ToolRegistry,
     /// Tool execution implementation.
-    pub tool_executor: Arc<dyn ToolExecutor>,
+    pub tool_executor: Option<Arc<dyn ToolExecutor>>,
     /// Model transport implementation.
     pub model_transport: Arc<dyn ModelTransport>,
     /// Builds immutable semantic model requests.
     pub request_builder: Arc<dyn ModelRequestBuilder>,
     /// Route selected for root model requests.
     pub model_route: ResolvedModelRoute,
-
-
 }
 
 /// Runtime construction input.
@@ -344,6 +343,9 @@ pub struct ConversationRuntime {
     writer: Option<RuntimeSessionWriter>,
     canonical_history: Vec<SessionPayload>,
     transient_assistant: String,
+    transient_reasoning_content: String,
+    transient_reasoning_summary: String,
+    transient_reasoning_encrypted: Option<String>,
     pending_tool_inputs: BTreeMap<String, String>,
     pending_tool_calls: Vec<harness_model_api::ToolCall>,
     active_tool_call: Option<harness_model_api::ToolCall>,
@@ -354,17 +356,10 @@ pub struct ConversationRuntime {
     canonical_revision: u64,
     transport_stopped: bool,
     next_attempt_id: u64,
-
-
-
-
-
-
+    model_started: bool,
 
     next_turn_id: u64,
 }
-
-
 
 impl ConversationRuntime {
     /// Constructs a runtime before any storage, model, or tool work starts.
@@ -377,6 +372,9 @@ impl ConversationRuntime {
             writer: None,
             canonical_history: Vec::new(),
             transient_assistant: String::new(),
+            transient_reasoning_content: String::new(),
+            transient_reasoning_summary: String::new(),
+            transient_reasoning_encrypted: None,
             pending_tool_inputs: BTreeMap::new(),
             pending_tool_calls: Vec::new(),
             active_tool_call: None,
@@ -388,7 +386,7 @@ impl ConversationRuntime {
             canonical_revision: 0,
             transport_stopped: false,
             next_attempt_id: 1,
-
+            model_started: false,
         }
     }
 
@@ -397,6 +395,8 @@ impl ConversationRuntime {
         if self.lifecycle != RuntimeLifecycle::Constructed {
             return Err(RuntimeError::InvalidLifecycle);
         }
+        let history = self.load_persisted_history()?;
+        self.restore_history(history)?;
         let writer = self
             .configuration
             .ports
@@ -408,6 +408,84 @@ impl ConversationRuntime {
         Ok(())
     }
 
+    fn load_persisted_history(&self) -> Result<Vec<SessionPayload>, RuntimeError> {
+        let reader = self.configuration.ports.session_store.reader()?;
+        let mut before_sequence = None;
+        let mut records = Vec::new();
+
+        loop {
+            let page = match reader.load_older(
+                self.configuration.session_id.clone(),
+                before_sequence,
+                PageSize::DEFAULT,
+            ) {
+                Ok(page) => page,
+                Err(SessionStoreError::NotFound(_)) if before_sequence.is_none() => {
+                    return Ok(records);
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let next_before_sequence = page.next_before;
+            records.extend(page.entries.into_iter().map(|record| record.payload));
+            if page.reached_start {
+                break;
+            }
+            let Some(next_before_sequence) = next_before_sequence else {
+                return Err(SessionStoreError::InvalidFormat(
+                    "nonterminal transcript page has no continuation cursor".to_string(),
+                )
+                .into());
+            };
+            if before_sequence.is_some_and(|before| next_before_sequence >= before) {
+                return Err(SessionStoreError::InvalidFormat(
+                    "transcript page cursor does not move toward the session start".to_string(),
+                )
+                .into());
+            }
+            before_sequence = Some(next_before_sequence);
+        }
+
+        records.reverse();
+        Ok(records)
+    }
+
+    fn restore_history(&mut self, history: Vec<SessionPayload>) -> Result<(), RuntimeError> {
+        let revision = u64::try_from(history.len()).map_err(|_| RuntimeError::IdExhausted)?;
+        let mut highest_turn_id = 0;
+        let mut highest_attempt_id = 0;
+        for payload in &history {
+            match payload {
+                SessionPayload::TurnStarted { turn_id }
+                | SessionPayload::InputMessage { turn_id, .. }
+                | SessionPayload::ModelAttemptStarted { turn_id, .. }
+                | SessionPayload::AssistantMessage { turn_id, .. }
+                | SessionPayload::Reasoning { turn_id, .. }
+                | SessionPayload::Error { turn_id, .. }
+                | SessionPayload::ToolCallAccepted { turn_id, .. }
+                | SessionPayload::ToolExecutionStarted { turn_id, .. }
+                | SessionPayload::ToolExecutionFinished { turn_id, .. }
+                | SessionPayload::TurnFinished { turn_id, .. } => {
+                    highest_turn_id = highest_turn_id.max(*turn_id);
+                }
+                SessionPayload::Metadata(_)
+                | SessionPayload::ProviderBinding(_)
+                | SessionPayload::SessionClosed => {}
+            }
+            if let SessionPayload::ModelAttemptStarted { attempt_id, .. } = payload {
+                highest_attempt_id = highest_attempt_id.max(*attempt_id);
+            }
+        }
+
+        self.next_turn_id = highest_turn_id
+            .checked_add(1)
+            .ok_or(RuntimeError::IdExhausted)?;
+        self.next_attempt_id = highest_attempt_id
+            .checked_add(1)
+            .ok_or(RuntimeError::IdExhausted)?;
+        self.canonical_revision = revision;
+        self.canonical_history = history;
+        Ok(())
+    }
 
     /// Marks startup complete after composition has satisfied its readiness contract.
     pub fn mark_ready(&mut self) -> Result<(), RuntimeError> {
@@ -428,10 +506,6 @@ impl ConversationRuntime {
         }
         self.lifecycle = RuntimeLifecycle::ShuttingDown;
         if let ConversationPhase::AwaitingModel {
-            turn_id,
-            attempt_id,
-        }
-        | ConversationPhase::Streaming {
             turn_id,
             attempt_id,
         } = &self.phase
@@ -479,7 +553,6 @@ impl ConversationRuntime {
         self.lifecycle = RuntimeLifecycle::Stopped;
         Ok(())
     }
-
 
     /// Enables persist mode with an explicit completion policy.
     pub fn enable_persist(
@@ -538,9 +611,7 @@ impl ConversationRuntime {
         }
 
         let turn_id = self.next_turn_id;
-        self.next_turn_id = turn_id
-            .checked_add(1)
-            .ok_or(RuntimeError::IdExhausted)?;
+        self.next_turn_id = turn_id.checked_add(1).ok_or(RuntimeError::IdExhausted)?;
         let next_revision = self
             .canonical_revision
             .checked_add(1)
@@ -572,7 +643,6 @@ impl ConversationRuntime {
         Ok(receipt)
     }
 
-
     /// Persists attempt identity before building and scheduling its model request.
     pub async fn start_model_request(&mut self) -> Result<RuntimeEffect, RuntimeError> {
         let turn_id = match &self.phase {
@@ -581,9 +651,7 @@ impl ConversationRuntime {
         };
 
         let attempt_id = self.next_attempt_id;
-        self.next_attempt_id = attempt_id
-            .checked_add(1)
-            .ok_or(RuntimeError::IdExhausted)?;
+        self.next_attempt_id = attempt_id.checked_add(1).ok_or(RuntimeError::IdExhausted)?;
         let next_revision = self
             .canonical_revision
             .checked_add(1)
@@ -599,6 +667,7 @@ impl ConversationRuntime {
         let request = self.configuration.ports.request_builder.build(
             next_revision,
             &self.configuration.model,
+            self.configuration.ports.model_route.generation,
             &request_history,
             &self.queued_steering,
         )?;
@@ -630,40 +699,32 @@ impl ConversationRuntime {
         self.canonical_revision = next_revision;
         self.pending_tool_inputs.clear();
         self.pending_tool_calls.clear();
+        self.transient_reasoning_content.clear();
+        self.transient_reasoning_summary.clear();
+        self.transient_reasoning_encrypted = None;
         self.take_queued_steering();
+        self.model_started = false;
         let attempt_id = harness_model_api::ModelAttemptId(attempt_id);
         self.phase = ConversationPhase::AwaitingModel {
             turn_id,
             attempt_id: attempt_id.0,
         };
         Ok(RuntimeEffect::StartModel {
+            turn_id,
             attempt: Arc::new(ModelAttempt::initial(request, attempt_id)),
             route: self.configuration.ports.model_route.clone(),
         })
     }
 
-
-    /// Marks an attempt as receiving model events.
-    pub fn begin_streaming(
-        &mut self,
-        turn_id: u64,
-        attempt_id: u64,
-    ) -> Result<(), RuntimeError> {
-        if !matches!(
-            &self.phase,
+    /// Verifies that model events belong to the active attempt.
+    pub fn ensure_model_attempt(&self, turn_id: u64, attempt_id: u64) -> Result<(), RuntimeError> {
+        match &self.phase {
             ConversationPhase::AwaitingModel {
                 turn_id: active_turn,
                 attempt_id: active_attempt,
-            } if *active_turn == turn_id && *active_attempt == attempt_id
-        ) {
-            return Err(RuntimeError::InvalidPhase);
+            } if *active_turn == turn_id && *active_attempt == attempt_id => Ok(()),
+            _ => Err(RuntimeError::InvalidPhase),
         }
-
-        self.phase = ConversationPhase::Streaming {
-            turn_id,
-            attempt_id,
-        };
-        Ok(())
     }
 
     /// Records transient assistant text without changing canonical history.
@@ -673,16 +734,7 @@ impl ConversationRuntime {
         attempt_id: u64,
         delta: String,
     ) -> Result<(), RuntimeError> {
-        if !matches!(
-            &self.phase,
-            ConversationPhase::Streaming {
-                turn_id: active_turn,
-                attempt_id: active_attempt,
-            } if *active_turn == turn_id && *active_attempt == attempt_id
-        ) {
-            return Err(RuntimeError::InvalidPhase);
-        }
-
+        self.ensure_model_attempt(turn_id, attempt_id)?;
         self.transient_assistant.push_str(&delta);
         Ok(())
     }
@@ -695,19 +747,12 @@ impl ConversationRuntime {
         event: ModelEvent,
     ) -> Result<Vec<RuntimeEffect>, RuntimeError> {
         match event {
-            ModelEvent::Started
-                if matches!(
-                    &self.phase,
-                    ConversationPhase::Streaming {
-                        turn_id: active_turn,
-                        attempt_id: active_attempt,
-                    } if *active_turn == turn_id && *active_attempt == attempt_id
-                ) =>
-            {
-                Err(RuntimeError::DuplicateModelStart)
-            }
             ModelEvent::Started => {
-                self.begin_streaming(turn_id, attempt_id)?;
+                self.ensure_model_attempt(turn_id, attempt_id)?;
+                if self.model_started {
+                    return Err(RuntimeError::DuplicateModelStart);
+                }
+                self.model_started = true;
                 Ok(vec![RuntimeEffect::Emit(RuntimeEvent::ResponseStarted)])
             }
             ModelEvent::AssistantTextDelta(delta) => {
@@ -716,8 +761,46 @@ impl ConversationRuntime {
                     delta,
                 ))])
             }
+            ModelEvent::ReasoningSummaryDelta(delta) => {
+                self.ensure_model_attempt(turn_id, attempt_id)?;
+                self.transient_reasoning_summary.push_str(&delta);
+                Ok(vec![RuntimeEffect::Emit(
+                    RuntimeEvent::ReasoningSummaryDelta(delta),
+                )])
+            }
+            ModelEvent::ReasoningContentDelta(delta) => {
+                self.ensure_model_attempt(turn_id, attempt_id)?;
+                self.transient_reasoning_content.push_str(&delta);
+                Ok(vec![RuntimeEffect::Emit(
+                    RuntimeEvent::ReasoningContentDelta(delta),
+                )])
+            }
+            ModelEvent::ReasoningItem(item) => {
+                self.ensure_model_attempt(turn_id, attempt_id)?;
+                let mut effects = Vec::new();
+                if let Some(content) = item.content {
+                    if self.transient_reasoning_content.is_empty() {
+                        self.transient_reasoning_content = content.clone();
+                        effects.push(RuntimeEffect::Emit(RuntimeEvent::ReasoningContentDelta(
+                            content,
+                        )));
+                    }
+                }
+                if let Some(summary) = item.summary {
+                    if self.transient_reasoning_summary.is_empty() {
+                        self.transient_reasoning_summary = summary.clone();
+                        effects.push(RuntimeEffect::Emit(RuntimeEvent::ReasoningSummaryDelta(
+                            summary,
+                        )));
+                    }
+                }
+                if item.encrypted_content.is_some() {
+                    self.transient_reasoning_encrypted = item.encrypted_content;
+                }
+                Ok(effects)
+            }
             ModelEvent::ToolInputDelta(delta) => {
-                self.ensure_streaming_attempt(turn_id, attempt_id)?;
+                self.ensure_model_attempt(turn_id, attempt_id)?;
                 self.pending_tool_inputs
                     .entry(delta.call_id)
                     .or_default()
@@ -725,7 +808,7 @@ impl ConversationRuntime {
                 Ok(Vec::new())
             }
             ModelEvent::ToolCall(call) => {
-                self.ensure_streaming_attempt(turn_id, attempt_id)?;
+                self.ensure_model_attempt(turn_id, attempt_id)?;
                 if self
                     .pending_tool_calls
                     .iter()
@@ -738,43 +821,16 @@ impl ConversationRuntime {
                 Ok(Vec::new())
             }
             ModelEvent::Metadata(_) | ModelEvent::Usage(_) => {
-                self.ensure_streaming_attempt(turn_id, attempt_id)?;
+                self.ensure_model_attempt(turn_id, attempt_id)?;
                 Ok(Vec::new())
             }
             ModelEvent::Terminal(_) if !self.pending_tool_inputs.is_empty() => {
                 Err(RuntimeError::IncompleteToolInput)
             }
             ModelEvent::Terminal(outcome) => {
-                self.finish_model_attempt(turn_id, attempt_id, outcome.clone())
-                    .await?;
-                Ok(vec![RuntimeEffect::Emit(RuntimeEvent::ResponseFinished(
-                    outcome,
-                ))])
+                self.finish_model_attempt(turn_id, attempt_id, outcome)
+                    .await
             }
-        }
-    }
-
-    fn ensure_streaming_attempt(
-        &mut self,
-        turn_id: u64,
-        attempt_id: u64,
-    ) -> Result<(), RuntimeError> {
-        match &self.phase {
-            ConversationPhase::AwaitingModel {
-                turn_id: active_turn,
-                attempt_id: active_attempt,
-            } if *active_turn == turn_id && *active_attempt == attempt_id => {
-                self.phase = ConversationPhase::Streaming {
-                    turn_id,
-                    attempt_id,
-                };
-                Ok(())
-            }
-            ConversationPhase::Streaming {
-                turn_id: active_turn,
-                attempt_id: active_attempt,
-            } if *active_turn == turn_id && *active_attempt == attempt_id => Ok(()),
-            _ => Err(RuntimeError::InvalidPhase),
         }
     }
 
@@ -783,7 +839,7 @@ impl ConversationRuntime {
         &mut self,
         turn_id: u64,
         attempt_id: u64,
-    ) -> Result<AppendReceipt, RuntimeError> {
+    ) -> Result<Vec<RuntimeEffect>, RuntimeError> {
         if self.phase
             != (ConversationPhase::PersistingAssistant {
                 turn_id,
@@ -797,10 +853,24 @@ impl ConversationRuntime {
             .canonical_revision
             .checked_add(1)
             .ok_or(RuntimeError::IdExhausted)?;
-        let records = vec![SessionPayload::AssistantMessage {
+        let has_reasoning = !self.transient_reasoning_content.is_empty()
+            || !self.transient_reasoning_summary.is_empty()
+            || self.transient_reasoning_encrypted.is_some();
+        let mut records = Vec::with_capacity(2);
+        if has_reasoning {
+            records.push(SessionPayload::Reasoning {
+                turn_id,
+                content: (!self.transient_reasoning_content.is_empty())
+                    .then(|| self.transient_reasoning_content.clone()),
+                encrypted_content: self.transient_reasoning_encrypted.clone(),
+                summary: (!self.transient_reasoning_summary.is_empty())
+                    .then(|| self.transient_reasoning_summary.clone()),
+            });
+        }
+        records.push(SessionPayload::AssistantMessage {
             turn_id,
             text: self.transient_assistant.clone(),
-        }];
+        });
         self.phase = ConversationPhase::PersistingAssistant {
             turn_id,
             attempt_id,
@@ -821,20 +891,29 @@ impl ConversationRuntime {
                 return Err(error.into());
             }
         };
+        let reasoning_sequence = has_reasoning.then(|| *receipt.sequences.start());
+        let assistant_sequence = *receipt.sequences.end();
 
         self.canonical_history.extend(records);
         self.canonical_revision = next_revision;
         self.transient_assistant.clear();
+        self.transient_reasoning_content.clear();
+        self.transient_reasoning_summary.clear();
+        self.transient_reasoning_encrypted = None;
         self.pending_interrupt = None;
+        self.model_started = false;
         self.phase = ConversationPhase::PreparingContinuation { turn_id };
-        Ok(receipt)
+        Ok(vec![
+            RuntimeEffect::Emit(RuntimeEvent::TranscriptCommitted {
+                reasoning_sequence,
+                assistant_sequence,
+            }),
+            RuntimeEffect::ContinueTurn { turn_id },
+        ])
     }
 
     /// Persists turn completion after assistant and tool work finish.
-    pub async fn complete_turn(
-        &mut self,
-        turn_id: u64,
-    ) -> Result<AppendReceipt, RuntimeError> {
+    pub async fn complete_turn(&mut self, turn_id: u64) -> Result<AppendReceipt, RuntimeError> {
         if self.phase != (ConversationPhase::PreparingContinuation { turn_id }) {
             return Err(RuntimeError::InvalidPhase);
         }
@@ -878,10 +957,6 @@ impl ConversationRuntime {
             ConversationPhase::AwaitingModel {
                 turn_id: active_turn,
                 attempt_id: active_attempt,
-            }
-            | ConversationPhase::Streaming {
-                turn_id: active_turn,
-                attempt_id: active_attempt,
             } if *active_turn == turn_id && *active_attempt == attempt_id => {
                 self.phase = ConversationPhase::Cancelling {
                     turn_id,
@@ -899,17 +974,13 @@ impl ConversationRuntime {
         turn_id: u64,
         attempt_id: u64,
         outcome: ModelTerminalOutcome,
-    ) -> Result<(), RuntimeError> {
+    ) -> Result<Vec<RuntimeEffect>, RuntimeError> {
         let active = matches!(
             &self.phase,
             ConversationPhase::AwaitingModel {
                 turn_id: active_turn,
                 attempt_id: active_attempt,
             }
-                | ConversationPhase::Streaming {
-                    turn_id: active_turn,
-                    attempt_id: active_attempt,
-                }
                 | ConversationPhase::Cancelling {
                     turn_id: active_turn,
                     attempt_id: active_attempt,
@@ -920,46 +991,92 @@ impl ConversationRuntime {
         }
 
         if matches!(outcome, ModelTerminalOutcome::Completed(_)) {
+            self.model_started = false;
             self.phase = ConversationPhase::PersistingAssistant {
                 turn_id,
                 attempt_id,
             };
-            return Ok(());
+            return Ok(vec![
+                RuntimeEffect::CommitAssistant {
+                    turn_id,
+                    attempt_id,
+                },
+                RuntimeEffect::Emit(RuntimeEvent::ResponseFinished(outcome)),
+            ]);
         }
 
         let next_revision = self
             .canonical_revision
             .checked_add(1)
             .ok_or(RuntimeError::IdExhausted)?;
-        let persisted_outcome = match &outcome {
-            ModelTerminalOutcome::Interrupted(interruption) => TurnOutcome::Interrupted {
-                reason: interruption.reason.clone(),
-            },
-            ModelTerminalOutcome::Cancelled(cancellation) => TurnOutcome::Cancelled {
-                reason: cancellation.reason.clone(),
-            },
-            ModelTerminalOutcome::Failed(failure) => TurnOutcome::Failed {
-                message: failure.message.clone(),
-            },
+        let (persisted_outcome, failure_details) = match &outcome {
+            ModelTerminalOutcome::Interrupted(interruption) => (
+                TurnOutcome::Interrupted {
+                    reason: interruption.reason.clone(),
+                },
+                Some((
+                    SessionErrorCategory::Model,
+                    RuntimeFailureCategory::Model,
+                    interruption.reason.clone(),
+                )),
+            ),
+            ModelTerminalOutcome::Cancelled(cancellation) => (
+                TurnOutcome::Cancelled {
+                    reason: cancellation.reason.clone(),
+                },
+                Some((
+                    SessionErrorCategory::Model,
+                    RuntimeFailureCategory::Model,
+                    cancellation.reason.clone(),
+                )),
+            ),
+            ModelTerminalOutcome::Failed(failure) => (
+                TurnOutcome::Failed {
+                    message: failure.message.clone(),
+                },
+                Some((
+                    match failure.kind {
+                        harness_model_api::ModelFailureKind::Protocol => {
+                            SessionErrorCategory::Protocol
+                        }
+                        _ => SessionErrorCategory::Model,
+                    },
+                    match failure.kind {
+                        harness_model_api::ModelFailureKind::Protocol => {
+                            RuntimeFailureCategory::Protocol
+                        }
+                        _ => RuntimeFailureCategory::Model,
+                    },
+                    failure.message.clone(),
+                )),
+            ),
             ModelTerminalOutcome::Completed(_) => unreachable!(),
         };
-        let records = vec![SessionPayload::TurnFinished {
+        let mut records = Vec::with_capacity(2);
+        if let Some((category, _, message)) = &failure_details {
+            records.push(SessionPayload::Error {
+                turn_id,
+                category: *category,
+                message: message.clone(),
+            });
+        }
+        records.push(SessionPayload::TurnFinished {
             turn_id,
             outcome: persisted_outcome,
-        }];
+        });
         self.phase = ConversationPhase::Cancelling {
             turn_id,
             attempt_id,
         };
 
-        match self
+        let receipt = match self
             .writer
             .as_mut()
             .ok_or(RuntimeError::InvalidLifecycle)?
             .append(&records, Durability::Durable)
             .await
         {
-            Ok(_) => {}
+            Ok(receipt) => receipt,
             Err(error) => {
                 self.phase = ConversationPhase::Failed {
                     turn_id: Some(turn_id),
@@ -967,14 +1084,29 @@ impl ConversationRuntime {
                 };
                 return Err(error.into());
             }
-        }
+        };
 
         self.canonical_history.extend(records);
         self.canonical_revision = next_revision;
         self.transient_assistant.clear();
+        self.transient_reasoning_content.clear();
+        self.transient_reasoning_summary.clear();
+        self.transient_reasoning_encrypted = None;
         self.pending_interrupt = None;
+        self.model_started = false;
         self.phase = ConversationPhase::Idle;
-        Ok(())
+
+        let mut effects = Vec::with_capacity(2);
+        if let Some((_, category, message)) = failure_details {
+            effects.push(RuntimeEffect::Emit(RuntimeEvent::TranscriptAppended(
+                TranscriptSnapshotEntry {
+                    sequence: receipt.sequences.clone().next(),
+                    payload: TranscriptPayload::Error { category, message },
+                },
+            )));
+        }
+        effects.push(RuntimeEffect::Emit(RuntimeEvent::ResponseFinished(outcome)));
+        Ok(effects)
     }
 
     /// Returns the explicit persist-mode state.
@@ -1010,12 +1142,19 @@ impl ConversationRuntime {
             RuntimeCommand::SubmitPrompt { text } => {
                 let persisted_text = text.clone();
                 let receipt = self.submit_prompt(text).await?;
-                Ok(vec![RuntimeEffect::Emit(RuntimeEvent::TranscriptAppended(
-                    harness_runtime_api::TranscriptSnapshotEntry {
-                        sequence: receipt.sequences.clone().last(),
-                        payload: harness_runtime_api::TranscriptPayload::PlainText(persisted_text),
-                    },
-                ))])
+                let start_model = self.start_model_request().await?;
+                Ok(vec![
+                    RuntimeEffect::Emit(RuntimeEvent::TranscriptAppended(
+                        harness_runtime_api::TranscriptSnapshotEntry {
+                            sequence: receipt.sequences.clone().last(),
+                            payload: harness_runtime_api::TranscriptPayload::Message {
+                                role: harness_runtime_api::MessageRole::User,
+                                text: persisted_text,
+                            },
+                        },
+                    )),
+                    start_model,
+                ])
             }
             RuntimeCommand::QueueSteering { text } => {
                 if self.lifecycle != RuntimeLifecycle::Ready {
@@ -1027,7 +1166,6 @@ impl ConversationRuntime {
                 if !matches!(
                     &self.phase,
                     ConversationPhase::AwaitingModel { .. }
-                        | ConversationPhase::Streaming { .. }
                         | ConversationPhase::PreparingContinuation { .. }
                 ) {
                     return Err(RuntimeError::InvalidPhase);
@@ -1041,10 +1179,6 @@ impl ConversationRuntime {
                 }
                 let (turn_id, attempt_id) = match &self.phase {
                     ConversationPhase::AwaitingModel {
-                        turn_id,
-                        attempt_id,
-                    }
-                    | ConversationPhase::Streaming {
                         turn_id,
                         attempt_id,
                     } => (*turn_id, *attempt_id),
@@ -1081,16 +1215,14 @@ impl ConversationRuntime {
                 self.begin_shutdown()?;
                 Ok(Vec::new())
             }
-
         }
     }
-
 
     /// Persists the next queued tool call before allowing its executor to run.
     pub async fn accept_next_tool_call(
         &mut self,
         turn_id: u64,
-    ) -> Result<AppendReceipt, RuntimeError> {
+    ) -> Result<RuntimeEffect, RuntimeError> {
         if self.phase != (ConversationPhase::PreparingContinuation { turn_id }) {
             return Err(RuntimeError::InvalidPhase);
         }
@@ -1130,14 +1262,14 @@ impl ConversationRuntime {
             turn_id,
             call_id: call_id.clone(),
         };
-        let receipt = match self
+        match self
             .writer
             .as_mut()
             .ok_or(RuntimeError::InvalidLifecycle)?
             .append(&records, Durability::Durable)
             .await
         {
-            Ok(receipt) => receipt,
+            Ok(_) => {}
             Err(error) => {
                 self.phase = ConversationPhase::Failed {
                     turn_id: Some(turn_id),
@@ -1145,7 +1277,7 @@ impl ConversationRuntime {
                 };
                 return Err(error.into());
             }
-        };
+        }
         self.canonical_history.extend(records);
         self.canonical_revision = next_revision;
         self.pending_tool_calls.remove(0);
@@ -1153,12 +1285,30 @@ impl ConversationRuntime {
         self.phase = ConversationPhase::ExecutingTool {
             turn_id,
             execution_id,
-            call_id,
+            call_id: call_id.clone(),
         };
-        Ok(receipt)
+        let request = self.active_tool_execution_request(ToolExecutionPolicy {
+            deadline_ms: 30_000,
+            cancellable: true,
+        })?;
+        Ok(RuntimeEffect::ExecuteTool {
+            turn_id,
+            call_id,
+            request,
+        })
     }
 
     /// Builds an execution request for the durably accepted active tool call.
+    /// Returns the configured tool executor for composition-root orchestration.
+    pub fn tool_executor(&self) -> Result<Arc<dyn ToolExecutor>, RuntimeError> {
+        self.configuration
+            .ports
+            .tool_executor
+            .as_ref()
+            .cloned()
+            .ok_or(RuntimeError::ToolExecutorUnavailable)
+    }
+
     pub fn active_tool_execution_request(
         &self,
         policy: ToolExecutionPolicy,
@@ -1172,12 +1322,16 @@ impl ConversationRuntime {
             .as_ref()
             .ok_or(RuntimeError::InvalidPhase)?;
         let tool = ToolName::new(call.name.clone()).map_err(|_| RuntimeError::UnknownTool)?;
-        if self.configuration.ports.tool_registry.get(&tool).is_none() {
-            return Err(RuntimeError::UnknownTool);
-        }
+        let advertised = self
+            .configuration
+            .ports
+            .tool_registry
+            .get(&tool)
+            .ok_or(RuntimeError::UnknownTool)?;
         Ok(ToolExecutionRequest {
             execution_id: ToolExecutionId(execution_id),
             tool,
+            route: advertised.executor.clone(),
             input: call.input.clone(),
             policy,
         })
@@ -1190,7 +1344,7 @@ impl ConversationRuntime {
         execution_id: u64,
         call_id: String,
         output: String,
-    ) -> Result<AppendReceipt, RuntimeError> {
+    ) -> Result<Vec<RuntimeEffect>, RuntimeError> {
         if self.phase
             != (ConversationPhase::ExecutingTool {
                 turn_id,
@@ -1215,14 +1369,14 @@ impl ConversationRuntime {
             execution_id,
             call_id,
         };
-        let receipt = match self
+        match self
             .writer
             .as_mut()
             .ok_or(RuntimeError::InvalidLifecycle)?
             .append(&records, Durability::Durable)
             .await
         {
-            Ok(receipt) => receipt,
+            Ok(_) => {}
             Err(error) => {
                 self.phase = ConversationPhase::Failed {
                     turn_id: Some(turn_id),
@@ -1230,12 +1384,51 @@ impl ConversationRuntime {
                 };
                 return Err(error.into());
             }
-        };
+        }
         self.canonical_history.extend(records);
         self.canonical_revision = next_revision;
         self.active_tool_call = None;
-        self.phase = ConversationPhase::PreparingContinuation { turn_id };
-        Ok(receipt)
+        if self.pending_tool_calls.is_empty() {
+            self.phase = ConversationPhase::PreparingAttempt { turn_id };
+            Ok(vec![RuntimeEffect::ContinueModel { turn_id }])
+        } else {
+            self.phase = ConversationPhase::PreparingContinuation { turn_id };
+            Ok(vec![RuntimeEffect::ContinueTurn { turn_id }])
+        }
+    }
+
+    /// Continues a turn after the assistant response or one tool result is durable.
+    pub async fn continue_turn(
+        &mut self,
+        turn_id: u64,
+    ) -> Result<Vec<RuntimeEffect>, RuntimeError> {
+        if self.phase != (ConversationPhase::PreparingContinuation { turn_id }) {
+            return Err(RuntimeError::InvalidPhase);
+        }
+        if self.pending_tool_calls.is_empty() {
+            self.complete_turn(turn_id).await?;
+            return Ok(Vec::new());
+        }
+        Ok(vec![self.accept_next_tool_call(turn_id).await?])
+    }
+
+    /// Loads one older transcript page through the injected read port.
+    pub fn load_transcript_page(
+        &self,
+        session_id: harness_session_store::SessionId,
+        before_sequence: Option<u64>,
+        page_size: PageSize,
+    ) -> Result<RuntimeEffect, RuntimeError> {
+        if session_id != self.configuration.session_id {
+            return Err(RuntimeError::InvalidLifecycle);
+        }
+        let page = self
+            .configuration
+            .ports
+            .session_store
+            .reader()?
+            .load_older(session_id, before_sequence, page_size)?;
+        Ok(self.apply_transcript_page(page))
     }
 
     /// Projects one persisted page into exactly representable frontend entries.
@@ -1252,6 +1445,26 @@ impl ConversationRuntime {
                     SessionPayload::AssistantMessage { text, .. } => TranscriptPayload::Message {
                         role: MessageRole::Assistant,
                         text,
+                    },
+                    SessionPayload::Reasoning {
+                        summary, content, ..
+                    } => {
+                        let text = summary.or(content).unwrap_or_default();
+                        if text.is_empty() {
+                            return None;
+                        }
+                        TranscriptPayload::Thinking { text }
+                    }
+                    SessionPayload::Error {
+                        category, message, ..
+                    } => TranscriptPayload::Error {
+                        category: match category {
+                            SessionErrorCategory::Model => RuntimeFailureCategory::Model,
+                            SessionErrorCategory::Protocol => RuntimeFailureCategory::Protocol,
+                            SessionErrorCategory::Tool => RuntimeFailureCategory::Tool,
+                            SessionErrorCategory::Lifecycle => RuntimeFailureCategory::Lifecycle,
+                        },
+                        message,
                     },
                     SessionPayload::ToolExecutionFinished {
                         call_id, output, ..
@@ -1323,6 +1536,10 @@ impl ConversationRuntime {
         &self.pending_tool_inputs
     }
 
+    /// Reports whether a completed model response queued tool calls.
+    pub fn has_pending_tool_calls(&self) -> bool {
+        !self.pending_tool_calls.is_empty()
+    }
 
     /// Returns the canonical history revision used by compaction and model requests.
     pub fn canonical_revision(&self) -> u64 {
@@ -1337,6 +1554,38 @@ impl ConversationRuntime {
     /// Returns the configured session identity.
     pub fn session_id(&self) -> harness_session_store::SessionId {
         self.configuration.session_id.clone()
+    }
+
+    /// Returns the currently active model selection.
+    pub fn active_model(&self) -> &harness_model_api::ModelSelection {
+        &self.configuration.model
+    }
+
+    /// Returns the currently active model transport.
+    pub fn active_transport(&self) -> std::sync::Arc<dyn harness_model_api::ModelTransport> {
+        std::sync::Arc::clone(&self.configuration.ports.model_transport)
+    }
+
+    /// Update the transport and model route ports in-place.
+    pub fn update_ports(
+        &mut self,
+        model_transport: std::sync::Arc<dyn harness_model_api::ModelTransport>,
+        model_route: harness_model_api::ResolvedModelRoute,
+    ) {
+        self.configuration.ports.model_transport = model_transport;
+        self.configuration.ports.model_route = model_route;
+    }
+
+    /// Appends records directly to the session store.
+    pub async fn append_records(
+        &mut self,
+        records: &[SessionPayload],
+    ) -> Result<harness_session_store::AppendReceipt, RuntimeError> {
+        let writer = self.writer.as_mut().ok_or(RuntimeError::InvalidLifecycle)?;
+        writer
+            .append(records, Durability::Durable)
+            .await
+            .map_err(RuntimeError::Session)
     }
 }
 
@@ -1387,6 +1636,12 @@ pub enum RuntimeError {
     /// Model transport shutdown fails.
     #[error("model transport shutdown failed: {0:?}")]
     ModelTransport(harness_model_api::ModelFailure),
+    /// Tool execution was requested without an executor.
+    #[error("tool execution is unavailable")]
+    ToolExecutorUnavailable,
+    /// The tool registry cannot be read because its lock is poisoned.
+    #[error("tool registry is unavailable")]
+    ToolRegistryUnavailable,
     /// Runtime receives a completion for an unknown job.
     #[error("runtime received an unknown job completion")]
     UnknownJob,
@@ -1447,6 +1702,7 @@ pub trait ModelRequestBuilder: Send + Sync {
         &self,
         revision: u64,
         selection: &ModelSelection,
+        provider_generation: ProviderGeneration,
         history: &[SessionPayload],
         steering: &[String],
     ) -> Result<Arc<ModelRequest>, RuntimeError>;
@@ -1455,19 +1711,40 @@ pub trait ModelRequestBuilder: Send + Sync {
 /// Effect scheduled by a reducer transition.
 #[derive(Debug)]
 pub enum RuntimeEffect {
-    /// Append records with explicit durability.
-    Append {
-        /// Payloads to append.
-        records: Vec<SessionPayload>,
-        /// Required durability.
-        durability: Durability,
-    },
     /// Start one model attempt.
     StartModel {
+        /// Turn owning the attempt.
+        turn_id: u64,
         /// Attempt to submit.
         attempt: Arc<ModelAttempt>,
         /// Route selected for this attempt.
         route: ResolvedModelRoute,
+    },
+    /// Commit one completed assistant response.
+    CommitAssistant {
+        /// Turn owning the response.
+        turn_id: u64,
+        /// Attempt that produced the response.
+        attempt_id: u64,
+    },
+    /// Continue a turn after durable assistant or tool state.
+    ContinueTurn {
+        /// Turn to continue.
+        turn_id: u64,
+    },
+    /// Start another model attempt after durable tool output.
+    ContinueModel {
+        /// Turn owning the next attempt.
+        turn_id: u64,
+    },
+    /// Execute one durably accepted tool call.
+    ExecuteTool {
+        /// Turn owning the tool call.
+        turn_id: u64,
+        /// Model call identifier.
+        call_id: String,
+        /// Request prepared by the reducer.
+        request: ToolExecutionRequest,
     },
     /// Loads one older transcript page outside the reducer.
     LoadTranscriptPage {
@@ -1480,8 +1757,6 @@ pub enum RuntimeEffect {
     },
     /// Emit one frontend event.
     Emit(RuntimeEvent),
-    /// Await a frontend command.
-    ContinueReceiving(RuntimeCommand),
 }
 
 /// Durable append completion returned to the reducer.
@@ -1492,7 +1767,6 @@ pub struct AppendCompletion {
     /// Records acknowledged by storage.
     pub records: Vec<SessionPayload>,
 }
-
 
 /// Writer capability used by the runtime after it has acquired a unique lease.
 pub struct RuntimeSessionWriter {

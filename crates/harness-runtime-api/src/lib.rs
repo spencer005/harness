@@ -1,14 +1,34 @@
 //! Frontend/runtime contracts and bounded command/event channels.
 
-
-use harness_model_api::{
-    ContextLimits, ModelCapabilities, ModelSelection, ModelTerminalOutcome,
-};
-
+use crossfire::{AsyncRx, MAsyncTx, TrySendError, mpsc::Array};
+use harness_model_api::{ContextLimits, ModelCapabilities, ModelSelection, ModelTerminalOutcome};
 use harness_tool_api::ToolInput;
-use tokio::sync::mpsc;
 
-const DEFAULT_CHANNEL_CAPACITY: usize = 64;
+/// Error returned when a runtime channel cannot accept a message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeSendError {
+    /// The receiver side of the channel is closed.
+    Closed,
+    /// The channel is currently full.
+    Full,
+}
+
+/// Error returned when the runtime channel is closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeClosed;
+
+impl std::fmt::Display for RuntimeClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "runtime channel closed")
+    }
+}
+
+impl std::error::Error for RuntimeClosed {}
+
+/// Asynchronous sender used for runtime command and event mailboxes.
+pub type RuntimeSender<T> = MAsyncTx<Array<T>>;
+/// Asynchronous receiver used for runtime command and event mailboxes.
+pub type RuntimeReceiver<T> = AsyncRx<Array<T>>;
 
 /// Command sent from a frontend to the conversation runtime.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,25 +54,62 @@ pub enum RuntimeEvent {
     TranscriptAppended(TranscriptSnapshotEntry),
     /// A transcript page is loaded.
     TranscriptPageLoaded(TranscriptPage),
+    /// Persisted sequences are assigned to the active streamed entries.
+    TranscriptCommitted {
+        /// Sequence assigned to the reasoning entry, when reasoning is persisted.
+        reasoning_sequence: Option<u64>,
+        /// Sequence assigned to the assistant message entry.
+        assistant_sequence: u64,
+    },
     /// The provider changes.
     ProviderChanged(ProviderSummary),
     /// The model changes.
     ModelChanged(ModelSummary),
     /// An agent changes.
     AgentChanged(AgentSummary),
+    /// An agent was removed from the registry.
+    AgentRemoved(u64),
     /// A background activity changes.
     ActivityChanged(Activity),
     /// Model response streaming starts.
     ResponseStarted,
     /// Assistant text arrives incrementally.
     AssistantTextDelta(String),
+    /// Reasoning summary text arrives incrementally.
+    ReasoningSummaryDelta(String),
+    /// Raw reasoning content arrives incrementally.
+    ReasoningContentDelta(String),
     /// Model response reaches a terminal outcome.
     ResponseFinished(ModelTerminalOutcome),
-
+    /// Estimated context-window token usage.
+    ContextUsage(ContextUsage),
+    /// A compaction operation completed with a summary.
+    CompactionCompleted(String),
+    /// The root agentic work cycle started.
+    AgenticLoopStarted,
+    /// The root agentic work cycle completed.
+    AgenticLoopCompleted,
+    /// Root developer-mode routing changed.
+    DeveloperModeChanged(bool),
+    /// First assistant token timing observation.
+    AssistantFirstToken(u64),
+    /// Runtime steering queue state changed.
+    SteeringChanged(Option<String>),
     /// Runtime reports a typed failure.
     Failure(RuntimeFailure),
     /// Runtime acknowledges joined shutdown.
     ShutdownComplete,
+}
+
+/// Frontend-facing context-window token usage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextUsage {
+    /// Estimated current input tokens.
+    pub estimated_input_tokens: u64,
+    /// Maximum accepted input tokens.
+    pub max_input_tokens: u64,
+    /// Threshold that triggers compaction.
+    pub compact_at_tokens: u64,
 }
 
 /// Persisted transcript entry with stable identity.
@@ -88,6 +145,15 @@ pub enum TranscriptPayload {
     },
     /// Plain text payload.
     PlainText(String),
+    /// Reasoning content or summary shown as a thinking block.
+    Thinking { text: String },
+    /// Turn-local provider, protocol, or execution failure.
+    Error {
+        /// Failure category.
+        category: RuntimeFailureCategory,
+        /// Original failure detail.
+        message: String,
+    },
 }
 
 /// Transcript message role.
@@ -212,6 +278,8 @@ pub enum RuntimeFailureCategory {
     Protocol,
     /// Runtime lifecycle failure.
     Lifecycle,
+    /// A frontend command is rejected before it changes runtime state.
+    Command,
 }
 
 /// Envelope that gives every event a stable runtime sequence.
@@ -223,105 +291,141 @@ pub struct RuntimeEventEnvelope {
     pub event: RuntimeEvent,
 }
 
-/// Error returned when a runtime channel closes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RuntimeClosed;
+impl RuntimeEventEnvelope {
+    /// Creates an event envelope with an explicit sequence.
+    pub fn new(sequence: u64, event: RuntimeEvent) -> Self {
+        Self { sequence, event }
+    }
+}
 
 /// Command sender with bounded backpressure.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RuntimeCommandSender {
-    sender: mpsc::Sender<RuntimeCommand>,
+    tx: RuntimeSender<RuntimeCommand>,
+}
+
+impl std::fmt::Debug for RuntimeCommandSender {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeCommandSender")
+            .finish_non_exhaustive()
+    }
+}
+
+impl RuntimeCommandSender {
+    /// Create a command sender from a crossfire mailbox sender.
+    pub fn new(tx: RuntimeSender<RuntimeCommand>) -> Self {
+        Self { tx }
+    }
+
+    /// Send a command asynchronously, waiting for mailbox capacity.
+    pub async fn send(&self, command: RuntimeCommand) -> Result<(), RuntimeClosed> {
+        self.tx.send(command).await.map_err(|_| RuntimeClosed)
+    }
+
+    /// Try to send a command without waiting for mailbox capacity.
+    pub fn try_send(&self, command: RuntimeCommand) -> Result<(), RuntimeSendError> {
+        self.tx.try_send(command).map_err(|err| match err {
+            TrySendError::Full(_) => RuntimeSendError::Full,
+            TrySendError::Disconnected(_) => RuntimeSendError::Closed,
+        })
+    }
 }
 
 /// Command receiver.
 #[derive(Debug)]
 pub struct RuntimeCommandReceiver {
-    receiver: mpsc::Receiver<RuntimeCommand>,
+    rx: RuntimeReceiver<RuntimeCommand>,
+}
+
+impl RuntimeCommandReceiver {
+    /// Create a command receiver from a crossfire mailbox receiver.
+    pub fn new(rx: RuntimeReceiver<RuntimeCommand>) -> Self {
+        Self { rx }
+    }
+
+    /// Receive the next command.
+    pub async fn recv(&mut self) -> Result<RuntimeCommand, RuntimeClosed> {
+        self.rx.recv().await.map_err(|_| RuntimeClosed)
+    }
 }
 
 /// Event sender with bounded backpressure.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RuntimeEventSender {
-    sender: mpsc::Sender<RuntimeEventEnvelope>,
+    tx: RuntimeSender<RuntimeEventEnvelope>,
+}
+
+impl std::fmt::Debug for RuntimeEventSender {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeEventSender").finish_non_exhaustive()
+    }
+}
+
+impl RuntimeEventSender {
+    /// Create an event sender from a crossfire mailbox sender.
+    pub fn new(tx: RuntimeSender<RuntimeEventEnvelope>) -> Self {
+        Self { tx }
+    }
+
+    /// Send an event envelope asynchronously, waiting for mailbox capacity.
+    pub async fn send(&self, event: RuntimeEventEnvelope) -> Result<(), RuntimeClosed> {
+        self.tx.send(event).await.map_err(|_| RuntimeClosed)
+    }
+
+    /// Try to send an event envelope without waiting for mailbox capacity.
+    pub fn try_send(&self, event: RuntimeEventEnvelope) -> Result<(), RuntimeSendError> {
+        self.tx.try_send(event).map_err(|err| match err {
+            TrySendError::Full(_) => RuntimeSendError::Full,
+            TrySendError::Disconnected(_) => RuntimeSendError::Closed,
+        })
+    }
 }
 
 /// Event receiver.
 #[derive(Debug)]
 pub struct RuntimeEventReceiver {
-    receiver: mpsc::Receiver<RuntimeEventEnvelope>,
+    rx: RuntimeReceiver<RuntimeEventEnvelope>,
 }
 
-/// Creates bounded frontend/runtime command and event channels.
+/// Create a command and event channel pair.
+///
+/// Returns `(command_sender, event_receiver, event_sender, command_receiver)`.
 pub fn channel_pair(
     capacity: usize,
 ) -> (
     RuntimeCommandSender,
-    RuntimeCommandReceiver,
-    RuntimeEventSender,
     RuntimeEventReceiver,
+    RuntimeEventSender,
+    RuntimeCommandReceiver,
 ) {
-    assert!(capacity > 0, "runtime channel capacity must be positive");
-    let (command_sender, command_receiver) = mpsc::channel(capacity);
-    let (event_sender, event_receiver) = mpsc::channel(capacity);
+    let (cmd_tx, cmd_rx) = crossfire::mpsc::bounded_async(capacity);
+    let (evt_tx, evt_rx) = crossfire::mpsc::bounded_async(capacity);
     (
-        RuntimeCommandSender {
-            sender: command_sender,
-        },
-        RuntimeCommandReceiver {
-            receiver: command_receiver,
-        },
-        RuntimeEventSender {
-            sender: event_sender,
-        },
-        RuntimeEventReceiver {
-            receiver: event_receiver,
-        },
+        RuntimeCommandSender::new(cmd_tx),
+        RuntimeEventReceiver::new(evt_rx),
+        RuntimeEventSender::new(evt_tx),
+        RuntimeCommandReceiver::new(cmd_rx),
     )
 }
 
-/// Creates channels with the standard bounded capacity.
-pub fn default_channel_pair() -> (
-    RuntimeCommandSender,
-    RuntimeCommandReceiver,
-    RuntimeEventSender,
-    RuntimeEventReceiver,
-) {
-    channel_pair(DEFAULT_CHANNEL_CAPACITY)
-}
-
-impl RuntimeCommandSender {
-    /// Sends a command, waiting when the bounded queue is full.
-    pub async fn send(&self, command: RuntimeCommand) -> Result<(), RuntimeClosed> {
-        self.sender.send(command).await.map_err(|_| RuntimeClosed)
-    }
-}
-
-impl RuntimeCommandReceiver {
-    /// Receives the next command.
-
-    pub async fn recv(&mut self) -> Result<RuntimeCommand, RuntimeClosed> {
-        self.receiver.recv().await.ok_or(RuntimeClosed)
-    }
-}
-
-impl RuntimeEventSender {
-    /// Sends an event envelope, waiting when the bounded queue is full.
-    pub async fn send(&self, event: RuntimeEventEnvelope) -> Result<(), RuntimeClosed> {
-        self.sender.send(event).await.map_err(|_| RuntimeClosed)
-    }
-}
-
 impl RuntimeEventReceiver {
-    /// Receives the next event envelope.
-    pub async fn recv(&mut self) -> Result<RuntimeEventEnvelope, RuntimeClosed> {
-        self.receiver.recv().await.ok_or(RuntimeClosed)
+    /// Create an event receiver from a crossfire mailbox receiver.
+    pub fn new(rx: RuntimeReceiver<RuntimeEventEnvelope>) -> Self {
+        Self { rx }
     }
-}
 
-impl RuntimeEventEnvelope {
-    /// Creates an event envelope with an explicit sequence.
-    pub fn new(sequence: u64, event: RuntimeEvent) -> Self {
-        Self { sequence, event }
+    /// Receive the next event envelope.
+    pub async fn recv(&mut self) -> Result<RuntimeEventEnvelope, RuntimeClosed> {
+        self.rx.recv().await.map_err(|_| RuntimeClosed)
+    }
+
+    /// Drain a single event without waiting, or returns `None` when empty.
+    pub fn try_recv(&mut self) -> Result<Option<RuntimeEventEnvelope>, RuntimeClosed> {
+        match self.rx.try_recv() {
+            Ok(message) => Ok(Some(message)),
+            Err(crossfire::TryRecvError::Empty) => Ok(None),
+            Err(crossfire::TryRecvError::Disconnected) => Err(RuntimeClosed),
+        }
     }
 }
 

@@ -1,0 +1,2 @@
+start: query
+query: /[\s\S]+/

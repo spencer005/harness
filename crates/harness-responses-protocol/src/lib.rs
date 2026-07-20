@@ -1,15 +1,24 @@
-//! Pure incremental framing and typed event decoding for Responses streams.
+//! OpenResponses wire framing and typed event decoding.
+//!
+//! The request and stream handling follows the OpenResponses specification:
+//! <https://www.openresponses.org/specification>.
+//! SSE framing follows the WHATWG server-sent events algorithm.
 
 use harness_model_api::{
-    ModelCompletion, ModelEvent, ModelFailure, ModelFailureKind, ModelInterruption, ModelUsage,
-    ModelTerminalOutcome, ToolCall, ToolInputDelta,
+    ModelCompletion, ModelEvent, ModelFailure, ModelFailureKind, ModelInput, ModelInterruption,
+    ModelMessageRole, ModelReasoning, ModelTerminalOutcome, ModelUsage, ToolCall, ToolInputDelta,
 };
-use harness_tool_api::ToolInput;
+use harness_tool_api::{GrammarSyntax, ToolDefinition, ToolInput, ToolInputSchema};
 use serde_json::Value;
 use thiserror::Error;
 
 /// Default maximum size of one SSE event payload.
 pub const DEFAULT_MAX_EVENT_BYTES: usize = 1_048_576;
+
+// WHATWG SSE permits one leading UTF-8 BOM before the first field.
+const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
+// `data:` plus its optional single separating space, per the SSE field grammar.
+const MAX_FIELD_PREFIX_BYTES: usize = "data: ".len();
 
 /// One complete server-sent event payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,6 +33,8 @@ pub struct SseDecoder {
     line: Vec<u8>,
     data: Vec<u8>,
     max_event_bytes: usize,
+    skip_lf_after_cr: bool,
+    started: bool,
 }
 
 impl SseDecoder {
@@ -36,52 +47,68 @@ impl SseDecoder {
             line: Vec::new(),
             data: Vec::new(),
             max_event_bytes,
+            skip_lf_after_cr: false,
+            started: false,
         })
     }
 
-    /// Feeds bytes and returns every complete event found in the input.
     /// Feeds bytes and returns every complete event found in the input.
     pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<SseEvent>, SseDecodeError> {
         let mut events = Vec::new();
 
         for &byte in bytes {
-            self.line.push(byte);
-            if self.line.len() > self.max_event_bytes.saturating_add(6) {
-                return Err(SseDecodeError::EventTooLarge {
-                    limit: self.max_event_bytes,
-                });
+            if self.skip_lf_after_cr {
+                self.skip_lf_after_cr = false;
+                if byte == b'\n' {
+                    continue;
+                }
             }
-            if byte == b'\n' {
-                let line = std::mem::take(&mut self.line);
-                self.consume_line(&line, &mut events)?;
+
+            match byte {
+                // WHATWG defines CRLF, LF, and CR as line endings. Process
+                // CR now and suppress only a following LF as the second half
+                // of the same CRLF terminator.
+                b'\r' => {
+                    self.consume_line(&mut events)?;
+                    self.skip_lf_after_cr = true;
+                }
+                b'\n' => self.consume_line(&mut events)?,
+                byte => {
+                    self.line.push(byte);
+                    if self.line.len() > self.max_event_bytes.saturating_add(MAX_FIELD_PREFIX_BYTES)
+                    {
+                        return Err(SseDecodeError::EventTooLarge {
+                            limit: self.max_event_bytes,
+                        });
+                    }
+                }
             }
         }
 
         Ok(events)
     }
 
-
-    /// Finishes the stream and rejects an incomplete UTF-8 line or event.
+    /// Finishes the stream, discarding any unterminated event as required by SSE.
     pub fn finish(&mut self) -> Result<Vec<SseEvent>, SseDecodeError> {
-        let mut events = Vec::new();
+        let events = Vec::new();
         if !self.line.is_empty() {
-            let line = std::mem::take(&mut self.line);
-            self.consume_line(&line, &mut events)?;
+            // The WHATWG algorithm discards an event that is not terminated by
+            // a blank line when the stream ends.
+            self.line.clear();
         }
-        if !self.data.is_empty() {
-            return Err(SseDecodeError::IncompleteEvent);
-        }
+        self.data.clear();
         Ok(events)
     }
 
-    fn consume_line(
-        &mut self,
-        line: &[u8],
-        events: &mut Vec<SseEvent>,
-    ) -> Result<(), SseDecodeError> {
-        let line = line.strip_suffix(b"\n").unwrap_or(line);
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        let line = std::str::from_utf8(line).map_err(SseDecodeError::InvalidUtf8)?;
+    fn consume_line(&mut self, events: &mut Vec<SseEvent>) -> Result<(), SseDecodeError> {
+        let mut line = std::mem::take(&mut self.line);
+        if !self.started {
+            self.started = true;
+            if line.starts_with(UTF8_BOM) {
+                line.drain(..UTF8_BOM.len());
+            }
+        }
+        let line = std::str::from_utf8(&line).map_err(SseDecodeError::InvalidUtf8)?;
 
         if line.is_empty() {
             if !self.data.is_empty() {
@@ -97,20 +124,30 @@ impl SseDecoder {
             return Ok(());
         }
 
-        let Some(value) = line.strip_prefix("data:") else {
-            return Err(SseDecodeError::UnexpectedField(line.to_owned()));
-        };
-        let value = value.strip_prefix(' ').unwrap_or(value);
-        let additional_bytes = value.len() + usize::from(!self.data.is_empty());
-        if self.data.len() + additional_bytes > self.max_event_bytes {
-            return Err(SseDecodeError::EventTooLarge {
-                limit: self.max_event_bytes,
-            });
+        let (field, value) = line
+            .split_once(':')
+            .map(|(field, value)| (field, value.strip_prefix(' ').unwrap_or(value)))
+            .unwrap_or((line, ""));
+
+        match field {
+            // The typed decoder dispatches on the JSON `type`, so SSE event
+            // names and reconnection metadata are intentionally not surfaced.
+            "event" | "id" | "retry" => {}
+            "data" => {
+                let additional_bytes = value.len() + usize::from(!self.data.is_empty());
+                if self.data.len() + additional_bytes > self.max_event_bytes {
+                    return Err(SseDecodeError::EventTooLarge {
+                        limit: self.max_event_bytes,
+                    });
+                }
+                if !self.data.is_empty() {
+                    self.data.push(b'\n');
+                }
+                self.data.extend_from_slice(value.as_bytes());
+            }
+            // WHATWG specifies that unknown fields are ignored.
+            _ => {}
         }
-        if !self.data.is_empty() {
-            self.data.push(b'\n');
-        }
-        self.data.extend_from_slice(value.as_bytes());
         Ok(())
     }
 }
@@ -123,18 +160,12 @@ pub struct InvalidEventLimit;
 /// Failure returned by incremental SSE decoding.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum SseDecodeError {
-    /// A field other than `data` or a comment appears.
-    #[error("unexpected SSE field: {0}")]
-    UnexpectedField(String),
     /// An SSE event exceeds the configured byte limit.
     #[error("SSE event exceeds the {limit}-byte limit")]
     EventTooLarge { limit: usize },
     /// A byte sequence is not valid UTF-8.
     #[error("SSE input contains invalid UTF-8")]
     InvalidUtf8(#[source] std::str::Utf8Error),
-    /// The stream ends in the middle of an event.
-    #[error("SSE stream ends with an incomplete event")]
-    IncompleteEvent,
 }
 
 /// Decoder state for one Responses model attempt.
@@ -144,7 +175,6 @@ pub struct ResponsesEventDecoder {
     assistant_text: String,
     usage: Option<ModelUsage>,
     terminal_seen: bool,
-
 }
 
 impl ResponsesEventDecoder {
@@ -189,7 +219,79 @@ impl ResponsesEventDecoder {
             return Ok(None);
         }
 
-        let event = decode_event(payload, &mut self.assistant_text, &mut self.usage)?;
+        let value: Value = serde_json::from_str(payload)?;
+        let event_type = value
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or(ProtocolError::MissingEventType)?;
+
+        if event_type == "response.output_item.added"
+            && value
+                .get("item")
+                .and_then(|item| item.get("type"))
+                .and_then(Value::as_str)
+                == Some("reasoning")
+        {
+            let item = value
+                .get("item")
+                .ok_or(ProtocolError::InvalidField { field: "item" })?;
+            return Ok(Some(ModelEvent::ReasoningItem(decode_reasoning_item(
+                item,
+            )?)));
+        }
+
+        if event_type == "response.content_part.added"
+            && value
+                .get("part")
+                .and_then(|part| part.get("type"))
+                .and_then(Value::as_str)
+                == Some("reasoning_text")
+        {
+            let part = value
+                .get("part")
+                .ok_or(ProtocolError::InvalidField { field: "part" })?;
+            let text = part.get("text").and_then(Value::as_str).unwrap_or_default();
+            if !text.is_empty() {
+                return Ok(Some(ModelEvent::ReasoningContentDelta(text.to_owned())));
+            }
+        }
+
+        // OpenResponses emits item and content lifecycle events around the
+        // semantic deltas. The runtime consumes lifecycle-only events after
+        // preserving any reasoning item data carried by them.
+        if matches!(
+            event_type,
+            "response.created"
+                | "response.in_progress"
+                | "response.output_item.added"
+                | "response.content_part.added"
+                | "response.content_part.done"
+                | "response.output_text.done"
+                | "response.reasoning_summary_part.added"
+                | "response.reasoning_summary_text.done"
+                | "response.reasoning_summary_part.done"
+                | "response.reasoning_text.done"
+        ) {
+            return Ok(None);
+        }
+
+        if event_type == "response.output_item.done"
+            && !matches!(
+                value
+                    .get("item")
+                    .and_then(|item| item.get("type"))
+                    .and_then(Value::as_str),
+                Some("function_call" | "custom_tool_call" | "reasoning")
+            )
+        {
+            return Ok(None);
+        }
+
+        let event = match decode_event_value(&value, &mut self.assistant_text, &mut self.usage) {
+            Ok(event) => event,
+            Err(ProtocolError::UnsupportedEvent(_)) if event_type.contains(':') => return Ok(None),
+            Err(error) => return Err(error),
+        };
         if matches!(event, ModelEvent::Terminal(_)) {
             if self.terminal_seen {
                 return Err(ProtocolError::DuplicateTerminal);
@@ -198,7 +300,6 @@ impl ResponsesEventDecoder {
         }
         Ok(Some(event))
     }
-
 }
 
 impl Default for ResponsesEventDecoder {
@@ -228,6 +329,9 @@ pub enum ProtocolError {
     /// More than one terminal outcome appears in one stream.
     #[error("Responses stream contains more than one terminal outcome")]
     DuplicateTerminal,
+    /// A tool's serialized JSON schema is invalid.
+    #[error("tool `{name}` has an invalid JSON schema: {reason}")]
+    InvalidToolSchema { name: String, reason: String },
 }
 
 /// Decodes one complete Responses JSON event.
@@ -237,6 +341,14 @@ pub fn decode_event(
     usage: &mut Option<ModelUsage>,
 ) -> Result<ModelEvent, ProtocolError> {
     let value: Value = serde_json::from_str(payload)?;
+    decode_event_value(&value, assistant_text, usage)
+}
+
+fn decode_event_value(
+    value: &Value,
+    assistant_text: &mut String,
+    usage: &mut Option<ModelUsage>,
+) -> Result<ModelEvent, ProtocolError> {
     let event_type = value
         .get("type")
         .and_then(Value::as_str)
@@ -249,13 +361,24 @@ pub fn decode_event(
             assistant_text.push_str(delta);
             Ok(ModelEvent::AssistantTextDelta(delta.to_owned()))
         }
-        "response.function_call_arguments.delta" => Ok(ModelEvent::ToolInputDelta(
-            ToolInputDelta {
-                call_id: string_field(&value, "item_id")?.to_owned(),
-                fragment: string_field(&value, "delta")?.to_owned(),
-            },
+        "response.reasoning_summary_text.delta" => Ok(ModelEvent::ReasoningSummaryDelta(
+            string_field(&value, "delta")?.to_owned(),
         )),
-        "response.output_item.done" => decode_tool_call(&value),
+        "response.reasoning_text.delta" => Ok(ModelEvent::ReasoningContentDelta(
+            string_field(&value, "delta")?.to_owned(),
+        )),
+        "response.function_call_arguments.delta" | "response.custom_tool_call_input.delta" => {
+            Ok(ModelEvent::ToolInputDelta(ToolInputDelta {
+                call_id: value
+                    .get("call_id")
+                    .or_else(|| value.get("item_id"))
+                    .and_then(Value::as_str)
+                    .ok_or(ProtocolError::InvalidField { field: "call_id" })?
+                    .to_owned(),
+                fragment: string_field(&value, "delta")?.to_owned(),
+            }))
+        }
+        "response.output_item.done" => decode_output_item(&value),
         "response.completed" => {
             *usage = extract_usage(&value);
             Ok(ModelEvent::Terminal(ModelTerminalOutcome::Completed(
@@ -276,8 +399,12 @@ pub fn decode_event(
             ModelFailure {
                 kind: ModelFailureKind::ProviderRejected,
                 message: value
-                    .get("response")
-                    .and_then(|response| response.get("error"))
+                    .get("error")
+                    .or_else(|| {
+                        value
+                            .get("response")
+                            .and_then(|response| response.get("error"))
+                    })
                     .and_then(|error| error.get("message"))
                     .and_then(Value::as_str)
                     .unwrap_or("Responses provider reported a failure")
@@ -293,23 +420,66 @@ pub fn decode_event(
     }
 }
 
-fn decode_tool_call(value: &Value) -> Result<ModelEvent, ProtocolError> {
+fn decode_output_item(value: &Value) -> Result<ModelEvent, ProtocolError> {
     let item = value
         .get("item")
         .ok_or(ProtocolError::InvalidField { field: "item" })?;
-    if item.get("type").and_then(Value::as_str) != Some("function_call") {
-        return Err(ProtocolError::UnsupportedEvent(
-            item.get("type")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown")
-                .to_owned(),
-        ));
+    match item.get("type").and_then(Value::as_str) {
+        Some("function_call") => Ok(ModelEvent::ToolCall(ToolCall {
+            call_id: string_field(item, "call_id")?.to_owned(),
+            name: string_field(item, "name")?.to_owned(),
+            input: ToolInput::FunctionJson(string_field(item, "arguments")?.to_owned()),
+        })),
+        Some("custom_tool_call") => Ok(ModelEvent::ToolCall(ToolCall {
+            call_id: string_field(item, "call_id")?.to_owned(),
+            name: string_field(item, "name")?.to_owned(),
+            input: ToolInput::Freeform(string_field(item, "input")?.to_owned()),
+        })),
+        Some("reasoning") => Ok(ModelEvent::ReasoningItem(decode_reasoning_item(item)?)),
+        Some(item_type) => Err(ProtocolError::UnsupportedEvent(item_type.to_owned())),
+        None => Err(ProtocolError::InvalidField { field: "item.type" }),
     }
-    Ok(ModelEvent::ToolCall(ToolCall {
-        call_id: string_field(item, "call_id")?.to_owned(),
-        name: string_field(item, "name")?.to_owned(),
-        input: ToolInput::FunctionJson(string_field(item, "arguments")?.to_owned()),
-    }))
+}
+
+fn decode_reasoning_item(item: &Value) -> Result<ModelReasoning, ProtocolError> {
+    Ok(ModelReasoning {
+        content: reasoning_text_array(item, "content")?,
+        encrypted_content: item
+            .get("encrypted_content")
+            .filter(|value| !value.is_null())
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| value.to_string())
+            }),
+        summary: reasoning_text_array(item, "summary")?,
+    })
+}
+
+fn reasoning_text_array(
+    item: &Value,
+    field: &'static str,
+) -> Result<Option<String>, ProtocolError> {
+    let Some(value) = item.get(field) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    if let Some(text) = value.as_str() {
+        return Ok(Some(text.to_owned()));
+    }
+    let Some(parts) = value.as_array() else {
+        return Err(ProtocolError::InvalidField { field });
+    };
+    let mut text = String::new();
+    for part in parts {
+        if let Some(part_text) = part.get("text").and_then(Value::as_str) {
+            text.push_str(part_text);
+        }
+    }
+    Ok(Some(text))
 }
 
 fn string_field<'a>(value: &'a Value, field: &'static str) -> Result<&'a str, ProtocolError> {
@@ -317,6 +487,128 @@ fn string_field<'a>(value: &'a Value, field: &'static str) -> Result<&'a str, Pr
         .get(field)
         .and_then(Value::as_str)
         .ok_or(ProtocolError::InvalidField { field })
+}
+
+/// Encodes canonical model input as Responses items.
+pub fn encode_input(input: &[ModelInput]) -> Vec<sonic_rs::Value> {
+    input
+        .iter()
+        .map(|item| match item {
+            ModelInput::Message { role, text } => {
+                let role = match role {
+                    ModelMessageRole::Developer => "developer",
+                    ModelMessageRole::User => "user",
+                    ModelMessageRole::Assistant => "assistant",
+                };
+                let content_type = match role {
+                    "assistant" => "output_text",
+                    _ => "input_text",
+                };
+                sonic_rs::json!({
+                    "type": "message",
+                    "role": role,
+                    "content": [{ "type": content_type, "text": text }]
+                })
+            }
+            ModelInput::AssistantToolCall {
+                call_id,
+                name,
+                arguments,
+            } => sonic_rs::json!({
+                "type": "function_call",
+                "call_id": call_id,
+                "name": name,
+                "arguments": arguments,
+                "status": "completed"
+            }),
+            ModelInput::FreeformToolCall {
+                call_id,
+                name,
+                input,
+            } => sonic_rs::json!({
+                "type": "custom_tool_call",
+                "call_id": call_id,
+                "name": name,
+                "input": input,
+                "status": "completed"
+            }),
+            ModelInput::ToolResult { call_id, output } => sonic_rs::json!({
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": output
+            }),
+            ModelInput::FreeformToolResult { call_id, output } => sonic_rs::json!({
+                "type": "custom_tool_call_output",
+                "call_id": call_id,
+                "output": output
+            }),
+            ModelInput::Reasoning {
+                content,
+                encrypted_content,
+                summary,
+            } => {
+                let mut item = sonic_rs::json!({
+                    "type": "reasoning",
+                    "status": "completed",
+                });
+                if let Some(content) = content {
+                    item["content"] = sonic_rs::json!([{
+                        "type": "output_text",
+                        "text": content,
+                    }]);
+                }
+                if let Some(encrypted_content) = encrypted_content {
+                    item["encrypted_content"] = sonic_rs::json!(encrypted_content);
+                }
+                if let Some(summary) = summary {
+                    item["summary"] = sonic_rs::json!([{
+                        "type": "summary_text",
+                        "text": summary,
+                    }]);
+                }
+                item
+            }
+        })
+        .collect()
+}
+
+/// Encodes canonical tool definitions using the Responses function format.
+pub fn encode_tools(tools: &[ToolDefinition]) -> Result<Vec<sonic_rs::Value>, ProtocolError> {
+    tools
+        .iter()
+        .map(|tool| {
+            let parameters: sonic_rs::Value = match &tool.input_schema {
+                ToolInputSchema::JsonSchema(schema) => sonic_rs::from_str(schema.as_str())
+                    .map_err(|error| ProtocolError::InvalidToolSchema {
+                        name: tool.name.as_str().to_owned(),
+                        reason: error.to_string(),
+                    })?,
+                ToolInputSchema::FreeformGrammar { syntax, definition } => {
+                    let syntax = match syntax {
+                        GrammarSyntax::Regex => "regex",
+                        GrammarSyntax::Lark => "lark",
+                    };
+                    return Ok(sonic_rs::json!({
+                        "type": "custom",
+                        "name": tool.name.as_str(),
+                        "description": tool.description,
+                        "format": {
+                            "type": "grammar",
+                            "syntax": syntax,
+                            "definition": definition
+                        }
+                    }));
+                }
+            };
+
+            Ok(sonic_rs::json!({
+                "type": "function",
+                "name": tool.name.as_str(),
+                "description": tool.description,
+                "parameters": parameters
+            }))
+        })
+        .collect()
 }
 
 fn extract_usage(value: &Value) -> Option<ModelUsage> {
@@ -335,10 +627,14 @@ mod tests {
     fn sse_decoder_accepts_byte_split_event() {
         let mut decoder = SseDecoder::new(128).unwrap();
         assert!(decoder.push(b"da").unwrap().is_empty());
-        assert!(decoder.push(b"ta: {\"type\":\"response.created\"}\r\n\r\n").unwrap()
-            == vec![SseEvent {
-                data: "{\"type\":\"response.created\"}".to_owned(),
-            }]);
+        assert!(
+            decoder
+                .push(b"ta: {\"type\":\"response.created\"}\r\n\r\n")
+                .unwrap()
+                == vec![SseEvent {
+                    data: "{\"type\":\"response.created\"}".to_owned(),
+                }]
+        );
     }
 
     #[test]
@@ -356,6 +652,34 @@ mod tests {
     }
 
     #[test]
+    fn sse_decoder_ignores_event_metadata() {
+        let mut decoder = SseDecoder::new(128).unwrap();
+        let events = decoder
+            .push(b"event: response.created\ndata: {\"type\":\"response.created\"}\n\n")
+            .unwrap();
+        assert_eq!(
+            events,
+            vec![SseEvent {
+                data: "{\"type\":\"response.created\"}".to_owned()
+            }]
+        );
+    }
+
+    #[test]
+    fn sse_decoder_accepts_all_standard_line_endings_and_unknown_fields() {
+        let mut decoder = SseDecoder::new(128).unwrap();
+        let events = decoder
+            .push(b"unknown: ignored\rdata: one\rdata: two\r\r")
+            .unwrap();
+        assert_eq!(
+            events,
+            vec![SseEvent {
+                data: "one\ntwo".to_owned()
+            }]
+        );
+    }
+
+    #[test]
     fn event_decoder_keeps_terminal_outcomes_distinct() {
         let mut decoder = ResponsesEventDecoder::new();
         let events = decoder
@@ -365,6 +689,33 @@ mod tests {
             events.as_slice(),
             [ModelEvent::Terminal(ModelTerminalOutcome::Interrupted(_))]
         ));
+    }
+
+    #[test]
+    fn lifecycle_events_do_not_emit_runtime_events() {
+        let mut decoder = ResponsesEventDecoder::new();
+        assert!(decoder
+            .push(b"event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\"}}\n\n")
+            .unwrap()
+            .is_empty());
+        assert!(
+            decoder
+                .push(b"data: {\"type\":\"response.content_part.added\"}\n\n")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(decoder
+            .push(b"data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"status\":\"completed\"}}\n\n")
+            .unwrap()
+            .is_empty());
+        assert!(
+            decoder
+                .push(b"data: {\"type\":\"vendor:trace\",\"sequence_number\":1}\n\n")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     #[test]
     fn done_sentinel_does_not_become_completion() {
         let mut decoder = ResponsesEventDecoder::new();
@@ -386,7 +737,7 @@ mod tests {
     fn event_size_limit_is_enforced_before_buffer_growth() {
         let mut decoder = SseDecoder::new(4).unwrap();
         assert!(matches!(
-            decoder.push(b"data: five\n"),
+            decoder.push(b"data: five!\n"),
             Err(SseDecodeError::EventTooLarge { limit: 4 })
         ));
     }
@@ -399,5 +750,51 @@ mod tests {
             Err(SseDecodeError::EventTooLarge { limit: 4 })
         ));
     }
+
+    #[test]
+    fn encodes_ollama_responses_message_items() {
+        let input = vec![
+            ModelInput::Message {
+                role: ModelMessageRole::User,
+                text: "hello".to_owned(),
+            },
+            ModelInput::Message {
+                role: ModelMessageRole::Assistant,
+                text: "hi".to_owned(),
+            },
+            ModelInput::AssistantToolCall {
+                call_id: "call-1".to_owned(),
+                name: "lookup".to_owned(),
+                arguments: "{}".to_owned(),
+            },
+            ModelInput::ToolResult {
+                call_id: "call-1".to_owned(),
+                output: "result".to_owned(),
+            },
+        ];
+
+        let encoded = encode_input(&input);
+        assert_eq!(encoded[0]["type"], "message");
+        assert_eq!(encoded[0]["content"][0]["type"], "input_text");
+        assert_eq!(encoded[1]["content"][0]["type"], "output_text");
+        assert_eq!(encoded[2]["type"], "function_call");
+        assert_eq!(encoded[3]["type"], "function_call_output");
+    }
+
+    #[test]
+    fn rejects_invalid_tool_schema() {
+        let tool = ToolDefinition {
+            name: harness_tool_api::ToolName::new("lookup").unwrap(),
+            description: "Look up a value".to_owned(),
+            input_schema: ToolInputSchema::JsonSchema(harness_tool_api::JsonSchema::new(
+                "not json",
+            )),
+            capabilities: Default::default(),
+        };
+
+        assert!(matches!(
+            encode_tools(&[tool]),
+            Err(ProtocolError::InvalidToolSchema { .. })
+        ));
     }
 }

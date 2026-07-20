@@ -1,0 +1,2 @@
+start: input
+input: /[\s\S]+/

@@ -1,6 +1,5 @@
 [workspace]
 members = [
-    "crates/harness-core",
     "crates/harness-responses-api",
     "crates/harness-tui-rewrite",
     "crates/harness-tool-api",
@@ -8,13 +7,14 @@ members = [
     "crates/harness-runtime-api",
     "crates/harness-responses-protocol",
     "crates/harness-session-store",
+    "crates/harness-openai-chat-protocol",
+    "crates/harness-openai-chat-transport",
     "crates/harness-conversation-runtime",
     "crates/harness-provider",
     "crates/harness-responses-transport",
     "crates/harness-session-service",
     "crates/harness-tool-execution",
     "crates/harness-cli",
-    "crates/harness-web",
     "crates/token_inspector",
 ]
 resolver = "2"
@@ -33,8 +33,6 @@ anyhow = "1"
 bytes = "1"
 crossfire = { version = "3.1.16", features = ["tokio"] }
 crossterm = { version = "0.28", features = ["event-stream"] }
-harness-core = { path = "crates/harness-core" }
-harness-web = { path = "crates/harness-web" }
 fff_search = { package = "fff-search", git = "https://github.com/dmtrkovalenko/fff" }
 harness-responses-api = { path = "crates/harness-responses-api" }
 harness-tui-rewrite = { path = "crates/harness-tui-rewrite" }
@@ -42,6 +40,8 @@ harness-tool-api = { path = "crates/harness-tool-api" }
 harness-model-api = { path = "crates/harness-model-api" }
 harness-runtime-api = { path = "crates/harness-runtime-api" }
 harness-responses-protocol = { path = "crates/harness-responses-protocol" }
+harness-openai-chat-protocol = { path = "crates/harness-openai-chat-protocol" }
+harness-openai-chat-transport = { path = "crates/harness-openai-chat-transport" }
 harness-session-store = { path = "crates/harness-session-store" }
 harness-conversation-runtime = { path = "crates/harness-conversation-runtime" }
 harness-provider = { path = "crates/harness-provider" }

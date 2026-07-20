@@ -1,6 +1,6 @@
 //! Runtime anti-corruption boundary, terminal input routing, and event loop.
 
-mod adapter;
+pub mod adapter;
 
 use std::{cmp::Ordering, io, time::Duration};
 
@@ -9,10 +9,7 @@ use crossterm::event::{
     MouseEventKind,
 };
 use futures_util::StreamExt;
-use harness_core::{
-    UiSnapshot,
-    actors::{ActorHandle, ActorReceiver, ActorSendError, RuntimeCommand, RuntimeEvent},
-};
+use harness_runtime_api::{RuntimeClosed, RuntimeCommandSender, RuntimeEventReceiver};
 
 use crate::{
     app::{AppEffect, Application, MouseCapture, UserCommand},
@@ -29,11 +26,10 @@ const MOUSE_WHEEL_ROWS: isize = 3;
 
 /// Runs the terminal UI against one harness runtime.
 pub async fn run_with_runtime(
-    snapshot: UiSnapshot,
-    commands: ActorHandle<RuntimeCommand>,
-    events: ActorReceiver<RuntimeEvent>,
-) -> io::Result<UiSnapshot> {
-    let initial = adapter::import_snapshot(snapshot);
+    initial: crate::domain::InitialState,
+    commands: RuntimeCommandSender,
+    mut events: RuntimeEventReceiver,
+) -> io::Result<crate::domain::FinalState> {
     let mut application = Application::import(initial)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
 
@@ -64,12 +60,12 @@ pub async fn run_with_runtime(
                 }
                 runtime_event = events.recv() => {
                     match runtime_event {
-                        Ok(event) => reduce_runtime_event_batch(
+                        Ok(envelope) => reduce_runtime_event_batch(
                             &mut application,
-                            event,
-                            &events,
+                            envelope.event,
+                            &mut events,
                         ),
-                        Err(_) => application.runtime_disconnected(),
+                        Err(RuntimeClosed) => application.runtime_disconnected(),
                     }
                     Vec::new()
                 }
@@ -78,13 +74,13 @@ pub async fn run_with_runtime(
                 },
             };
 
-            if !execute_effects(&mut application, &mut terminal, &commands, effects)? {
+            if !execute_effects(&mut application, &mut terminal, &commands, effects).await? {
                 break;
             }
         }
     }
 
-    Ok(adapter::export_snapshot(application.into_final_state()))
+    Ok(application.into_final_state())
 }
 
 async fn wait_for_visual_change(delay: Option<Duration>) {
@@ -361,16 +357,16 @@ fn route_mouse_event(
 
 fn reduce_runtime_event_batch(
     application: &mut Application,
-    first: RuntimeEvent,
-    events: &ActorReceiver<RuntimeEvent>,
+    first: harness_runtime_api::RuntimeEvent,
+    events: &mut RuntimeEventReceiver,
 ) {
     let mut pending_delta = None;
     reduce_runtime_event(application, first, &mut pending_delta);
     for _ in 0..MAX_RUNTIME_EVENT_DRAIN {
-        let Ok(event) = events.try_recv() else {
+        let Some(envelope) = events.try_recv().unwrap_or(None) else {
             break;
         };
-        reduce_runtime_event(application, event, &mut pending_delta);
+        reduce_runtime_event(application, envelope.event, &mut pending_delta);
         if application.should_exit() {
             break;
         }
@@ -380,11 +376,11 @@ fn reduce_runtime_event_batch(
 
 fn reduce_runtime_event(
     application: &mut Application,
-    event: RuntimeEvent,
+    event: harness_runtime_api::RuntimeEvent,
     pending_delta: &mut Option<String>,
 ) {
     match event {
-        RuntimeEvent::AssistantTextDelta(delta) => {
+        harness_runtime_api::RuntimeEvent::AssistantTextDelta(delta) => {
             pending_delta
                 .get_or_insert_with(String::new)
                 .push_str(&delta);
@@ -402,10 +398,10 @@ fn flush_assistant_delta(application: &mut Application, pending_delta: &mut Opti
     }
 }
 
-fn execute_effects(
+async fn execute_effects(
     application: &mut Application,
     terminal: &mut TerminalSession,
-    commands: &ActorHandle<RuntimeCommand>,
+    commands: &RuntimeCommandSender,
     effects: Vec<AppEffect>,
 ) -> io::Result<bool> {
     for effect in effects {
@@ -413,12 +409,12 @@ fn execute_effects(
             AppEffect::Runtime {
                 request,
                 completion,
-            } => match commands.try_send(adapter::export_runtime_request(request)) {
+            } => match commands
+                .send(adapter::export_runtime_request(request))
+                .await
+            {
                 Ok(()) => application.delivery_accepted(completion),
-                Err(ActorSendError::Full) => {
-                    application.delivery_failed(completion, "runtime command mailbox is full");
-                }
-                Err(ActorSendError::Closed) => {
+                Err(RuntimeClosed) => {
                     application.delivery_failed(
                         completion,
                         "runtime command delivery failed: actor mailbox closed",

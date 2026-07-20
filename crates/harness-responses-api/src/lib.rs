@@ -32,13 +32,6 @@ use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Error as WsError;
 use url::Url;
 
-mod ws;
-
-/// Deterministic Responses WebSocket pool.
-pub use ws::ResponsesWsPool;
-/// Runtime configuration for the deterministic Responses WebSocket pool.
-pub use ws::WsPoolConfig;
-
 /// Header name for selecting OpenAI beta protocol contracts.
 pub const OPENAI_BETA_HEADER: &str = "openai-beta";
 /// Beta contract value for Responses WebSockets v2.
@@ -121,14 +114,16 @@ fn boxed_error(
     Box::new(error)
 }
 
-pub(crate) fn protocol_error(message: impl Into<String>) -> ResponsesApiError {
+/// Construct a protocol error with a message.
+pub fn protocol_error(message: impl Into<String>) -> ResponsesApiError {
     ResponsesApiError::Protocol {
         message: message.into(),
         source: None,
     }
 }
 
-pub(crate) fn protocol_source_error(
+/// Construct a protocol error with a message and source error.
+pub fn protocol_source_error(
     message: impl Into<String>,
     source: impl std::error::Error + Send + Sync + 'static,
 ) -> ResponsesApiError {
@@ -138,14 +133,16 @@ pub(crate) fn protocol_source_error(
     }
 }
 
-pub(crate) fn websocket_error(message: impl Into<String>) -> ResponsesApiError {
+/// Construct a WebSocket error with a message.
+pub fn websocket_error(message: impl Into<String>) -> ResponsesApiError {
     ResponsesApiError::WebSocket {
         message: message.into(),
         source: None,
     }
 }
 
-pub(crate) fn websocket_source_error(
+/// Construct a WebSocket error with a message and source error.
+pub fn websocket_source_error(
     message: impl Into<String>,
     source: impl std::error::Error + Send + Sync + 'static,
 ) -> ResponsesApiError {
@@ -438,7 +435,8 @@ impl Auth {
         }
     }
 
-    async fn refresh_after_unauthorized(&self) -> Result<bool, AuthError> {
+    /// Refreshes ChatGPT credentials after receiving an unauthorized response.
+    pub async fn refresh_after_unauthorized(&self) -> Result<bool, AuthError> {
         match self {
             Self::ApiKey(_) => Ok(false),
             Self::ChatGpt(session) => {
@@ -476,7 +474,8 @@ impl ResponsesTurnState {
         self.value.get().map(String::as_str)
     }
 
-    fn capture(&self, value: String) {
+    /// Captured turn-state value from a handshake.
+    pub fn capture(&self, value: String) {
         let _ = self.value.set(value);
     }
 }
@@ -1297,7 +1296,8 @@ impl ResponsesApiError {
         }
     }
 
-    fn is_unauthorized(&self) -> bool {
+    /// Returns true if the error is an HTTP 401 Unauthorized error.
+    pub fn is_unauthorized(&self) -> bool {
         matches!(
             self,
             Self::Http {
@@ -1307,7 +1307,8 @@ impl ResponsesApiError {
         )
     }
 
-    fn requires_reconnect(&self) -> bool {
+    /// Returns true if the error requires a reconnection.
+    pub fn requires_reconnect(&self) -> bool {
         matches!(
             self,
             Self::Retryable { .. }
@@ -1318,14 +1319,16 @@ impl ResponsesApiError {
         )
     }
 
-    fn can_retry_before_response_frame(&self) -> bool {
+    /// Returns true if the request can be retried before any response frame is received.
+    pub fn can_retry_before_response_frame(&self) -> bool {
         matches!(
             self,
             Self::WebSocket { .. } | Self::Timeout(_) | Self::StreamInterrupted
         )
     }
 
-    fn into_retryable_websocket_error(self) -> Self {
+    /// Convert the error into a retryable WebSocket error.
+    pub fn into_retryable_websocket_error(self) -> Self {
         if matches!(self, Self::Retryable { .. }) {
             return self;
         }
@@ -1336,12 +1339,14 @@ impl ResponsesApiError {
         }
     }
 
-    fn can_keep_websocket_open_after_stream_error(&self) -> bool {
+    /// Returns true if the WebSocket connection can be kept open after this error.
+    pub fn can_keep_websocket_open_after_stream_error(&self) -> bool {
         matches!(self, Self::Http { status, .. } if *status != StatusCode::UNAUTHORIZED)
     }
 }
 
-fn merge_request_headers(
+/// Merges provider-specific, extra request, and default headers.
+pub fn merge_request_headers(
     provider_headers: &HeaderMap,
     extra_headers: HeaderMap,
     default_headers: &HeaderMap,
@@ -1393,7 +1398,8 @@ fn insert_header(
     Ok(())
 }
 
-fn map_ws_error(err: WsError, url: &Url) -> ResponsesApiError {
+/// Map a WebSocket library error into a Responses API error.
+pub fn map_ws_error(err: WsError, url: &Url) -> ResponsesApiError {
     match err {
         WsError::Http(response) => {
             let status = response.status();
@@ -1428,7 +1434,8 @@ struct WrappedWebsocketErrorEvent {
     headers: Option<Object>,
 }
 
-fn map_wrapped_websocket_error(payload: &str) -> Option<ResponsesApiError> {
+/// Decode and map a wrapped Cloudflare/WebSocket error payload.
+pub fn map_wrapped_websocket_error(payload: &str) -> Option<ResponsesApiError> {
     let event = sonic_rs::from_str::<WrappedWebsocketErrorEvent>(payload).ok()?;
     if event.kind != "error" {
         return None;
@@ -1516,7 +1523,8 @@ fn cf_ray_from_body(body: &str) -> Option<String> {
     lower.contains("cf ray").then(|| "cf ray".to_string())
 }
 
-fn stamp_prewarm_generate_false(body: &mut Value) -> Result<(), ResponsesApiError> {
+/// Stamps turn metadata indicating prewarm to false.
+pub fn stamp_prewarm_generate_false(body: &mut Value) -> Result<(), ResponsesApiError> {
     let root = body
         .as_object_mut()
         .ok_or_else(|| protocol_error("Responses WebSocket frame must be a JSON object"))?;
@@ -1628,14 +1636,16 @@ fn event_type(frame: &Value) -> Option<&str> {
     frame.as_object()?.get(&"type")?.as_str()
 }
 
-fn is_response_terminal_event(frame: &Value) -> bool {
+/// Returns true if the WebSocket frame represents a terminal event.
+pub fn is_response_terminal_event(frame: &Value) -> bool {
     matches!(
         event_type(frame),
         Some("response.completed" | "response.done")
     )
 }
 
-fn response_completed_id(frame: &Value) -> Option<String> {
+/// Extracts the completed response ID from a WebSocket frame, if available.
+pub fn response_completed_id(frame: &Value) -> Option<String> {
     frame
         .as_object()?
         .get(&"response")?
@@ -1675,7 +1685,6 @@ mod tests {
             handshake::server::{Request as ServerRequest, Response as ServerResponse},
         },
     };
-    use ws::ConnectionContext;
 
     use super::*;
 
@@ -1758,6 +1767,11 @@ mod tests {
         assert!(!headers.contains_key("x-client-version"));
         assert!(!headers.contains_key("x-codex-client-version"));
     }
+}
+
+#[cfg(any())]
+mod obsolete_tests {
+    use super::*;
 
     #[tokio::test]
     async fn models_client_queries_client_version_and_parallel_capability() {

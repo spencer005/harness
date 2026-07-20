@@ -15,11 +15,20 @@ pub(super) fn project(payload: &TranscriptPayload) -> DisplayDocument<ControlFre
                 MessageRole::User => ("» ", StyleId::User),
                 MessageRole::Developer => ("» ", StyleId::Developer),
                 MessageRole::Assistant => ("• ", StyleId::Assistant),
+                MessageRole::Tool => ("⚙ ", StyleId::Assistant),
             };
             builder.plain(marker, style, false);
             builder.plain(text.as_str(), style, true);
         }
         TranscriptPayload::PlainText(text) => project_plain_text(&mut builder, text.as_str()),
+        TranscriptPayload::Thinking(text) => {
+            builder.plain("∴ ", StyleId::Muted, false);
+            builder.plain(text.as_str(), StyleId::Muted, true);
+        }
+        TranscriptPayload::Error { message, .. } => {
+            builder.plain("× ", StyleId::Error, false);
+            builder.plain(message.as_str(), StyleId::Error, true);
+        }
         TranscriptPayload::ToolCall {
             name, input, kind, ..
         } => {

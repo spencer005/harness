@@ -8,4 +8,5 @@ version.workspace = true
 harness-model-api.workspace = true
 harness-tool-api.workspace = true
 serde_json.workspace = true
+sonic-rs.workspace = true
 thiserror.workspace = true

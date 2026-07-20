@@ -681,8 +681,10 @@ impl Application {
     /// Reduces one adapted runtime event.
     pub(crate) fn apply_domain_event(&mut self, event: DomainEvent) {
         match event {
-            DomainEvent::AppendTranscript(payload) => {
-                self.transcript.append(payload);
+            DomainEvent::AppendTranscript(entry) => {
+                if let Err(error) = self.transcript.append_snapshot(entry) {
+                    self.record_transcript_error(error);
+                }
             }
             DomainEvent::TranscriptPage {
                 entries,
@@ -692,6 +694,17 @@ impl Application {
                 if let Err(error) =
                     self.transcript
                         .apply_page(entries, next_before_sequence, reached_start)
+                {
+                    self.record_transcript_error(error);
+                }
+            }
+            DomainEvent::TranscriptCommitted {
+                reasoning_sequence,
+                assistant_sequence,
+            } => {
+                if let Err(error) = self
+                    .transcript
+                    .reconcile_commit(reasoning_sequence, assistant_sequence)
                 {
                     self.record_transcript_error(error);
                 }
@@ -733,11 +746,22 @@ impl Application {
                     self.record_transcript_error(error);
                 }
             }
+            DomainEvent::ThinkingDelta(delta) => {
+                if let Err(error) = self.transcript.append_thinking_delta(delta) {
+                    self.record_transcript_error(error);
+                }
+            }
             DomainEvent::ResponseStreamCompleted => {
                 match self.transcript.complete_response_stream() {
                     Ok(()) => self.session.response_streaming = false,
                     Err(error) => self.record_transcript_error(error),
                 }
+            }
+            DomainEvent::ResponseStreamFailed => {
+                if let Err(error) = self.transcript.complete_response_stream() {
+                    self.record_transcript_error(error);
+                }
+                self.session.response_streaming = false;
             }
             DomainEvent::AgentUpdated(agent) => {
                 self.session.agents.insert(agent.id, agent);
@@ -754,12 +778,7 @@ impl Application {
             DomainEvent::SteeringChanged(queued) => {
                 self.session.queued_steering = queued;
             }
-            DomainEvent::AgentMailboxChanged(agent) => {
-                self.transcript
-                    .append(crate::domain::TranscriptPayload::Event(ExternalText::new(
-                        format!("agent mailbox update: {}", agent.0),
-                    )));
-            }
+
             DomainEvent::ActivityChanged(activity) => {
                 let id = activity.id.as_str().to_string();
                 if activity.status == ActivityStatus::Running {
@@ -784,13 +803,10 @@ impl Application {
                         )));
                 }
             }
-            DomainEvent::LowLevelResponseObserved => {}
-            DomainEvent::ProtocolViolation(message) => {
-                self.notice = Some(Notice {
-                    text: message,
-                    severity: NoticeSeverity::Error,
-                });
+            DomainEvent::Failure(message) => {
+                self.set_notice(message, NoticeSeverity::Error);
             }
+
             DomainEvent::ShutdownCompleted => {
                 self.should_exit = true;
             }

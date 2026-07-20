@@ -1,0 +1,11 @@
+start: operation+
+operation: add | remove | move | edit
+add: "§ Add " path LF body
+remove: "§ Remove " path LF?
+move: "§ Move " path LF "§ To " path LF?
+edit: "§ Edit " path LF body
+
+body: /[\s\S]+/
+path: /[^\n]+/
+
+%import common.LF

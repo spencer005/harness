@@ -4,11 +4,7 @@
 //! `harness-responses-protocol`, and conversation policy remains above this
 //! crate.
 
-use std::{
-    collections::BTreeMap,
-    pin::Pin,
-    sync::Arc,
-};
+use std::{collections::BTreeMap, pin::Pin, sync::Arc};
 
 use futures_util::{Stream, StreamExt};
 use harness_model_api::{
@@ -20,7 +16,7 @@ use thiserror::Error;
 use tokio::{
     sync::mpsc,
     task::JoinHandle,
-    time::{timeout, Duration},
+    time::{Duration, timeout},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -96,7 +92,6 @@ pub struct TransportSupervisor<C> {
     attempts: BTreeMap<u64, JoinHandle<()>>,
     cancellations: BTreeMap<u64, CancellationToken>,
     accepting: bool,
-
 }
 
 impl<C> TransportSupervisor<C>
@@ -117,7 +112,6 @@ where
             attempts: BTreeMap::new(),
             cancellations: BTreeMap::new(),
             accepting: true,
-
         })
     }
 
@@ -163,10 +157,7 @@ where
     }
 
     /// Retires one completed attempt and joins its owned task exactly once.
-    pub async fn retire(
-        &mut self,
-        attempt_id: u64,
-    ) -> Result<(), TransportSupervisorError> {
+    pub async fn retire(&mut self, attempt_id: u64) -> Result<(), TransportSupervisorError> {
         self.cancellations
             .remove(&attempt_id)
             .ok_or(TransportSupervisorError::UnknownAttempt)?;
@@ -190,10 +181,10 @@ where
         let attempts = std::mem::take(&mut self.attempts);
         let mut first_error = None;
         for (_, handle) in attempts {
-            if let Err(error) = handle.await {
-                if first_error.is_none() {
-                    first_error = Some(TransportSupervisorError::Join(error.to_string()));
-                }
+            if let Err(error) = handle.await
+                && first_error.is_none()
+            {
+                first_error = Some(TransportSupervisorError::Join(error.to_string()));
             }
         }
         match first_error {
@@ -218,18 +209,17 @@ where
         configuration: TransportConfiguration,
     ) -> Result<Self, TransportSupervisorError> {
         Ok(Self {
-            supervisor: Arc::new(tokio::sync::Mutex::new(
-                TransportSupervisor::new(client, configuration)?,
-            )),
+            supervisor: Arc::new(tokio::sync::Mutex::new(TransportSupervisor::new(
+                client,
+                configuration,
+            )?)),
         })
     }
-
 
     /// Cancels and joins every registered model attempt.
     pub async fn shutdown(&self) -> Result<(), TransportSupervisorError> {
         self.supervisor.lock().await.shutdown().await
     }
-
 }
 
 impl<C> ModelTransport for SupervisedModelTransport<C>
@@ -271,7 +261,6 @@ where
                 })
         })
     }
-
 }
 /// Handle for one supervised model attempt.
 pub struct TransportAttemptHandle {
@@ -358,15 +347,14 @@ where
     C: StreamingClient + 'static,
 {
     send_event(&sender, ModelEvent::Started, &cancellation).await?;
-    let mut stream = client
-        .start(attempt)
-        .await
-        .map_err(map_stream_error)?;
+    let mut stream = client.start(attempt).await.map_err(map_stream_error)?;
     let mut decoder = ResponsesEventDecoder::with_max_event_bytes(configuration.max_event_bytes)
-        .map_err(|error| AttemptFailure::Failure(ModelFailure {
-            kind: ModelFailureKind::Protocol,
-            message: error.to_string(),
-        }))?;
+        .map_err(|error| {
+            AttemptFailure::Failure(ModelFailure {
+                kind: ModelFailureKind::Protocol,
+                message: error.to_string(),
+            })
+        })?;
 
     loop {
         let next = tokio::select! {
@@ -475,3 +463,5 @@ pub enum TransportSupervisorError {
     #[error("transport is shutting down")]
     ShuttingDown,
 }
+
+pub mod ws;

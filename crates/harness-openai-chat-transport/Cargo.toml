@@ -1,5 +1,5 @@
 [package]
-name = "harness-responses-transport"
+name = "harness-openai-chat-transport"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
@@ -7,11 +7,9 @@ version.workspace = true
 [dependencies]
 futures-util.workspace = true
 harness-model-api.workspace = true
-harness-responses-api.workspace = true
-harness-responses-protocol.workspace = true
+harness-openai-chat-protocol.workspace = true
+harness-tool-api.workspace = true
+sonic-rs.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
-sonic-rs.workspace = true
-tokio-tungstenite.workspace = true
-http.workspace = true

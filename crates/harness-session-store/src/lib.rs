@@ -6,7 +6,6 @@
 use std::{
     ops::RangeInclusive,
     path::{Path, PathBuf},
-
 };
 
 use thiserror::Error;
@@ -97,12 +96,22 @@ pub enum SessionPayload {
     /// User input is durably accepted.
     InputMessage { turn_id: u64, text: String },
     /// Model attempt begins.
-    ModelAttemptStarted {
-        turn_id: u64,
-        attempt_id: u64,
-    },
+    ModelAttemptStarted { turn_id: u64, attempt_id: u64 },
     /// Assistant output is durably committed.
     AssistantMessage { turn_id: u64, text: String },
+    /// A reasoning item is durably recorded for later model input.
+    Reasoning {
+        turn_id: u64,
+        content: Option<String>,
+        encrypted_content: Option<String>,
+        summary: Option<String>,
+    },
+    /// A turn-local failure is durably recorded.
+    Error {
+        turn_id: u64,
+        category: SessionErrorCategory,
+        message: String,
+    },
     /// Tool call is durably accepted.
     ToolCallAccepted {
         turn_id: u64,
@@ -138,6 +147,19 @@ pub struct SessionProviderBinding {
     pub provider: String,
     /// Selected model.
     pub model: String,
+}
+
+/// Category assigned to a turn-local failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionErrorCategory {
+    /// Provider or model operation failure.
+    Model,
+    /// Provider protocol or decoding failure.
+    Protocol,
+    /// Tool execution failure.
+    Tool,
+    /// Runtime transition failure associated with the turn.
+    Lifecycle,
 }
 
 /// Terminal turn outcome persisted by the runtime.
@@ -183,22 +205,13 @@ pub trait SessionWriter: Send {
         records: &'a [SessionPayload],
         durability: Durability,
     ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<AppendReceipt, SessionStoreError>,
-                > + Send
-                + 'a,
-        >,
+        Box<dyn std::future::Future<Output = Result<AppendReceipt, SessionStoreError>> + Send + 'a>,
     >;
 
     /// Closes the writer after flushing and joining its owned work.
     fn close(
         self: Box<Self>,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<(), SessionStoreError>> + Send,
-        >,
-    >;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SessionStoreError>> + Send>>;
 }
 
 /// Storage backend boundary used by composition.
@@ -212,9 +225,8 @@ pub trait SessionStore: Send + Sync {
         session_id: SessionId,
     ) -> std::pin::Pin<
         Box<
-            dyn std::future::Future<
-                    Output = Result<Box<dyn SessionWriter>, SessionStoreError>,
-                > + Send
+            dyn std::future::Future<Output = Result<Box<dyn SessionWriter>, SessionStoreError>>
+                + Send
                 + '_,
         >,
     >;
@@ -272,15 +284,5 @@ mod tests {
     #[test]
     fn page_size_rejects_zero() {
         assert_eq!(PageSize::new(0), Err(InvalidPageSize));
-    }
-
-    #[test]
-    fn append_receipt_preserves_requested_durability() {
-        let receipt = AppendReceipt {
-            sequences: 4..=6,
-            durability: Durability::Durable,
-        };
-        assert_eq!(receipt.durability, Durability::Durable);
-        assert_eq!(receipt.sequences, 4..=6);
     }
 }

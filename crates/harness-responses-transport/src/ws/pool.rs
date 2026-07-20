@@ -11,6 +11,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+use harness_responses_api::{
+    ApiProvider, Auth, CodexHeaders, OPENAI_MODEL, ResponsesApiError, ResponsesStreamEvent,
+    ResponsesStreamRequest, X_CODEX_TURN_STATE, X_MODELS_ETAG, X_REASONING_INCLUDED, map_ws_error,
+    merge_request_headers, stamp_prewarm_generate_false, websocket_source_error,
+};
 use http::HeaderMap;
 use tokio::sync::Mutex;
 use tokio_tungstenite::{
@@ -19,11 +24,6 @@ use tokio_tungstenite::{
 };
 
 use super::connection::{ConnectionContext, ResponsesConnection};
-use crate::{
-    ApiProvider, Auth, CodexHeaders, OPENAI_MODEL, ResponsesApiError, ResponsesStreamEvent,
-    ResponsesStreamRequest, X_CODEX_TURN_STATE, X_MODELS_ETAG, X_REASONING_INCLUDED, map_ws_error,
-    merge_request_headers, stamp_prewarm_generate_false, websocket_source_error,
-};
 
 const DEFAULT_WEBSOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const DEFAULT_IDLE_WEBSOCKET_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(1);
@@ -610,7 +610,7 @@ impl ResponsesWsPool {
         let url = self
             .inner
             .provider
-            .websocket_endpoint_url(crate::ApiEndpoint::Responses);
+            .websocket_endpoint_url(harness_responses_api::ApiEndpoint::Responses);
         let mut request_headers = merge_request_headers(
             self.inner.provider.headers(),
             headers.to_header_map()?,

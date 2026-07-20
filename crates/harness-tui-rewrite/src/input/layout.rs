@@ -578,7 +578,7 @@ fn cell_at_byte(text: &str, row: RowGeometry, byte: usize) -> usize {
     debug_assert!(row.start_byte <= byte && byte <= row.end_byte);
     text[row.start_byte..byte]
         .graphemes(true)
-        .map(|grapheme| projection::display_width(grapheme))
+        .map(projection::display_width)
         .sum()
 }
 

@@ -7,7 +7,7 @@
 //!
 //! - one [`ResponsesWsPool`] is scoped to one provider, auth source, and default
 //!   Codex identity header set;
-//! - request-level [`crate::CodexHeaders`] do not partition idle sockets;
+//! - request-level [`harness_responses_api::CodexHeaders`] do not partition idle sockets;
 //! - idle sockets are leased in FIFO order and returned to the back of the idle
 //!   queue;
 //! - an idle queue at capacity closes the returned connection instead of

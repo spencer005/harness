@@ -1,0 +1,5 @@
+start: "patch:" value LF?
+
+value: /[^\n]+/
+
+%import common.LF

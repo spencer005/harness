@@ -48,107 +48,31 @@ pub const FUNCTION_TOOL_TYPE: &str = "function";
 pub const FUNCTION_TOOL_CALL_TYPE: &str = "function_call";
 
 /// Lark grammar used by Codex's native freeform `apply_patch` tool.
-pub const APPLY_PATCH_LARK_GRAMMAR: &str = r#"start: begin_patch hunk+ end_patch
-begin_patch: "*** Begin Patch" LF
-end_patch: "*** End Patch" LF?
-
-hunk: add_hunk | delete_hunk | update_hunk
-add_hunk: "*** Add File: " filename LF add_line+
-delete_hunk: "*** Delete File: " filename LF
-update_hunk: "*** Update File: " filename LF change_move? change?
-
-filename: /(.+)/
-add_line: "+" /(.*)/ LF -> line
-
-change_move: "*** Move to: " filename LF
-change: (change_context | change_line)+ eof_line?
-change_context: ("@@" | "@@ " /(.+)/) LF
-change_line: ("+" | "-" | " ") /(.*)/ LF
-eof_line: "*** End of File" LF
-
-%import common.LF
-"#;
+pub const APPLY_PATCH_LARK_GRAMMAR: &str = include_str!("tools/grammars/apply_patch.lark");
 
 /// Lark grammar for native line-anchor file edits.
-pub const EDIT_FILE_LARK_GRAMMAR: &str = r#"start: operation+
-operation: add | remove | move | edit
-add: "§ Add " path LF body
-remove: "§ Remove " path LF?
-move: "§ Move " path LF "§ To " path LF?
-edit: "§ Edit " path LF body
-
-body: /[\s\S]+/
-path: /[^\n]+/
-
-%import common.LF
-"#;
+pub const EDIT_FILE_LARK_GRAMMAR: &str = include_str!("tools/grammars/edit_file.lark");
 
 /// Lark grammar for root-owned implementation location queries.
-pub const LOCATE_LARK_GRAMMAR: &str = r#"start: query
-query: /[\s\S]+/
-"#;
+pub const LOCATE_LARK_GRAMMAR: &str = include_str!("tools/grammars/locate.lark");
 /// Lark grammar for the unified inspection tool.
-pub const INSPECT_LARK_GRAMMAR: &str = r#"start: input
-input: /[\s\S]+/
-"#;
+pub const INSPECT_LARK_GRAMMAR: &str = include_str!("tools/grammars/inspect.lark");
 
 /// Lark grammar for applying or discarding an in-memory staged patch.
-pub const STAGED_PATCH_LARK_GRAMMAR: &str = r#"start: "patch:" value LF?
-
-value: /[^\n]+/
-
-%import common.LF
-"#;
+pub const STAGED_PATCH_LARK_GRAMMAR: &str = include_str!("tools/grammars/staged_patch.lark");
 
 /// Lark grammar for opening a command-isolated PTY terminal session.
-pub const TERMINAL_OPEN_LARK_GRAMMAR: &str = r#"start: open_field* command_tail
-open_field: option_line
-option_line: option_key ":" value LF?
-option_key: "workdir" | "rows" | "cols"
-command_tail: command_inline
-            | command_block
-command_inline: "command:" inline_value LF?
-command_block: "command:" LF body
-
-value: /[^\n]*/
-inline_value: /[^\n]+/
-body: /[\s\S]+/
-
-%import common.LF
-"#;
+pub const TERMINAL_OPEN_LARK_GRAMMAR: &str = include_str!("tools/grammars/terminal_open.lark");
 
 /// Lark grammar for writing interactive input to a running terminal command.
-pub const TERMINAL_WRITE_LARK_GRAMMAR: &str = r#"start: terminal_line input_tail
-     | input_inline terminal_line
-input_tail: input_inline
-          | input_block
-terminal_line: "terminal:" value LF?
-input_inline: "input:" inline_value LF?
-input_block: "input:" LF body
-           | "input:" LF?
-
-value: /[^\n]*/
-inline_value: /[^\n]+/
-body: /[\s\S]+/
-
-%import common.LF
-"#;
+pub const TERMINAL_WRITE_LARK_GRAMMAR: &str = include_str!("tools/grammars/terminal_write.lark");
 
 /// Lark grammar for reading recent PTY terminal output.
-pub const TERMINAL_READ_LARK_GRAMMAR: &str = r#"start: poll_line? terminal_line poll_line?
-poll_line: "poll_after:" value LF?
-terminal_line: "terminal:" value LF?
-
-value: /[^\n]+/
-
-%import common.LF
-"#;
+pub const TERMINAL_READ_LARK_GRAMMAR: &str = include_str!("tools/grammars/terminal_read.lark");
 
 /// Lark grammar for the persist-mode task completion marker.
-pub const MARK_TASK_COMPLETE_LARK_GRAMMAR: &str = r#"start: "complete" LF?
-
-%import common.LF
-"#;
+pub const MARK_TASK_COMPLETE_LARK_GRAMMAR: &str =
+    include_str!("tools/grammars/mark_task_complete.lark");
 
 /// Native Responses freeform/custom tool definition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1009,7 +933,7 @@ pub fn named_freeform_tool_output_item(
 
 #[cfg(test)]
 mod tests {
-    use sonic_rs::{JsonContainerTrait, json};
+    use sonic_rs::{json, JsonContainerTrait};
 
     use super::*;
 

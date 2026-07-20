@@ -8,9 +8,9 @@ mod app;
 mod control;
 
 mod display;
-mod domain;
+pub mod domain;
 mod input;
-mod runtime;
+pub mod runtime;
 mod terminal;
 
 mod transcript;

@@ -6,46 +6,37 @@
 
 use std::collections::BTreeMap;
 
+pub use harness_runtime_api::{MessageRole, RuntimeFailureCategory};
+
 /// Text received from outside the TUI trust boundary.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct ExternalText(String);
+pub struct ExternalText(String);
 
 impl ExternalText {
     /// Wraps untrusted text without granting display safety.
-    pub(crate) fn new(text: impl Into<String>) -> Self {
+    pub fn new(text: impl Into<String>) -> Self {
         Self(text.into())
     }
 
     /// Returns the untrusted text for validation or protocol processing.
-    pub(crate) fn as_str(&self) -> &str {
+    pub fn as_str(&self) -> &str {
         &self.0
     }
 
     /// Consumes the wrapper and returns its string.
-    pub(crate) fn into_string(self) -> String {
+    pub fn into_string(self) -> String {
         self.0
     }
 
     /// Appends another untrusted fragment without granting display safety.
-    pub(crate) fn append(&mut self, text: &ExternalText) {
+    pub fn append(&mut self, text: &ExternalText) {
         self.0.push_str(text.as_str());
     }
 }
 
-/// Message role represented by a transcript entry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MessageRole {
-    /// User input.
-    User,
-    /// Developer-role input.
-    Developer,
-    /// Assistant output.
-    Assistant,
-}
-
 /// Invocation encoding used by a tool call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ToolInvocationKind {
+pub enum ToolInvocationKind {
     /// Freeform tool input.
     Freeform,
     /// JSON/function arguments.
@@ -54,36 +45,36 @@ pub(crate) enum ToolInvocationKind {
 
 /// Structured display data for a tool output.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ToolOutputDisplay {
+pub enum ToolOutputDisplay {
     /// Source snippets returned by the inspect tool.
     InspectRead(Vec<InspectReadDisplay>),
 }
 
 /// One source snippet returned by an inspect read.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct InspectReadDisplay {
+pub struct InspectReadDisplay {
     /// Untrusted displayed path.
-    pub(crate) path: ExternalText,
+    pub path: ExternalText,
     /// First source line represented by `lines`.
-    pub(crate) start_line: usize,
+    pub start_line: usize,
     /// Untrusted source lines.
-    pub(crate) lines: Vec<ExternalText>,
+    pub lines: Vec<ExternalText>,
     /// Optional continuation range.
-    pub(crate) next: Option<InspectReadNext>,
+    pub next: Option<InspectReadNext>,
 }
 
 /// Continuation location for an inspect read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct InspectReadNext {
+pub struct InspectReadNext {
     /// First unread source line.
-    pub(crate) start_line: usize,
+    pub start_line: usize,
     /// Suggested continuation line count.
-    pub(crate) line_count: usize,
+    pub line_count: usize,
 }
 
 /// Encoding and structured presentation data for a tool output.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ToolOutputKind {
+pub enum ToolOutputKind {
     /// Freeform output with optional structured transcript display.
     Freeform {
         /// Structured display supplied by the runtime.
@@ -95,7 +86,7 @@ pub(crate) enum ToolOutputKind {
 
 /// Semantic transcript payload independent of terminal presentation.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum TranscriptPayload {
+pub enum TranscriptPayload {
     /// Typed conversation message.
     Message {
         /// Message role.
@@ -105,6 +96,15 @@ pub(crate) enum TranscriptPayload {
     },
     /// Legacy or runtime-generated plain transcript text.
     PlainText(ExternalText),
+    /// Reasoning content or summary displayed as a thinking block.
+    Thinking(ExternalText),
+    /// Failure associated with the active turn.
+    Error {
+        /// Failure category.
+        category: RuntimeFailureCategory,
+        /// Original failure detail.
+        message: ExternalText,
+    },
     /// Native tool invocation.
     ToolCall {
         /// Runtime correlation identifier.
@@ -138,7 +138,7 @@ pub(crate) enum TranscriptPayload {
 
 /// Provider implementation kind represented independently from core DTOs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProviderKind {
+pub enum ProviderKind {
     /// Codex provider.
     Codex,
     /// Ollama Cloud provider.
@@ -149,7 +149,7 @@ pub(crate) enum ProviderKind {
 
 /// Provider transport represented independently from core DTOs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProviderTransport {
+pub enum ProviderTransport {
     /// WebSocket streaming transport.
     WebSocket,
     /// HTTPS streaming transport.
@@ -168,24 +168,24 @@ impl ProviderTransport {
 
 /// Provider details rendered by the status line.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ProviderState {
+pub struct ProviderState {
     /// Untrusted provider display name.
-    pub(crate) display_name: ExternalText,
+    pub display_name: ExternalText,
     /// Provider implementation kind.
-    pub(crate) kind: ProviderKind,
+    pub kind: ProviderKind,
     /// Provider transport.
-    pub(crate) transport: ProviderTransport,
+    pub transport: ProviderTransport,
 }
 
 /// Model settings rendered by the status line.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ModelState {
+pub struct ModelState {
     /// Untrusted model identifier.
-    pub(crate) model: ExternalText,
+    pub model: ExternalText,
     /// Optional untrusted reasoning effort value.
-    pub(crate) reasoning_effort: Option<ExternalText>,
+    pub reasoning_effort: Option<ExternalText>,
     /// Optional untrusted service tier value.
-    pub(crate) service_tier: Option<ExternalText>,
+    pub service_tier: Option<ExternalText>,
 }
 
 /// Context-window usage rendered by the status line.
@@ -209,11 +209,11 @@ impl ContextUsage {
 
 /// Stable subagent identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct AgentId(pub(crate) u64);
+pub struct AgentId(pub u64);
 
 /// Subagent lifecycle represented independently from core DTOs.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum AgentStatus {
+pub enum AgentStatus {
     /// Agent is actively running.
     Running,
     /// Agent is waiting for work or input.
@@ -228,17 +228,17 @@ pub(crate) enum AgentStatus {
 
 /// Renderable subagent state.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AgentState {
+pub struct AgentState {
     /// Stable agent identifier.
-    pub(crate) id: AgentId,
+    pub id: AgentId,
     /// Untrusted path or display name.
-    pub(crate) path: ExternalText,
+    pub path: ExternalText,
     /// Current status.
-    pub(crate) status: AgentStatus,
+    pub status: AgentStatus,
     /// Most recent task-level message.
-    pub(crate) last_task_message: Option<ExternalText>,
+    pub last_task_message: Option<ExternalText>,
     /// Most recent activity message.
-    pub(crate) last_activity_message: Option<ExternalText>,
+    pub last_activity_message: Option<ExternalText>,
 }
 
 /// Typed activity lifecycle.
@@ -267,73 +267,73 @@ pub(crate) struct ActivityState {
 
 /// Initial application values imported at the runtime boundary.
 #[derive(Debug)]
-pub(crate) struct InitialState {
+pub struct InitialState {
     /// Stable session identifier.
-    pub(crate) session_id: ExternalText,
+    pub session_id: ExternalText,
     /// Human-readable title.
-    pub(crate) thread_title: ExternalText,
+    pub thread_title: ExternalText,
     /// Current provider.
-    pub(crate) provider: Option<ProviderState>,
+    pub provider: Option<ProviderState>,
     /// Current model settings.
-    pub(crate) model: ModelState,
+    pub model: ModelState,
     /// Whether prompt submission uses the developer role.
-    pub(crate) developer_mode: bool,
-    /// Whether an assistant stream is active.
-    pub(crate) response_streaming: bool,
+    pub developer_mode: bool,
+    /// Whether an assistant stream remains active.
+    pub response_streaming: bool,
     /// Last time-to-first-token value.
-    pub(crate) last_ttft_ms: Option<u64>,
+    pub last_ttft_ms: Option<u64>,
     /// Transcript state with persisted sequence identities when known.
-    pub(crate) transcript: Vec<TranscriptSnapshotEntry>,
+    pub transcript: Vec<TranscriptSnapshotEntry>,
     /// Initial prompt text.
-    pub(crate) prompt: String,
+    pub prompt: String,
     /// Initial prompt cursor byte position.
-    pub(crate) prompt_cursor: usize,
+    pub prompt_cursor: usize,
     /// Steering queued by the runtime.
-    pub(crate) queued_steering: Option<ExternalText>,
+    pub queued_steering: Option<ExternalText>,
     /// Initial subagent summaries.
-    pub(crate) agents: Vec<AgentState>,
+    pub agents: Vec<AgentState>,
     /// Runtime activity IDs known to be active.
-    pub(crate) active_activity_ids: Vec<ExternalText>,
+    pub active_activity_ids: Vec<ExternalText>,
 }
 
 /// Final application values exported at the runtime boundary.
 #[derive(Debug)]
-pub(crate) struct FinalState {
+pub struct FinalState {
     /// Stable session identifier.
-    pub(crate) session_id: ExternalText,
+    pub session_id: ExternalText,
     /// Human-readable title.
-    pub(crate) thread_title: ExternalText,
+    pub thread_title: ExternalText,
     /// Current provider.
-    pub(crate) provider: Option<ProviderState>,
+    pub provider: Option<ProviderState>,
     /// Current model settings.
-    pub(crate) model: ModelState,
+    pub model: ModelState,
     /// Whether prompt submission uses the developer role.
-    pub(crate) developer_mode: bool,
+    pub developer_mode: bool,
     /// Whether an assistant stream remains active.
-    pub(crate) response_streaming: bool,
+    pub response_streaming: bool,
     /// Last time-to-first-token value.
-    pub(crate) last_ttft_ms: Option<u64>,
+    pub last_ttft_ms: Option<u64>,
     /// Final transcript state with persisted sequence identities when known.
-    pub(crate) transcript: Vec<TranscriptSnapshotEntry>,
+    pub transcript: Vec<TranscriptSnapshotEntry>,
     /// Final prompt text.
-    pub(crate) prompt: String,
+    pub prompt: String,
     /// Final prompt cursor.
-    pub(crate) prompt_cursor: usize,
+    pub prompt_cursor: usize,
     /// Steering queue acknowledged by the runtime.
-    pub(crate) queued_steering: Option<ExternalText>,
+    pub queued_steering: Option<ExternalText>,
     /// Final subagent summaries.
-    pub(crate) agents: Vec<AgentState>,
+    pub agents: Vec<AgentState>,
     /// IDs of activities still running.
-    pub(crate) active_activity_ids: Vec<ExternalText>,
+    pub active_activity_ids: Vec<ExternalText>,
 }
 
 /// One semantic transcript entry at the snapshot boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TranscriptSnapshotEntry {
+pub struct TranscriptSnapshotEntry {
     /// Persisted sequence identity when known.
-    pub(crate) sequence: Option<u64>,
+    pub sequence: Option<u64>,
     /// Semantic transcript payload.
-    pub(crate) payload: TranscriptPayload,
+    pub payload: TranscriptPayload,
 }
 
 /// One sequence-numbered persisted transcript payload.
@@ -348,8 +348,8 @@ pub(crate) struct PersistedTranscriptEntry {
 /// Runtime event after exhaustive boundary adaptation.
 #[derive(Debug, Clone)]
 pub(crate) enum DomainEvent {
-    /// One transcript payload was appended.
-    AppendTranscript(TranscriptPayload),
+    /// One transcript entry was appended.
+    AppendTranscript(TranscriptSnapshotEntry),
     /// One page of older transcript entries was loaded.
     TranscriptPage {
         /// Sequence-numbered displayable entries.
@@ -358,6 +358,13 @@ pub(crate) enum DomainEvent {
         next_before_sequence: Option<u64>,
         /// Whether the oldest persisted entry was reached.
         reached_start: bool,
+    },
+    /// Persisted sequences are assigned to active streamed entries.
+    TranscriptCommitted {
+        /// Sequence assigned to the reasoning entry, when present.
+        reasoning_sequence: Option<u64>,
+        /// Sequence assigned to the assistant message entry.
+        assistant_sequence: u64,
     },
     /// Model settings changed.
     ModelChanged(ModelState),
@@ -377,8 +384,12 @@ pub(crate) enum DomainEvent {
     AssistantFirstToken(u64),
     /// Assistant text was appended to the active stream.
     AssistantTextDelta(ExternalText),
+    /// Reasoning text was appended to the active thinking block.
+    ThinkingDelta(ExternalText),
     /// Assistant streaming completed.
     ResponseStreamCompleted,
+    /// Assistant streaming failed after the runtime persisted the outcome.
+    ResponseStreamFailed,
     /// A subagent changed.
     AgentUpdated(AgentState),
     /// A subagent was removed.
@@ -387,14 +398,10 @@ pub(crate) enum DomainEvent {
     CompactionCompleted(ExternalText),
     /// Runtime steering queue state changed.
     SteeringChanged(Option<ExternalText>),
-    /// A subagent mailbox changed.
-    AgentMailboxChanged(AgentId),
     /// A background activity changed.
     ActivityChanged(ActivityState),
-    /// A low-level response event was observed but has no direct UI projection.
-    LowLevelResponseObserved,
-    /// A malformed external event was rejected.
-    ProtocolViolation(ExternalText),
+    /// A runtime failure surfaced to the frontend.
+    Failure(String),
     /// Runtime shutdown completed.
     ShutdownCompleted,
 }

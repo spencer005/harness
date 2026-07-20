@@ -1,0 +1,14 @@
+start: terminal_line input_tail
+     | input_inline terminal_line
+input_tail: input_inline
+          | input_block
+terminal_line: "terminal:" value LF?
+input_inline: "input:" inline_value LF?
+input_block: "input:" LF body
+           | "input:" LF?
+
+value: /[^\n]*/
+inline_value: /[^\n]+/
+body: /[\s\S]+/
+
+%import common.LF
