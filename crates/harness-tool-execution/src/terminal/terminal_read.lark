@@ -1,0 +1,5 @@
+start: poll_line? terminal_line poll_line?
+poll_line: "poll_after:" value LF?
+terminal_line: "terminal:" value LF?
+value: /[^\n]+/
+%import common.LF

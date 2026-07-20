@@ -1,8 +1,9 @@
 //! Provider-independent contracts for tool discovery, invocation, and results.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use thiserror::Error;
+use std::sync::RwLock;
 
 /// Stable name assigned to a tool.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -270,6 +271,113 @@ pub struct AdvertisedTool {
     pub definition: ToolDefinition,
     /// Executor route selected by composition.
     pub executor: ToolExecutorRoute,
+}
+
+/// Shared availability policy for dynamically enabling or disabling tools.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolAvailability {
+    rules: Vec<(String, bool)>,
+}
+
+impl ToolAvailability {
+    /// Creates a policy with every registered tool enabled by default.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the enabled state for a glob pattern such as `terminal*`.
+    pub fn set(&mut self, pattern: impl Into<String>, enabled: bool) -> Result<(), ToolPatternError> {
+        let pattern = pattern.into();
+        if pattern.is_empty() || pattern == "*" && !enabled {
+            return Err(ToolPatternError);
+        }
+        self.rules.push((pattern, enabled));
+        Ok(())
+    }
+
+    /// Returns whether a tool is enabled. The most recently matching rule wins.
+    pub fn is_enabled(&self, tool: &str) -> bool {
+        self.rules
+            .iter()
+            .rev()
+            .find(|(pattern, _)| glob_matches(pattern, tool))
+            .map(|(_, enabled)| *enabled)
+            .unwrap_or(true)
+    }
+
+    /// Returns the configured rules in insertion order.
+    pub fn rules(&self) -> &[(String, bool)] {
+        &self.rules
+    }
+}
+
+fn glob_matches(pattern: &str, value: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let value: Vec<char> = value.chars().collect();
+    let mut states = vec![false; value.len() + 1];
+    states[0] = true;
+    for symbol in pattern {
+        let mut next = vec![false; value.len() + 1];
+        if symbol == '*' {
+            let mut seen = false;
+            for index in 0..=value.len() {
+                seen |= states[index];
+                next[index] = seen;
+            }
+        } else {
+            for index in 0..value.len() {
+                if states[index] && value[index] == symbol {
+                    next[index + 1] = true;
+                }
+            }
+        }
+        states = next;
+    }
+    states[value.len()]
+}
+
+/// Failure returned when a tool availability pattern is invalid.
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+#[error("tool availability pattern is invalid")]
+pub struct ToolPatternError;
+
+/// Executor wrapper that applies live availability to already-built requests.
+pub struct AvailabilityToolExecutor {
+    inner: Arc<dyn ToolExecutor>,
+    availability: Arc<RwLock<ToolAvailability>>,
+}
+
+impl AvailabilityToolExecutor {
+    /// Wraps an executor with shared dynamic availability state.
+    pub fn new(
+        inner: Arc<dyn ToolExecutor>,
+        availability: Arc<RwLock<ToolAvailability>>,
+    ) -> Self {
+        Self { inner, availability }
+    }
+}
+
+impl ToolExecutor for AvailabilityToolExecutor {
+    fn execute(
+        &self,
+        request: ToolExecutionRequest,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ToolResult, ToolFailure>> + Send + '_>> {
+        let enabled = self
+            .availability
+            .read()
+            .map(|policy| policy.is_enabled(request.tool.as_str()))
+            .unwrap_or(false);
+        if !enabled {
+            return Box::pin(async {
+                Ok(ToolResult {
+                    model_output: "tool is unavailable.".to_owned(),
+                    presentation: None,
+                    artifacts: Vec::new(),
+                })
+            });
+        }
+        self.inner.execute(request)
+    }
 }
 
 /// Registered tools with unique names and executable routes.

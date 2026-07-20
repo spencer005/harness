@@ -4,7 +4,9 @@
 //! credentials, or implement PTYs. The session store remains behind its
 //! current-format adapter until the final user-run migration phase.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, sync::{Arc, RwLock}};
+
+pub mod compaction;
 
 use harness_model_api::{
     ModelAttempt, ModelEvent, ModelRequest, ModelSelection, ModelTerminalOutcome, ModelTransport,
@@ -19,8 +21,8 @@ use harness_session_store::{
     SessionStoreError, SessionWriter, TranscriptPage as StoredTranscriptPage, TurnOutcome,
 };
 use harness_tool_api::{
-    ToolExecutionId, ToolExecutionPolicy, ToolExecutionRequest, ToolExecutor, ToolName,
-    ToolRegistry,
+    ToolAvailability, ToolExecutionId, ToolExecutionPolicy, ToolExecutionRequest, ToolExecutor,
+    ToolName, ToolRegistry,
 };
 use thiserror::Error;
 use tokio::task::JoinHandle;
@@ -103,8 +105,8 @@ pub enum ConversationPhase {
     PreparingContinuation { turn_id: u64 },
     /// Active model work is being cancelled.
     Cancelling { turn_id: u64, attempt_id: u64 },
-    /// A compaction job is active.
-    Compacting { compaction_id: u64 },
+    /// A compaction model attempt is active.
+    Compacting { compaction_id: u64, attempt_id: u64 },
     /// A turn or lifecycle operation failed and is returning to idle.
     Failed {
         turn_id: Option<u64>,
@@ -322,6 +324,10 @@ pub struct RuntimePorts {
     pub request_builder: Arc<dyn ModelRequestBuilder>,
     /// Route selected for root model requests.
     pub model_route: ResolvedModelRoute,
+    /// Route selected for compaction requests.
+    pub compaction_route: ResolvedModelRoute,
+    /// Shared dynamic tool-availability policy.
+    pub tool_availability: Arc<RwLock<ToolAvailability>>,
 }
 
 /// Runtime construction input.
@@ -353,10 +359,14 @@ pub struct ConversationRuntime {
     persist_state: PersistState,
     queued_steering: Vec<String>,
     pending_interrupt: Option<String>,
+    request_loop_stopped: bool,
     canonical_revision: u64,
     transport_stopped: bool,
     next_attempt_id: u64,
     model_started: bool,
+    compaction: Option<compaction::CompactionCoordinator>,
+    next_compaction_id: u64,
+    compatibility_mode: bool,
 
     next_turn_id: u64,
 }
@@ -383,10 +393,14 @@ impl ConversationRuntime {
             persist_state: PersistState::Disabled,
             queued_steering: Vec::new(),
             pending_interrupt: None,
+            request_loop_stopped: false,
             canonical_revision: 0,
             transport_stopped: false,
             next_attempt_id: 1,
             model_started: false,
+            compaction: None,
+            next_compaction_id: 1,
+            compatibility_mode: false,
         }
     }
 
@@ -469,6 +483,7 @@ impl ConversationRuntime {
                 }
                 SessionPayload::Metadata(_)
                 | SessionPayload::ProviderBinding(_)
+                | SessionPayload::CompactionCheckpoint { .. }
                 | SessionPayload::SessionClosed => {}
             }
             if let SessionPayload::ModelAttemptStarted { attempt_id, .. } = payload {
@@ -610,6 +625,7 @@ impl ConversationRuntime {
             return Err(RuntimeError::EmptyCommandText);
         }
 
+        self.request_loop_stopped = false;
         let turn_id = self.next_turn_id;
         self.next_turn_id = turn_id.checked_add(1).ok_or(RuntimeError::IdExhausted)?;
         let next_revision = self
@@ -664,13 +680,23 @@ impl ConversationRuntime {
         request_history.extend_from_slice(&self.canonical_history);
         request_history.extend_from_slice(&records);
 
-        let request = self.configuration.ports.request_builder.build(
-            next_revision,
-            &self.configuration.model,
-            self.configuration.ports.model_route.generation,
-            &request_history,
-            &self.queued_steering,
-        )?;
+        let request = if self.compatibility_mode {
+            self.configuration.ports.request_builder.build_compatibility(
+                next_revision,
+                &self.configuration.model,
+                self.configuration.ports.model_route.generation,
+                &request_history,
+                &self.queued_steering,
+            )?
+        } else {
+            self.configuration.ports.request_builder.build(
+                next_revision,
+                &self.configuration.model,
+                self.configuration.ports.model_route.generation,
+                &request_history,
+                &self.queued_steering,
+            )?
+        };
         if request.provider_generation != self.configuration.ports.model_route.generation {
             return Err(RuntimeError::ProviderGenerationMismatch);
         }
@@ -739,6 +765,52 @@ impl ConversationRuntime {
         Ok(())
     }
 
+    /// Prepares and schedules a compaction model request.
+    pub fn start_compaction_request(&mut self) -> Result<RuntimeEffect, RuntimeError> {
+        let coordinator = self
+            .compaction
+            .as_ref()
+            .ok_or(RuntimeError::CompactionNotActive)?;
+        if !matches!(self.phase, ConversationPhase::Idle) {
+            return Err(RuntimeError::InvalidPhase);
+        }
+        let source = coordinator
+            .source()
+            .ok_or(RuntimeError::CompactionRedoUnavailable)?;
+        let instruction = coordinator
+            .instruction()
+            .ok_or(RuntimeError::CompactionNotActive)?;
+        let compaction_id = self.next_compaction_id;
+        self.next_compaction_id = compaction_id
+            .checked_add(1)
+            .ok_or(RuntimeError::IdExhausted)?;
+        let attempt_id = self.next_attempt_id;
+        self.next_attempt_id = attempt_id.checked_add(1).ok_or(RuntimeError::IdExhausted)?;
+        let request = self.configuration.ports.request_builder.build_compaction(
+            self.canonical_revision,
+            &self.configuration.model,
+            self.configuration.ports.compaction_route.generation,
+            &source.history,
+            instruction,
+        )?;
+        if request.provider_generation != self.configuration.ports.compaction_route.generation {
+            return Err(RuntimeError::ProviderGenerationMismatch);
+        }
+        self.model_started = false;
+        self.phase = ConversationPhase::Compacting {
+            compaction_id,
+            attempt_id,
+        };
+        Ok(RuntimeEffect::StartCompaction {
+            compaction_id,
+            attempt: Arc::new(ModelAttempt::initial(
+                request,
+                harness_model_api::ModelAttemptId(attempt_id),
+            )),
+            route: self.configuration.ports.compaction_route.clone(),
+        })
+    }
+
     /// Applies one typed model event to the active attempt.
     pub async fn dispatch_model_event(
         &mut self,
@@ -746,6 +818,73 @@ impl ConversationRuntime {
         attempt_id: u64,
         event: ModelEvent,
     ) -> Result<Vec<RuntimeEffect>, RuntimeError> {
+        if let ConversationPhase::Compacting {
+            compaction_id,
+            attempt_id: active_attempt,
+        } = self.phase
+        {
+            if active_attempt != attempt_id {
+                return Err(RuntimeError::InvalidPhase);
+            }
+            return match event {
+                ModelEvent::Started => {
+                    if self.model_started {
+                        return Err(RuntimeError::DuplicateModelStart);
+                    }
+                    self.model_started = true;
+                    Ok(vec![RuntimeEffect::Emit(RuntimeEvent::ResponseStarted)])
+                }
+                ModelEvent::AssistantTextDelta(delta) => {
+                    self.record_compaction_delta(&delta)?;
+                    Ok(Vec::new())
+                }
+                ModelEvent::Terminal(outcome) => {
+                    let started = self.model_started;
+                    self.model_started = false;
+                    self.phase = ConversationPhase::Idle;
+                    if !started {
+                        return Ok(vec![RuntimeEffect::Emit(RuntimeEvent::Failure(
+                            harness_runtime_api::RuntimeFailure {
+                                category: harness_runtime_api::RuntimeFailureCategory::Protocol,
+                                message: "compaction stream completed before it started"
+                                    .to_string(),
+                            },
+                        ))]);
+                    }
+                    match outcome {
+                        ModelTerminalOutcome::Completed(completion) => {
+                            self.finish_compaction()?;
+                            let summary = self
+                                .compaction
+                                .as_ref()
+                                .and_then(compaction::CompactionCoordinator::validated_summary)
+                                .ok_or(RuntimeError::CompactionInvalidResult)?
+                                .to_owned();
+                            Ok(vec![
+                                RuntimeEffect::Emit(RuntimeEvent::ResponseFinished(
+                                    ModelTerminalOutcome::Completed(completion),
+                                )),
+                                RuntimeEffect::CommitCompaction {
+                                    compaction_id,
+                                    summary,
+                                },
+                            ])
+                        }
+                        other => Ok(vec![RuntimeEffect::Emit(RuntimeEvent::ResponseFinished(
+                            other,
+                        ))]),
+                    }
+                }
+                ModelEvent::ReasoningSummaryDelta(_)
+                | ModelEvent::ReasoningContentDelta(_)
+                | ModelEvent::ReasoningItem(_)
+                | ModelEvent::ToolInputDelta(_)
+                | ModelEvent::ToolCall(_)
+                | ModelEvent::Metadata(_)
+                | ModelEvent::Usage(_) => Ok(Vec::new()),
+            };
+        }
+
         match event {
             ModelEvent::Started => {
                 self.ensure_model_attempt(turn_id, attempt_id)?;
@@ -817,8 +956,18 @@ impl ConversationRuntime {
                     return Err(RuntimeError::DuplicateToolCall);
                 }
                 self.pending_tool_inputs.remove(&call.call_id);
+                let transcript = RuntimeEffect::Emit(RuntimeEvent::TranscriptAppended(
+                    harness_runtime_api::TranscriptSnapshotEntry {
+                        sequence: None,
+                        payload: harness_runtime_api::TranscriptPayload::ToolCall {
+                            call_id: call.call_id.clone(),
+                            name: call.name.clone(),
+                            input: call.input.clone(),
+                        },
+                    },
+                ));
                 self.pending_tool_calls.push(call);
-                Ok(Vec::new())
+                Ok(vec![transcript])
             }
             ModelEvent::Metadata(_) | ModelEvent::Usage(_) => {
                 self.ensure_model_attempt(turn_id, attempt_id)?;
@@ -832,6 +981,73 @@ impl ConversationRuntime {
                     .await
             }
         }
+    }
+
+    /// Persists a validated compaction checkpoint before replacing active history.
+    pub async fn commit_compaction(
+        &mut self,
+        _compaction_id: u64,
+        summary: String,
+    ) -> Result<Vec<RuntimeEffect>, RuntimeError> {
+        if self.phase != ConversationPhase::Idle {
+            return Err(RuntimeError::InvalidPhase);
+        }
+        let coordinator = self
+            .compaction
+            .as_ref()
+            .ok_or(RuntimeError::CompactionNotActive)?;
+        let source = coordinator
+            .source()
+            .ok_or(RuntimeError::CompactionRedoUnavailable)?
+            .clone();
+        let source_revision = source.revision;
+        let turn_id = source
+            .history
+            .iter()
+            .rev()
+            .find_map(|payload| match payload {
+                SessionPayload::TurnStarted { turn_id }
+                | SessionPayload::InputMessage { turn_id, .. }
+                | SessionPayload::ModelAttemptStarted { turn_id, .. }
+                | SessionPayload::AssistantMessage { turn_id, .. }
+                | SessionPayload::Reasoning { turn_id, .. }
+                | SessionPayload::Error { turn_id, .. }
+                | SessionPayload::ToolCallAccepted { turn_id, .. }
+                | SessionPayload::ToolExecutionStarted { turn_id, .. }
+                | SessionPayload::ToolExecutionFinished { turn_id, .. }
+                | SessionPayload::TurnFinished { turn_id, .. } => Some(*turn_id),
+                _ => None,
+            })
+            .unwrap_or(0);
+        let record = SessionPayload::CompactionCheckpoint {
+            source_revision,
+            summary: summary.clone(),
+        };
+        let next_revision = self
+            .canonical_revision
+            .checked_add(1)
+            .ok_or(RuntimeError::IdExhausted)?;
+        self.writer
+            .as_mut()
+            .ok_or(RuntimeError::InvalidLifecycle)?
+            .append(std::slice::from_ref(&record), Durability::Durable)
+            .await
+            .map_err(RuntimeError::Session)?;
+        self.canonical_history.clear();
+        self.canonical_history.push(record);
+        self.canonical_revision = next_revision;
+        self.compaction
+            .as_mut()
+            .ok_or(RuntimeError::CompactionNotActive)?
+            .commit()
+            .map_err(|_| RuntimeError::CompactionInvalidResult)?;
+        self.compaction = None;
+        self.request_loop_stopped = false;
+        self.phase = ConversationPhase::PreparingAttempt { turn_id };
+        Ok(vec![
+            RuntimeEffect::Emit(RuntimeEvent::CompactionCompleted(summary)),
+            RuntimeEffect::ContinueModel { turn_id },
+        ])
     }
 
     /// Persists the accumulated assistant text before allowing continuation.
@@ -1096,7 +1312,7 @@ impl ConversationRuntime {
         self.model_started = false;
         self.phase = ConversationPhase::Idle;
 
-        let mut effects = Vec::with_capacity(2);
+        let mut effects = Vec::with_capacity(3);
         if let Some((_, category, message)) = failure_details {
             effects.push(RuntimeEffect::Emit(RuntimeEvent::TranscriptAppended(
                 TranscriptSnapshotEntry {
@@ -1106,6 +1322,7 @@ impl ConversationRuntime {
             )));
         }
         effects.push(RuntimeEffect::Emit(RuntimeEvent::ResponseFinished(outcome)));
+        effects.push(RuntimeEffect::Emit(RuntimeEvent::AgenticLoopCompleted));
         Ok(effects)
     }
 
@@ -1144,6 +1361,7 @@ impl ConversationRuntime {
                 let receipt = self.submit_prompt(text).await?;
                 let start_model = self.start_model_request().await?;
                 Ok(vec![
+                    RuntimeEffect::Emit(RuntimeEvent::AgenticLoopStarted),
                     RuntimeEffect::Emit(RuntimeEvent::TranscriptAppended(
                         harness_runtime_api::TranscriptSnapshotEntry {
                             sequence: receipt.sequences.clone().last(),
@@ -1155,6 +1373,70 @@ impl ConversationRuntime {
                     )),
                     start_model,
                 ])
+            }
+            RuntimeCommand::Retry => {
+                if self.lifecycle != RuntimeLifecycle::Ready {
+                    return Err(RuntimeError::InvalidLifecycle);
+                }
+                if self.phase != ConversationPhase::Idle {
+                    return Err(RuntimeError::InvalidPhase);
+                }
+
+                let mut retry_turn = None;
+                for payload in self.canonical_history.iter().rev() {
+                    match payload {
+                        // Errors and turn/attempt markers are bookkeeping around the
+                        // actual turn and must not hide a retryable input or tool result.
+                        SessionPayload::Error { .. }
+                        | SessionPayload::TurnFinished { .. }
+                        | SessionPayload::ModelAttemptStarted { .. }
+                        | SessionPayload::ToolExecutionStarted { .. }
+                        | SessionPayload::TurnStarted { .. } => {}
+                        SessionPayload::InputMessage { turn_id, .. }
+                        | SessionPayload::ToolCallAccepted { turn_id, .. }
+                        | SessionPayload::ToolExecutionFinished { turn_id, .. } => {
+                            retry_turn = Some(*turn_id);
+                            break;
+                        }
+                        // A real assistant/reasoning/checkpoint record means the
+                        // retryable turn is no longer the durable tail.
+                        _ => break,
+                    }
+                }
+                let turn_id = retry_turn.ok_or(RuntimeError::RetryUnavailable)?;
+
+                self.request_loop_stopped = false;
+                self.pending_interrupt = None;
+                self.phase = ConversationPhase::PreparingAttempt { turn_id };
+                Ok(vec![
+                    RuntimeEffect::Emit(RuntimeEvent::AgenticLoopStarted),
+                    RuntimeEffect::ContinueModel { turn_id },
+                ])
+            }
+            RuntimeCommand::SetToolAvailability { pattern, enabled } => {
+                if self.lifecycle != RuntimeLifecycle::Ready {
+                    return Err(RuntimeError::InvalidLifecycle);
+                }
+                self.configuration
+                    .ports
+                    .tool_availability
+                    .write()
+                    .map_err(|_| RuntimeError::ToolAvailabilityUnavailable)?
+                    .set(pattern, enabled)
+                    .map_err(|_| RuntimeError::InvalidToolAvailabilityPattern)?;
+                Ok(Vec::new())
+            }
+            RuntimeCommand::Compact { instruction } => {
+                self.begin_compaction(instruction)?;
+                Ok(vec![self.start_compaction_request()?])
+            }
+            RuntimeCommand::RetryCompaction { instruction } => {
+                self.redo_compaction_with_instruction(instruction)?;
+                Ok(vec![self.start_compaction_request()?])
+            }
+            RuntimeCommand::CancelCompaction => {
+                self.cancel_compaction()?;
+                Ok(Vec::new())
             }
             RuntimeCommand::QueueSteering { text } => {
                 if self.lifecycle != RuntimeLifecycle::Ready {
@@ -1171,21 +1453,54 @@ impl ConversationRuntime {
                     return Err(RuntimeError::InvalidPhase);
                 }
                 self.queued_steering.push(text);
+                Ok(vec![RuntimeEffect::Emit(RuntimeEvent::SteeringChanged(
+                    Some(self.queued_steering.join("\n")),
+                ))])
+            }
+            RuntimeCommand::StopRequestLoop => {
+                if self.lifecycle != RuntimeLifecycle::Ready {
+                    return Err(RuntimeError::InvalidLifecycle);
+                }
+                self.request_loop_stopped = true;
+                Ok(Vec::new())
+            }
+            RuntimeCommand::AbortResponse => {
+                let (turn_id, attempt_id) = match &self.phase {
+                    ConversationPhase::AwaitingModel { turn_id, attempt_id } => (*turn_id, *attempt_id),
+                    _ => return Err(RuntimeError::InvalidPhase),
+                };
+                self.interrupt(turn_id, attempt_id)?;
                 Ok(Vec::new())
             }
             RuntimeCommand::Interrupt { text } => {
-                if text.is_empty() {
-                    return Err(RuntimeError::EmptyCommandText);
+                if self.lifecycle != RuntimeLifecycle::Ready {
+                    return Err(RuntimeError::InvalidLifecycle);
                 }
-                let (turn_id, attempt_id) = match &self.phase {
+                // Stash steering text (if any) for the next model attempt.
+                if !text.is_empty() {
+                    self.pending_interrupt = Some(text);
+                }
+                // Interrupt the active model attempt if one is awaiting. If the
+                // runtime is between attempts (preparing, executing tools, or
+                // persisting), the pending interrupt / stopped loop flag will
+                // short-circuit the turn at the next continuation.
+                let interrupted = match &self.phase {
                     ConversationPhase::AwaitingModel {
                         turn_id,
                         attempt_id,
-                    } => (*turn_id, *attempt_id),
-                    _ => return Err(RuntimeError::InvalidPhase),
+                    } => {
+                        self.interrupt(*turn_id, *attempt_id)?;
+                        true
+                    }
+                    ConversationPhase::Cancelling { .. } => true,
+                    _ => false,
                 };
-                self.pending_interrupt = Some(text);
-                self.interrupt(turn_id, attempt_id)?;
+                if !interrupted {
+                    // Signal the request loop to stop so the turn ends as soon
+                    // as the current phase completes, rather than starting
+                    // another model attempt.
+                    self.request_loop_stopped = true;
+                }
                 Ok(Vec::new())
             }
             RuntimeCommand::SetModel { selection } => {
@@ -1222,7 +1537,7 @@ impl ConversationRuntime {
     pub async fn accept_next_tool_call(
         &mut self,
         turn_id: u64,
-    ) -> Result<RuntimeEffect, RuntimeError> {
+    ) -> Result<Vec<RuntimeEffect>, RuntimeError> {
         if self.phase != (ConversationPhase::PreparingContinuation { turn_id }) {
             return Err(RuntimeError::InvalidPhase);
         }
@@ -1246,18 +1561,34 @@ impl ConversationRuntime {
             .checked_add(1)
             .ok_or(RuntimeError::IdExhausted)?;
 
-        let records = vec![
-            SessionPayload::ToolCallAccepted {
+        let goal_completion = call.name == "goal"
+            && is_goal_completion_input(call.input.as_str())
+            && matches!(
+                &self.persist_state,
+                PersistState::Active(task)
+                    if task.completion_policy == CompletionPolicy::ModelMayComplete
+            );
+        let records = if goal_completion {
+            vec![SessionPayload::ToolCallAccepted {
                 turn_id,
                 call_id: call_id.clone(),
                 name: call.name.clone(),
                 input: call.input.as_str().to_owned(),
-            },
-            SessionPayload::ToolExecutionStarted {
-                turn_id,
-                call_id: call_id.clone(),
-            },
-        ];
+            }]
+        } else {
+            vec![
+                SessionPayload::ToolCallAccepted {
+                    turn_id,
+                    call_id: call_id.clone(),
+                    name: call.name.clone(),
+                    input: call.input.as_str().to_owned(),
+                },
+                SessionPayload::ToolExecutionStarted {
+                    turn_id,
+                    call_id: call_id.clone(),
+                },
+            ]
+        };
         self.phase = ConversationPhase::PersistingToolCall {
             turn_id,
             call_id: call_id.clone(),
@@ -1281,6 +1612,26 @@ impl ConversationRuntime {
         self.canonical_history.extend(records);
         self.canonical_revision = next_revision;
         self.pending_tool_calls.remove(0);
+        let transcript = RuntimeEffect::Emit(RuntimeEvent::TranscriptAppended(
+            harness_runtime_api::TranscriptSnapshotEntry {
+                sequence: None,
+                payload: harness_runtime_api::TranscriptPayload::ToolCall {
+                    call_id: call.call_id.clone(),
+                    name: call.name.clone(),
+                    input: call.input.clone(),
+                },
+            },
+        ));
+        if goal_completion {
+            self.active_tool_call = None;
+            self.phase = ConversationPhase::PreparingContinuation { turn_id };
+            self.complete_persist()?;
+            self.complete_turn(turn_id).await?;
+            return Ok(vec![
+                transcript,
+                RuntimeEffect::Emit(RuntimeEvent::AgenticLoopCompleted),
+            ]);
+        }
         self.active_tool_call = Some(call);
         self.phase = ConversationPhase::ExecutingTool {
             turn_id,
@@ -1291,11 +1642,14 @@ impl ConversationRuntime {
             deadline_ms: 30_000,
             cancellable: true,
         })?;
-        Ok(RuntimeEffect::ExecuteTool {
-            turn_id,
-            call_id,
-            request,
-        })
+        Ok(vec![
+            transcript,
+            RuntimeEffect::ExecuteTool {
+                turn_id,
+                call_id,
+                request,
+            },
+        ])
     }
 
     /// Builds an execution request for the durably accepted active tool call.
@@ -1362,12 +1716,12 @@ impl ConversationRuntime {
         let records = vec![SessionPayload::ToolExecutionFinished {
             turn_id,
             call_id: call_id.clone(),
-            output,
+            output: output.clone(),
         }];
         self.phase = ConversationPhase::PersistingToolResult {
             turn_id,
             execution_id,
-            call_id,
+            call_id: call_id.clone(),
         };
         match self
             .writer
@@ -1388,12 +1742,21 @@ impl ConversationRuntime {
         self.canonical_history.extend(records);
         self.canonical_revision = next_revision;
         self.active_tool_call = None;
+        let transcript = RuntimeEffect::Emit(RuntimeEvent::TranscriptAppended(
+            harness_runtime_api::TranscriptSnapshotEntry {
+                sequence: None,
+                payload: harness_runtime_api::TranscriptPayload::ToolResult {
+                    call_id,
+                    output,
+                },
+            },
+        ));
         if self.pending_tool_calls.is_empty() {
             self.phase = ConversationPhase::PreparingAttempt { turn_id };
-            Ok(vec![RuntimeEffect::ContinueModel { turn_id }])
+            Ok(vec![transcript, RuntimeEffect::ContinueModel { turn_id }])
         } else {
             self.phase = ConversationPhase::PreparingContinuation { turn_id };
-            Ok(vec![RuntimeEffect::ContinueTurn { turn_id }])
+            Ok(vec![transcript, RuntimeEffect::ContinueTurn { turn_id }])
         }
     }
 
@@ -1405,11 +1768,22 @@ impl ConversationRuntime {
         if self.phase != (ConversationPhase::PreparingContinuation { turn_id }) {
             return Err(RuntimeError::InvalidPhase);
         }
-        if self.pending_tool_calls.is_empty() {
+        if self.request_loop_stopped {
+            self.pending_tool_calls.clear();
+            self.active_tool_call = None;
+            self.queued_steering.clear();
             self.complete_turn(turn_id).await?;
-            return Ok(Vec::new());
+            return Ok(vec![RuntimeEffect::Emit(RuntimeEvent::AgenticLoopCompleted)]);
         }
-        Ok(vec![self.accept_next_tool_call(turn_id).await?])
+        if self.pending_tool_calls.is_empty() {
+            if !self.queued_steering.is_empty() {
+                self.phase = ConversationPhase::PreparingAttempt { turn_id };
+                return Ok(vec![RuntimeEffect::ContinueModel { turn_id }]);
+            }
+            self.complete_turn(turn_id).await?;
+            return Ok(vec![RuntimeEffect::Emit(RuntimeEvent::AgenticLoopCompleted)]);
+        }
+        self.accept_next_tool_call(turn_id).await
     }
 
     /// Loads one older transcript page through the injected read port.
@@ -1469,6 +1843,9 @@ impl ConversationRuntime {
                     SessionPayload::ToolExecutionFinished {
                         call_id, output, ..
                     } => TranscriptPayload::ToolResult { call_id, output },
+                    SessionPayload::CompactionCheckpoint { summary, .. } => {
+                        TranscriptPayload::Thinking { text: summary }
+                    }
                     SessionPayload::Metadata(_)
                     | SessionPayload::ProviderBinding(_)
                     | SessionPayload::TurnStarted { .. }
@@ -1496,6 +1873,145 @@ impl ConversationRuntime {
 
     pub fn canonical_history(&self) -> &[SessionPayload] {
         &self.canonical_history
+    }
+
+    /// Begins a staged compaction against the current canonical history.
+    pub fn begin_compaction(
+        &mut self,
+        instruction: String,
+    ) -> Result<(), RuntimeError> {
+        if self.lifecycle != RuntimeLifecycle::Ready {
+            return Err(RuntimeError::InvalidLifecycle);
+        }
+        if self.phase != ConversationPhase::Idle {
+            return Err(RuntimeError::InvalidPhase);
+        }
+        if self.canonical_history.is_empty() {
+            return Err(RuntimeError::CompactionEmptyHistory);
+        }
+        if self.compaction.is_some() {
+            return Err(RuntimeError::CompactionAlreadyRunning);
+        }
+        let source = compaction::CompactionSource {
+            revision: self.canonical_revision,
+            history: self.canonical_history.clone(),
+        };
+        self.compaction = Some(
+            compaction::CompactionCoordinator::begin(source, instruction)
+                .map_err(|_| RuntimeError::CompactionAlreadyRunning)?,
+        );
+        Ok(())
+    }
+
+    /// Returns whether a compaction model attempt is active.
+    pub fn compaction_attempt_active(&self) -> bool {
+        matches!(self.phase, ConversationPhase::Compacting { .. })
+    }
+
+    /// Retries the active model attempt using function-tool compatibility encoding.
+    pub fn retry_with_compatibility(
+        &mut self,
+        turn_id: u64,
+        attempt_id: u64,
+    ) -> Result<Option<RuntimeEffect>, RuntimeError> {
+        if self.compatibility_mode {
+            return Ok(None);
+        }
+        match self.phase {
+            ConversationPhase::AwaitingModel {
+                turn_id: active_turn,
+                attempt_id: active_attempt,
+            } if active_turn == turn_id && active_attempt == attempt_id => {}
+            _ => return Err(RuntimeError::InvalidPhase),
+        }
+        let request = self.configuration.ports.request_builder.build_compatibility(
+            self.canonical_revision,
+            &self.configuration.model,
+            self.configuration.ports.model_route.generation,
+            &self.canonical_history,
+            &[],
+        )?;
+        if request.provider_generation != self.configuration.ports.model_route.generation {
+            return Err(RuntimeError::ProviderGenerationMismatch);
+        }
+        if request.history_revision != self.canonical_revision {
+            return Err(RuntimeError::RequestRevisionMismatch);
+        }
+        self.compatibility_mode = true;
+        self.model_started = false;
+        Ok(Some(RuntimeEffect::StartModel {
+            turn_id,
+            attempt: Arc::new(ModelAttempt::initial(
+                request,
+                harness_model_api::ModelAttemptId(attempt_id),
+            )),
+            route: self.configuration.ports.model_route.clone(),
+        }))
+    }
+
+    /// Returns whether the active model response emitted its start event.
+    pub fn model_response_started(&self) -> bool {
+        self.model_started
+    }
+
+    /// Returns a failed compaction attempt to the idle state while retaining its source.
+    pub fn fail_compaction_attempt(&mut self) {
+        if self.compaction_attempt_active() {
+            self.phase = ConversationPhase::Idle;
+            self.model_started = false;
+        }
+    }
+
+    /// Adds one streamed compaction fragment to the staged result.
+    pub fn record_compaction_delta(&mut self, delta: &str) -> Result<(), RuntimeError> {
+        self.compaction
+            .as_mut()
+            .ok_or(RuntimeError::CompactionNotActive)?
+            .push_delta(delta)
+            .map_err(|_| RuntimeError::CompactionNotActive)
+    }
+
+    /// Validates the staged compaction response without changing active history.
+    pub fn finish_compaction(&mut self) -> Result<(), RuntimeError> {
+        self.compaction
+            .as_mut()
+            .ok_or(RuntimeError::CompactionNotActive)?
+            .finish()
+            .map(|_| ())
+            .map_err(|_| RuntimeError::CompactionInvalidResult)
+    }
+
+    /// Retries compaction from the preserved pre-compaction source.
+    pub fn redo_compaction(&mut self) -> Result<(), RuntimeError> {
+        self.redo_compaction_with_instruction(None)
+    }
+
+    /// Retries compaction with optional replacement instructions.
+    pub fn redo_compaction_with_instruction(
+        &mut self,
+        instruction: Option<String>,
+    ) -> Result<(), RuntimeError> {
+        self.compaction
+            .as_mut()
+            .ok_or(RuntimeError::CompactionNotActive)?
+            .redo_with_instruction(instruction)
+            .map_err(|_| RuntimeError::CompactionRedoUnavailable)
+    }
+
+    /// Cancels staged compaction and preserves the active canonical history.
+    pub fn cancel_compaction(&mut self) -> Result<(), RuntimeError> {
+        let coordinator = self
+            .compaction
+            .as_mut()
+            .ok_or(RuntimeError::CompactionNotActive)?;
+        coordinator.cancel();
+        self.compaction = None;
+        Ok(())
+    }
+
+    /// Returns whether a compaction transaction is staged.
+    pub fn has_compaction(&self) -> bool {
+        self.compaction.is_some()
     }
 
     /// Creates the shutdown acknowledgment only after joined shutdown completes.
@@ -1566,7 +2082,7 @@ impl ConversationRuntime {
         std::sync::Arc::clone(&self.configuration.ports.model_transport)
     }
 
-    /// Update the transport and model route ports in-place.
+    /// Update the transport and root model route ports in-place.
     pub fn update_ports(
         &mut self,
         model_transport: std::sync::Arc<dyn harness_model_api::ModelTransport>,
@@ -1574,6 +2090,11 @@ impl ConversationRuntime {
     ) {
         self.configuration.ports.model_transport = model_transport;
         self.configuration.ports.model_route = model_route;
+    }
+
+    /// Updates the route used for future compaction requests.
+    pub fn update_compaction_route(&mut self, route: harness_model_api::ResolvedModelRoute) {
+        self.configuration.ports.compaction_route = route;
     }
 
     /// Appends records directly to the session store.
@@ -1693,11 +2214,43 @@ pub enum RuntimeError {
     /// A model attempt emits more than one start event.
     #[error("model attempt emitted a duplicate start event")]
     DuplicateModelStart,
+    /// The session has no durable history to compact.
+    #[error("session history is empty; nothing to compact")]
+    CompactionEmptyHistory,
+    /// A compaction transaction is already staged.
+    #[error("compaction is already running")]
+    CompactionAlreadyRunning,
+    /// No compaction transaction is staged.
+    #[error("compaction is not active")]
+    CompactionNotActive,
+    /// The staged model output failed compaction validation.
+    #[error("compaction result is invalid")]
+    CompactionInvalidResult,
+    /// The preserved source is no longer available for redo.
+    #[error("compaction cannot be redone")]
+    CompactionRedoUnavailable,
+    /// The dynamic tool-availability policy cannot be read or written.
+    #[error("tool availability policy is unavailable")]
+    ToolAvailabilityUnavailable,
+    /// A dynamic tool-availability pattern is invalid.
+    #[error("tool availability pattern is invalid")]
+    InvalidToolAvailabilityPattern,
+    /// The durable tail does not identify a user or tool turn that can be retried.
+    #[error("the last durable message cannot be retried")]
+    RetryUnavailable,
+}
+
+fn is_goal_completion_input(input: &str) -> bool {
+    let input = input.trim();
+    input == "complete"
+        || input == r#"{"input":"complete"}"#
+        || input == r#"{ "input": "complete" }"#
 }
 
 /// Port that builds immutable model requests from canonical state.
 pub trait ModelRequestBuilder: Send + Sync {
     /// Builds a request for the current canonical revision and selected model.
+    /// Builds immutable semantic model requests.
     fn build(
         &self,
         revision: u64,
@@ -1706,12 +2259,42 @@ pub trait ModelRequestBuilder: Send + Sync {
         history: &[SessionPayload],
         steering: &[String],
     ) -> Result<Arc<ModelRequest>, RuntimeError>;
+
+    /// Builds a request using function-tool compatibility encoding.
+    fn build_compatibility(
+        &self,
+        revision: u64,
+        selection: &ModelSelection,
+        provider_generation: ProviderGeneration,
+        history: &[SessionPayload],
+        steering: &[String],
+    ) -> Result<Arc<ModelRequest>, RuntimeError> {
+        self.build(revision, selection, provider_generation, history, steering)
+    }
+
+    /// Builds a request whose response is a compaction summary.
+    fn build_compaction(
+        &self,
+        revision: u64,
+        selection: &ModelSelection,
+        provider_generation: ProviderGeneration,
+        history: &[SessionPayload],
+        instruction: &str,
+    ) -> Result<Arc<ModelRequest>, RuntimeError> {
+        self.build(
+            revision,
+            selection,
+            provider_generation,
+            history,
+            &[instruction.to_owned()],
+        )
+    }
 }
 
 /// Effect scheduled by a reducer transition.
 #[derive(Debug)]
 pub enum RuntimeEffect {
-    /// Start one model attempt.
+    /// Start one normal model attempt.
     StartModel {
         /// Turn owning the attempt.
         turn_id: u64,
@@ -1719,6 +2302,22 @@ pub enum RuntimeEffect {
         attempt: Arc<ModelAttempt>,
         /// Route selected for this attempt.
         route: ResolvedModelRoute,
+    },
+    /// Start one compaction model attempt.
+    StartCompaction {
+        /// Compaction identity.
+        compaction_id: u64,
+        /// Attempt to submit.
+        attempt: Arc<ModelAttempt>,
+        /// Compaction route.
+        route: ResolvedModelRoute,
+    },
+    /// Commit a validated compaction checkpoint.
+    CommitCompaction {
+        /// Compaction identity.
+        compaction_id: u64,
+        /// Validated summary text.
+        summary: String,
     },
     /// Commit one completed assistant response.
     CommitAssistant {

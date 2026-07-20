@@ -12,7 +12,10 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     pin::Pin,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use harness_tool_api::{
@@ -55,6 +58,13 @@ impl Executor {
     /// Creates an executor that can edit only files below `workspace`.
     pub fn new(workspace: WorkspaceRoot) -> Self {
         Self { workspace }
+    }
+}
+
+::inventory::submit! {
+    crate::inventory::ToolRegistration {
+        spec,
+        executor: |workspace| Arc::new(Executor::new(workspace)),
     }
 }
 

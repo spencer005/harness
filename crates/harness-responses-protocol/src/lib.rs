@@ -175,6 +175,15 @@ pub struct ResponsesEventDecoder {
     assistant_text: String,
     usage: Option<ModelUsage>,
     terminal_seen: bool,
+    /// `item_id -> call_id` learned from `response.output_item.added` frames for
+    /// function/custom tool calls. Some providers omit `call_id` on
+    /// `function_call_arguments.delta` / `custom_tool_call_input.delta` frames
+    /// and only send `item_id`, while the later `response.output_item.done`
+    /// frame carries the canonical `call_id`. Mapping back through `item_id`
+    /// lets the runtime key tool-input deltas under the same identifier that
+    /// the completed `ToolCall` event will use, so the terminal event does not
+    /// trip `IncompleteToolInput` on a stale entry.
+    tool_call_ids: std::collections::HashMap<String, String>,
 }
 
 impl ResponsesEventDecoder {
@@ -191,6 +200,7 @@ impl ResponsesEventDecoder {
             assistant_text: String::new(),
             usage: None,
             terminal_seen: false,
+            tool_call_ids: std::collections::HashMap::new(),
         })
     }
 
@@ -238,6 +248,31 @@ impl ResponsesEventDecoder {
             return Ok(Some(ModelEvent::ReasoningItem(decode_reasoning_item(
                 item,
             )?)));
+        }
+
+        // Remember the canonical call_id that a tool item will use on its
+        // `output_item.done` frame. Delta frames for the same call frequently
+        // carry only `item_id`, so we map `item_id -> call_id` here and resolve
+        // deltas against it below.
+        if event_type == "response.output_item.added"
+            && matches!(
+                value
+                    .get("item")
+                    .and_then(|item| item.get("type"))
+                    .and_then(Value::as_str),
+                Some("function_call" | "custom_tool_call")
+            )
+        {
+            if let Some(item) = value.get("item") {
+                if let (Some(item_id), Some(call_id)) = (
+                    item.get("id").and_then(Value::as_str),
+                    item.get("call_id").and_then(Value::as_str),
+                ) {
+                    self.tool_call_ids
+                        .insert(item_id.to_owned(), call_id.to_owned());
+                }
+            }
+            // Fall through; lifecycle-only event for tool calls.
         }
 
         if event_type == "response.content_part.added"
@@ -292,6 +327,24 @@ impl ResponsesEventDecoder {
             Err(ProtocolError::UnsupportedEvent(_)) if event_type.contains(':') => return Ok(None),
             Err(error) => return Err(error),
         };
+
+        // Normalize tool-call identifiers so delta fragments and the completed
+        // `ToolCall` event share the same key. Some Responses providers emit
+        // delta frames carrying only `item_id` (no `call_id`), and the later
+        // `output_item.done` frame carries the canonical `call_id`. Without
+        // remapping, the runtime's pending-tool-input entry for the delta
+        // (keyed by `item_id`) never gets cleared by the `ToolCall` (keyed by
+        // `call_id`), leaving a dangling entry that trips `IncompleteToolInput`
+        // on the terminal event. We learned `item_id -> call_id` from the
+        // `output_item.added` frame above; here we rewrite any delta whose key
+        // is still the raw `item_id` back to the canonical `call_id`.
+        if let ModelEvent::ToolInputDelta(delta) = &event {
+            if let Some(call_id) = self.tool_call_ids.get(&delta.call_id) {
+                let mut delta = delta.clone();
+                delta.call_id = call_id.clone();
+                return Ok(Some(ModelEvent::ToolInputDelta(delta)));
+            }
+        }
         if matches!(event, ModelEvent::Terminal(_)) {
             if self.terminal_seen {
                 return Err(ProtocolError::DuplicateTerminal);
@@ -424,14 +477,23 @@ fn decode_output_item(value: &Value) -> Result<ModelEvent, ProtocolError> {
     let item = value
         .get("item")
         .ok_or(ProtocolError::InvalidField { field: "item" })?;
+    // Mirror the delta resolver: `call_id` is canonical when present, but
+    // providers that never emit it put the identifier in `id` instead. Falling
+    // back to `id` keeps the `ToolCall` key aligned with the delta keys.
+    let call_id = item
+        .get("call_id")
+        .or_else(|| item.get("id"))
+        .and_then(Value::as_str)
+        .ok_or(ProtocolError::InvalidField { field: "call_id" })?
+        .to_owned();
     match item.get("type").and_then(Value::as_str) {
         Some("function_call") => Ok(ModelEvent::ToolCall(ToolCall {
-            call_id: string_field(item, "call_id")?.to_owned(),
+            call_id,
             name: string_field(item, "name")?.to_owned(),
             input: ToolInput::FunctionJson(string_field(item, "arguments")?.to_owned()),
         })),
         Some("custom_tool_call") => Ok(ModelEvent::ToolCall(ToolCall {
-            call_id: string_field(item, "call_id")?.to_owned(),
+            call_id,
             name: string_field(item, "name")?.to_owned(),
             input: ToolInput::Freeform(string_field(item, "input")?.to_owned()),
         })),
@@ -572,7 +634,7 @@ pub fn encode_input(input: &[ModelInput]) -> Vec<sonic_rs::Value> {
         .collect()
 }
 
-/// Encodes canonical tool definitions using the Responses function format.
+/// Encodes canonical tool definitions using the OpenResponses function and custom-tool formats.
 pub fn encode_tools(tools: &[ToolDefinition]) -> Result<Vec<sonic_rs::Value>, ProtocolError> {
     tools
         .iter()
@@ -730,6 +792,61 @@ mod tests {
         assert!(matches!(
             decoder.push(payload),
             Err(ProtocolError::DuplicateTerminal)
+        ));
+    }
+
+    /// Regression: some Responses providers emit `function_call_arguments.delta`
+    /// (or `custom_tool_call_input.delta`) frames carrying only `item_id`, then
+    /// announce the canonical `call_id` on the `output_item.done` frame. The
+    /// decoder must rewrite the delta's key to the canonical `call_id` learned
+    /// from the earlier `output_item.added` frame, so the runtime can pair the
+    /// accumulated input with the completed `ToolCall` and not trip
+    /// `IncompleteToolInput` on the terminal event.
+    #[test]
+    fn tool_input_delta_keyed_by_item_id_is_remapped_to_call_id() {
+        let mut decoder = ResponsesEventDecoder::new();
+        // `added` carries both `id` (item_id) and `call_id`.
+        decoder
+            .push(b"data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"fc-1\",\"call_id\":\"call-xyz\",\"name\":\"lookup\"}}\n\n")
+            .unwrap();
+        // Delta carries only `item_id`.
+        let events = decoder
+            .push(b"data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc-1\",\"delta\":\"{\\\"q\\\":\\\"\"}\n\n")
+            .unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [ModelEvent::ToolInputDelta(delta)] if delta.call_id == "call-xyz"
+                && delta.fragment == "{\"q\":\""
+        ));
+        // Done carries the canonical `call_id`.
+        let events = decoder
+            .push(b"data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"id\":\"fc-1\",\"call_id\":\"call-xyz\",\"name\":\"lookup\",\"arguments\":\"{\\\"q\\\":\\\"hi\\\"}\"}}\n\n")
+            .unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [ModelEvent::ToolCall(call)] if call.call_id == "call-xyz"
+        ));
+    }
+
+    /// Regression: a provider that never emits `call_id` anywhere keys both the
+    /// deltas and the completed `ToolCall` off `id`. The decoder must keep them
+    /// aligned so the runtime can clear the pending input on the done frame.
+    #[test]
+    fn tool_call_without_call_id_falls_back_to_item_id() {
+        let mut decoder = ResponsesEventDecoder::new();
+        let events = decoder
+            .push(b"data: {\"type\":\"response.custom_tool_call_input.delta\",\"item_id\":\"ctc-1\",\"delta\":\"command: \"}\n\n")
+            .unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [ModelEvent::ToolInputDelta(delta)] if delta.call_id == "ctc-1"
+        ));
+        let events = decoder
+            .push(b"data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"custom_tool_call\",\"id\":\"ctc-1\",\"name\":\"shell\",\"input\":\"command: ls\"}}\n\n")
+            .unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [ModelEvent::ToolCall(call)] if call.call_id == "ctc-1"
         ));
     }
 

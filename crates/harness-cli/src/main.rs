@@ -27,9 +27,9 @@ use harness_model_api::{
     ModelAttempt, ModelAttemptHandle, ModelFailure, ModelInput, ModelMessageRole, ModelRequest,
     ModelRequestId, ModelSelection, ModelTransport, ProviderGeneration, ResolvedModelRoute,
 };
-use harness_openai_chat_transport::{
+use harness_chat_completions_transport::{
     ChatStreamChunk, ChatStreamError, ChatStreamingClient, ChatTransportConfiguration,
-    OpenAiChatTransport,
+    ChatCompletionsTransport,
 };
 use harness_provider::{
     ProviderAuthConfig, ProviderConfig, ProviderDriverConfig, ProviderError, ProviderIdentity,
@@ -50,8 +50,10 @@ use harness_runtime_api::{
 use harness_session_store::{
     SessionPayload, SessionReader, SessionRecord, SessionStore, SessionStoreError, SessionWriter,
 };
-use harness_tool_api::ToolRegistry;
-use harness_tool_execution::{WorkspaceRoot, edit_file};
+use harness_tool_api::{
+    AvailabilityToolExecutor, ToolAvailability, ToolExecutor, ToolRegistry,
+};
+use harness_tool_execution::{ToolInventory, WorkspaceRoot};
 use harness_tui_rewrite::domain::{
     ExternalText, InitialState, ModelState, ProviderKind, ProviderState, ProviderTransport,
 };
@@ -122,6 +124,10 @@ enum SerializablePayload {
     TurnFinished {
         turn_id: u64,
         outcome: SerializableTurnOutcome,
+    },
+    CompactionCheckpoint {
+        source_revision: u64,
+        summary: String,
     },
     SessionClosed,
 }
@@ -251,6 +257,13 @@ fn to_serializable_payload(payload: &SessionPayload) -> SerializablePayload {
                 }
             },
         },
+        SessionPayload::CompactionCheckpoint {
+            source_revision,
+            summary,
+        } => SerializablePayload::CompactionCheckpoint {
+            source_revision: *source_revision,
+            summary: summary.clone(),
+        },
         SessionPayload::SessionClosed => SerializablePayload::SessionClosed,
     }
 }
@@ -350,6 +363,13 @@ fn from_serializable_payload(sp: SerializablePayload) -> SessionPayload {
                     harness_session_store::TurnOutcome::Failed { message }
                 }
             },
+        },
+        SerializablePayload::CompactionCheckpoint {
+            source_revision,
+            summary,
+        } => SessionPayload::CompactionCheckpoint {
+            source_revision,
+            summary,
         },
         SerializablePayload::SessionClosed => SessionPayload::SessionClosed,
     }
@@ -555,6 +575,7 @@ impl SessionWriter for FileSessionWriter {
 
 struct RealModelRequestBuilder {
     tool_registry: Arc<RwLock<ToolRegistry>>,
+    tool_availability: Arc<RwLock<ToolAvailability>>,
 }
 
 impl ModelRequestBuilder for RealModelRequestBuilder {
@@ -608,6 +629,12 @@ impl ModelRequestBuilder for RealModelRequestBuilder {
                     });
                 }
                 SessionPayload::Error { .. } => {}
+                SessionPayload::CompactionCheckpoint { summary, .. } => {
+                    input.push(ModelInput::Message {
+                        role: ModelMessageRole::User,
+                        text: format!("Conversation summary after compaction:\n\n{summary}"),
+                    });
+                }
                 SessionPayload::ToolCallAccepted {
                     call_id,
                     name,
@@ -662,9 +689,15 @@ impl ModelRequestBuilder for RealModelRequestBuilder {
             });
         }
 
+        let availability = self
+            .tool_availability
+            .read()
+            .map_err(|_| RuntimeError::ToolAvailabilityUnavailable)?;
         let mut tools = Vec::new();
         for (_, tool) in registry.iter() {
-            tools.push(tool.definition.clone());
+            if availability.is_enabled(tool.definition.name.as_str()) {
+                tools.push(tool.definition.clone());
+            }
         }
 
         let gen_val = provider_generation;
@@ -676,6 +709,85 @@ impl ModelRequestBuilder for RealModelRequestBuilder {
             input: Arc::from(input),
             tools: Arc::from(tools),
         }))
+    }
+
+    fn build_compatibility(
+        &self,
+        revision: u64,
+        selection: &ModelSelection,
+        provider_generation: ProviderGeneration,
+        history: &[SessionPayload],
+        steering: &[String],
+    ) -> Result<Arc<ModelRequest>, RuntimeError> {
+        let request = self.build(
+            revision,
+            selection,
+            provider_generation,
+            history,
+            steering,
+        )?;
+        let input = request
+            .input
+            .iter()
+            .map(|item| match item {
+                ModelInput::FreeformToolCall {
+                    call_id,
+                    name,
+                    input,
+                } => ModelInput::AssistantToolCall {
+                    call_id: call_id.clone(),
+                    name: name.clone(),
+                    arguments: sonic_rs::json!({ "input": input }).to_string(),
+                },
+                ModelInput::FreeformToolResult { call_id, output } => ModelInput::ToolResult {
+                    call_id: call_id.clone(),
+                    output: output.clone(),
+                },
+                other => other.clone(),
+            })
+            .collect::<Vec<_>>();
+        let tools = request
+            .tools
+            .iter()
+            .map(|tool| {
+                let mut tool = tool.clone();
+                if matches!(
+                    &tool.input_schema,
+                    harness_tool_api::ToolInputSchema::FreeformGrammar { .. }
+                ) {
+                    tool.input_schema = harness_tool_api::ToolInputSchema::JsonSchema(
+                        harness_tool_api::JsonSchema::new(
+                            r#"{"type":"object","properties":{"input":{"type":"string"}},"required":["input"],"additionalProperties":false}"#,
+                        ),
+                    );
+                }
+                tool
+            })
+            .collect::<Vec<_>>();
+        Ok(Arc::new(ModelRequest {
+            input: Arc::from(input),
+            tools: Arc::from(tools),
+            ..(*request).clone()
+        }))
+    }
+
+    fn build_compaction(
+        &self,
+        revision: u64,
+        selection: &ModelSelection,
+        provider_generation: ProviderGeneration,
+        history: &[SessionPayload],
+        instruction: &str,
+    ) -> Result<Arc<ModelRequest>, RuntimeError> {
+        let mut request = self.build(
+            revision,
+            selection,
+            provider_generation,
+            history,
+            &[instruction.to_owned()],
+        )?;
+        Arc::make_mut(&mut request).tools = Arc::from([]);
+        Ok(request)
     }
 }
 
@@ -1242,7 +1354,10 @@ async fn resolve_provider_and_transport(
 
     let capabilities = harness_model_api::ModelCapabilities {
         tool_calls: model_config.supports_tools,
-        freeform_tool_input: false,
+        freeform_tool_input: !matches!(
+            &profile.driver,
+            ProviderDriverConfig::ChatCompletion { .. }
+        ),
         streaming: true,
     };
 
@@ -1313,7 +1428,7 @@ async fn resolve_provider_and_transport(
                 max_event_bytes: 1_048_576,
             };
             Arc::new(
-                OpenAiChatTransport::new(client, config)
+                ChatCompletionsTransport::new(client, config)
                     .map_err(|e| ProviderError::Transport(e.to_string()))?,
             )
         }
@@ -1472,6 +1587,11 @@ enum AppAction {
         reasoning: Option<String>,
         tier: Option<String>,
     },
+    Retry,
+    SetToolAvailability { pattern: String, enabled: bool },
+    Compact { instruction: String },
+    RetryCompaction { instruction: Option<String> },
+    CancelCompaction,
 }
 
 type Commands = CommandRegistry<App, AppAction>;
@@ -1501,6 +1621,55 @@ fn provider(app: &mut App, mut context: Context<'_>) -> CommandResult<AppAction>
             name: "subcommand",
             value: other.into(),
             reason: "expected 'use'".into(),
+        }),
+    }
+}
+
+fn retry(_app: &mut App, context: Context<'_>) -> CommandResult<AppAction> {
+    context.args.finish()?;
+    Ok(AppAction::Retry)
+}
+
+fn tool(_app: &mut App, mut context: Context<'_>) -> CommandResult<AppAction> {
+    let pattern = context.args.required("pattern")?.to_owned();
+    let state = context.args.required("state")?;
+    context.args.finish()?;
+    let enabled = match state {
+        "enabled" | "enable" | "on" => true,
+        "disable" | "disabled" | "off" => false,
+        _ => {
+            return Err(CommandError::InvalidArgument {
+                name: "state",
+                value: state.into(),
+                reason: "expected enabled or disable".into(),
+            });
+        }
+    };
+    Ok(AppAction::SetToolAvailability { pattern, enabled })
+}
+
+fn compact(_app: &mut App, mut context: Context<'_>) -> CommandResult<AppAction> {
+    let first = context.args.next();
+    match first {
+        Some("cancel") => {
+            context.args.finish()?;
+            Ok(AppAction::CancelCompaction)
+        }
+        Some("redo") => {
+            let instruction = context.args.next().map(str::to_owned);
+            context.args.finish()?;
+            Ok(AppAction::RetryCompaction { instruction })
+        }
+        Some(first) => {
+            let mut instruction = first.to_owned();
+            for part in context.args {
+                instruction.push(' ');
+                instruction.push_str(part);
+            }
+            Ok(AppAction::Compact { instruction })
+        }
+        None => Ok(AppAction::Compact {
+            instruction: String::new(),
         }),
     }
 }
@@ -1566,6 +1735,20 @@ fn build_commands() -> Result<Commands, Box<dyn std::error::Error>> {
                 .usage("<name> [reasoning] [tier]")
                 .summary("Switch active model settings"),
         )
+        .command(
+            CommandSpec::new("retry", retry)
+                .summary("Retry the current user/tool turn"),
+        )
+        .command(
+            CommandSpec::new("tool", tool)
+                .usage("<pattern> <enabled|disable>")
+                .summary("Enable or disable tools matching a glob"),
+        )
+        .command(
+            CommandSpec::new("compact", compact)
+                .usage("[instruction|redo [instruction]|cancel]")
+                .summary("Compact, redo, or cancel session compaction"),
+        )
         .build()?)
 }
 
@@ -1628,6 +1811,7 @@ async fn execute_app_action(
             .map_err(|e| format!("Failed to switch provider: {e}"))?;
 
             runtime.update_ports(new_transport, resolved.routes.root.clone());
+            runtime.update_compaction_route(resolved.routes.compaction.clone());
 
             let provider_id = harness_model_api::ProviderId::new(profile_id.as_str())
                 .map_err(|e| format!("Invalid provider ID: {e}"))?;
@@ -1697,6 +1881,55 @@ async fn execute_app_action(
 
             Ok(())
         }
+        AppAction::Retry => {
+            let effects = runtime
+                .dispatch_command(harness_runtime_api::RuntimeCommand::Retry)
+                .await
+                .map_err(|error| format!("Failed to retry turn: {error}"))?;
+            if !drive_runtime_effects(runtime, effects, event_tx, seq).await {
+                return Err("Runtime event channel closed".to_string());
+            }
+            Ok(())
+        }
+        AppAction::SetToolAvailability { pattern, enabled } => {
+            runtime
+                .dispatch_command(harness_runtime_api::RuntimeCommand::SetToolAvailability {
+                    pattern,
+                    enabled,
+                })
+                .await
+                .map_err(|error| format!("Failed to update tool availability: {error}"))?;
+            Ok(())
+        }
+        AppAction::Compact { instruction } => {
+            let effects = runtime
+                .dispatch_command(harness_runtime_api::RuntimeCommand::Compact { instruction })
+                .await
+                .map_err(|error| format!("Failed to start compaction: {error}"))?;
+            if !drive_runtime_effects(runtime, effects, event_tx, seq).await {
+                return Err("Runtime event channel closed".to_string());
+            }
+            Ok(())
+        }
+        AppAction::RetryCompaction { instruction } => {
+            let effects = runtime
+                .dispatch_command(harness_runtime_api::RuntimeCommand::RetryCompaction {
+                    instruction,
+                })
+                .await
+                .map_err(|error| format!("Failed to redo compaction: {error}"))?;
+            if !drive_runtime_effects(runtime, effects, event_tx, seq).await {
+                return Err("Runtime event channel closed".to_string());
+            }
+            Ok(())
+        }
+        AppAction::CancelCompaction => {
+            runtime
+                .dispatch_command(harness_runtime_api::RuntimeCommand::CancelCompaction)
+                .await
+                .map_err(|error| format!("Failed to cancel compaction: {error}"))?;
+            Ok(())
+        }
         AppAction::ModelUse {
             model: model_name,
             reasoning,
@@ -1729,6 +1962,7 @@ async fn execute_app_action(
             .map_err(|e| format!("Failed to switch model: {e}"))?;
 
             runtime.update_ports(new_transport, resolved.routes.root.clone());
+            runtime.update_compaction_route(resolved.routes.compaction.clone());
 
             let provider_id = harness_model_api::ProviderId::new(profile_id.as_str())
                 .map_err(|e| format!("Invalid provider ID: {e}"))?;
@@ -1793,12 +2027,24 @@ async fn run_model_attempt(
     seq: &mut u64,
 ) -> Result<Option<Vec<RuntimeEffect>>, RuntimeError> {
     let attempt_id = attempt.attempt_id.0;
+    let compaction_attempt = runtime.compaction_attempt_active();
     ConversationRuntime::build_active_attempt(turn_id, Arc::clone(&attempt), route)?;
 
     let active_transport = runtime.active_transport();
     let mut handle = match active_transport.start(attempt).await {
         Ok(handle) => handle,
         Err(error) => {
+            if compaction_attempt {
+                runtime.fail_compaction_attempt();
+                return Ok(Some(vec![RuntimeEffect::Emit(
+                    harness_runtime_api::RuntimeEvent::Failure(
+                        harness_runtime_api::RuntimeFailure {
+                            category: harness_runtime_api::RuntimeFailureCategory::Model,
+                            message: format!("{error:?}"),
+                        },
+                    ),
+                )]));
+            }
             let effects = runtime
                 .finish_model_attempt(
                     turn_id,
@@ -1812,8 +2058,39 @@ async fn run_model_attempt(
 
     let mut deferred = Vec::new();
     while let Some(event) = handle.next_event().await {
+        let compatibility_failure = match &event {
+            harness_model_api::ModelEvent::Terminal(outcome)
+                if !compaction_attempt && is_custom_tool_compatibility_failure(outcome) =>
+            {
+                Some(outcome.clone())
+            }
+            _ => None,
+        };
         let terminal = matches!(&event, harness_model_api::ModelEvent::Terminal(_));
-        let (event_effects, stop) = match runtime
+        let (event_effects, stop) = if let Some(outcome) = compatibility_failure {
+            let started = runtime.model_response_started();
+            if let Some(retry) = runtime.retry_with_compatibility(turn_id, attempt_id)? {
+                let mut effects = Vec::new();
+                if started {
+                    effects.push(RuntimeEffect::Emit(
+                        harness_runtime_api::RuntimeEvent::ResponseFinished(outcome),
+                    ));
+                }
+                effects.push(RuntimeEffect::Emit(harness_runtime_api::RuntimeEvent::Failure(
+                    harness_runtime_api::RuntimeFailure {
+                        category: harness_runtime_api::RuntimeFailureCategory::Model,
+                        message: "The provider rejected native custom-tool history; compatibility mode will be used and the request will be retried.".to_string(),
+                    },
+                )));
+                effects.push(retry);
+                (effects, true)
+            } else {
+                (runtime
+                    .finish_model_attempt(turn_id, attempt_id, outcome)
+                    .await?, true)
+            }
+        } else {
+            match runtime
             .dispatch_model_event(turn_id, attempt_id, event)
             .await
         {
@@ -1825,13 +2102,33 @@ async fn run_model_attempt(
                         message: format!("model event rejected: {error}"),
                     },
                 );
-                (
-                    runtime
-                        .finish_model_attempt(turn_id, attempt_id, failure)
-                        .await?,
-                    true,
-                )
+                if compaction_attempt {
+                    let started = runtime.model_response_started();
+                    let failure_message = format!("{failure:?}");
+                    runtime.fail_compaction_attempt();
+                    let effect = if started {
+                        RuntimeEffect::Emit(
+                            harness_runtime_api::RuntimeEvent::ResponseFinished(failure),
+                        )
+                    } else {
+                        RuntimeEffect::Emit(harness_runtime_api::RuntimeEvent::Failure(
+                            harness_runtime_api::RuntimeFailure {
+                                category: harness_runtime_api::RuntimeFailureCategory::Protocol,
+                                message: failure_message,
+                            },
+                        ))
+                    };
+                    (vec![effect], true)
+                } else {
+                    (
+                        runtime
+                            .finish_model_attempt(turn_id, attempt_id, failure)
+                            .await?,
+                        true,
+                    )
+                }
             }
+        }
         };
 
         for effect in event_effects {
@@ -1876,6 +2173,20 @@ async fn run_model_attempt(
             kind: harness_model_api::ModelFailureKind::Protocol,
             message: "model stream ended before a terminal event".to_string(),
         });
+    if compaction_attempt {
+        let started = runtime.model_response_started();
+        let failure_message = format!("{failure:?}");
+        runtime.fail_compaction_attempt();
+        let event = if started {
+            harness_runtime_api::RuntimeEvent::ResponseFinished(failure)
+        } else {
+            harness_runtime_api::RuntimeEvent::Failure(harness_runtime_api::RuntimeFailure {
+                category: harness_runtime_api::RuntimeFailureCategory::Protocol,
+                message: failure_message,
+            })
+        };
+        return Ok(Some(vec![RuntimeEffect::Emit(event)]));
+    }
     let effects = runtime
         .finish_model_attempt(turn_id, attempt_id, failure)
         .await?;
@@ -1883,8 +2194,32 @@ async fn run_model_attempt(
     Ok(Some(deferred))
 }
 
+fn is_custom_tool_compatibility_failure(
+    outcome: &harness_model_api::ModelTerminalOutcome,
+) -> bool {
+    matches!(
+        outcome,
+        harness_model_api::ModelTerminalOutcome::Failed(failure)
+            if failure.kind == harness_model_api::ModelFailureKind::ProviderRejected
+                && failure.message.contains("HTTP status 400")
+                && failure
+                    .message
+                    .contains("unknown input item type: \\\"custom_tool_call\\\"")
+    )
+}
+
 fn enqueue_runtime_effects(pending: &mut Vec<RuntimeEffect>, effects: Vec<RuntimeEffect>) {
     pending.extend(effects.into_iter().rev());
+}
+
+async fn emit_runtime_event(
+    event_tx: &harness_runtime_api::RuntimeEventSender,
+    seq: &mut u64,
+    event: harness_runtime_api::RuntimeEvent,
+) -> bool {
+    let envelope = harness_runtime_api::RuntimeEventEnvelope::new(*seq, event);
+    *seq += 1;
+    event_tx.send(envelope).await.is_ok()
 }
 
 async fn drive_runtime_effects(
@@ -1910,14 +2245,65 @@ async fn drive_runtime_effects(
                 turn_id,
                 attempt,
                 route,
-            } => match run_model_attempt(runtime, turn_id, attempt, route, event_tx, seq).await {
+            } => {
+                if !emit_runtime_event(
+                    event_tx,
+                    seq,
+                    harness_runtime_api::RuntimeEvent::ModelAwaiting(true),
+                )
+                .await
+                    || !emit_runtime_event(
+                        event_tx,
+                        seq,
+                        harness_runtime_api::RuntimeEvent::SteeringChanged(None),
+                    )
+                    .await
+                {
+                    return false;
+                }
+                let result = run_model_attempt(runtime, turn_id, attempt, route, event_tx, seq).await;
+                if !emit_runtime_event(
+                    event_tx,
+                    seq,
+                    harness_runtime_api::RuntimeEvent::ModelAwaiting(false),
+                )
+                .await
+                {
+                    return false;
+                }
+                match result {
+                    Ok(Some(effects)) => Ok(effects),
+                    Ok(None) => return false,
+                    Err(error) => Err((
+                        harness_runtime_api::RuntimeFailureCategory::Model,
+                        format!("starting model attempt failed: {error}"),
+                    )),
+                }
+            },
+            RuntimeEffect::StartCompaction {
+                compaction_id: _,
+                attempt,
+                route,
+            } => match run_model_attempt(runtime, 0, attempt, route, event_tx, seq).await {
                 Ok(Some(effects)) => Ok(effects),
                 Ok(None) => return false,
                 Err(error) => Err((
                     harness_runtime_api::RuntimeFailureCategory::Model,
-                    format!("starting model attempt failed: {error}"),
+                    format!("starting compaction failed: {error}"),
                 )),
             },
+            RuntimeEffect::CommitCompaction {
+                compaction_id,
+                summary,
+            } => runtime
+                .commit_compaction(compaction_id, summary)
+                .await
+                .map_err(|error| {
+                    (
+                        harness_runtime_api::RuntimeFailureCategory::Session,
+                        format!("compaction commit failed: {error}"),
+                    )
+                }),
             RuntimeEffect::CommitAssistant {
                 turn_id,
                 attempt_id,
@@ -2188,13 +2574,16 @@ async fn run_tui(_auth_mode: AuthMode, resume: ResumeSelection) -> CliResult<()>
     let workspace =
         WorkspaceRoot::open(env::current_dir().map_err(|source| CliError::CurrentDir { source })?)
             .map_err(|error| CliError::ToolRegistration(error.to_string()))?;
-    let tool_registry = Arc::new(RwLock::new(
-        ToolRegistry::builder()
-            .tool(edit_file::spec().map_err(|error| CliError::ToolRegistration(error.to_string()))?)
-            .build()
-            .map_err(|error| CliError::ToolRegistration(error.to_string()))?,
+    let mut registry = ToolRegistry::new();
+    let inventory = ToolInventory::register_into(&mut registry, workspace)
+        .map_err(|error| CliError::ToolRegistration(error.to_string()))?;
+    let tool_registry = Arc::new(RwLock::new(registry));
+    let tool_availability = Arc::new(RwLock::new(ToolAvailability::new()));
+    let inventory_executor: Arc<dyn ToolExecutor> = Arc::new(inventory);
+    let tool_executor = Arc::new(AvailabilityToolExecutor::new(
+        inventory_executor,
+        Arc::clone(&tool_availability),
     ));
-    let tool_executor = Arc::new(edit_file::Executor::new(workspace));
 
     let provider_config = load_provider_config().ok_or_else(|| {
         CliError::ProviderRuntime(ProviderError::Configuration(
@@ -2289,8 +2678,11 @@ async fn run_tui(_auth_mode: AuthMode, resume: ResumeSelection) -> CliResult<()>
         model_transport: initial_transport.clone(),
         request_builder: Arc::new(RealModelRequestBuilder {
             tool_registry: Arc::clone(&tool_registry),
+            tool_availability: Arc::clone(&tool_availability),
         }),
         model_route: resolved_provider.routes.root.clone(),
+        compaction_route: resolved_provider.routes.compaction.clone(),
+        tool_availability,
     };
 
     let runtime = start_conversation_runtime(
@@ -2516,6 +2908,11 @@ fn transcript_snapshot_entry(record: &SessionRecord) -> Option<TranscriptSnapsho
             call_id: call_id.clone(),
             output: output.clone(),
         },
+        SessionPayload::CompactionCheckpoint { summary, .. } => {
+            harness_runtime_api::TranscriptPayload::Thinking {
+                text: summary.clone(),
+            }
+        }
         SessionPayload::Metadata(_)
         | SessionPayload::ProviderBinding(_)
         | SessionPayload::TurnStarted { .. }

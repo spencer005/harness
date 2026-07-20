@@ -10,6 +10,11 @@ use harness_tool_api::{ToolExecutionRequest, ToolExecutor, ToolFailure, ToolResu
 use thiserror::Error;
 
 pub mod edit_file;
+pub mod goal;
+pub mod inspect;
+pub mod inventory;
+pub mod terminal;
+pub use inventory::ToolInventory;
 
 /// Opened workspace capability used to scope tool operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,29 +40,15 @@ impl WorkspaceRoot {
         &self.root
     }
 
-    /// Validates a user-supplied path without resolving it outside the capability.
+    /// Accepts a user-supplied path for tool backends.
     ///
-    /// Concrete backends still perform directory-relative identity checks before
-    /// opening components, so this value does not authorize path concatenation.
+    /// Paths may be relative, absolute, or contain `.` and `..` components.
+    /// The caller is responsible for the filesystem access policy it wants to
+    /// apply; this method only preserves the supplied path for resolution.
     pub fn relative_path<'a>(
         &self,
         value: &'a str,
     ) -> Result<WorkspaceRelativePath<'a>, WorkspacePathError> {
-        let path = Path::new(value);
-        if path.is_absolute() {
-            return Err(WorkspacePathError::Absolute);
-        }
-        if value.is_empty() {
-            return Err(WorkspacePathError::Empty);
-        }
-        if path.components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::ParentDir | std::path::Component::CurDir
-            )
-        }) {
-            return Err(WorkspacePathError::Traversal);
-        }
         Ok(WorkspaceRelativePath { value })
     }
 }

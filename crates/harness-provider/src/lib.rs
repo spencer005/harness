@@ -616,6 +616,7 @@ pub enum ProviderImplementationKind {
     /// Ollama Cloud provider using API-key auth and HTTPS request transport.
     OllamaCloud,
     /// HTTPS API provider using API-key auth and HTTPS request transport.
+    /// TODO: rename to http not https
     HttpsApi,
 }
 
@@ -660,7 +661,7 @@ pub enum ProviderDriverConfig {
         /// Stream idle timeout in milliseconds.
         stream_idle_timeout_ms: u64,
     },
-    /// OpenAI Chat Completions protocol over HTTPS.
+    /// OpenAPI-compatible Chat Completions protocol over HTTP.
     #[serde(rename = "chat-completion", alias = "chat_completion")]
     ChatCompletion {
         /// Base URL including provider path prefix.

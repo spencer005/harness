@@ -129,6 +129,13 @@ pub enum SessionPayload {
     },
     /// Turn reaches a terminal outcome.
     TurnFinished { turn_id: u64, outcome: TurnOutcome },
+    /// Durable replacement history produced by compaction.
+    CompactionCheckpoint {
+        /// Canonical revision summarized by this checkpoint.
+        source_revision: u64,
+        /// Validated durable summary.
+        summary: String,
+    },
     /// Session closes.
     SessionClosed,
 }

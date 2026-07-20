@@ -7,8 +7,8 @@ members = [
     "crates/harness-runtime-api",
     "crates/harness-responses-protocol",
     "crates/harness-session-store",
-    "crates/harness-openai-chat-protocol",
-    "crates/harness-openai-chat-transport",
+    "crates/harness-chat-completions-protocol",
+    "crates/harness-chat-completions-transport",
     "crates/harness-conversation-runtime",
     "crates/harness-provider",
     "crates/harness-responses-transport",
@@ -40,8 +40,8 @@ harness-tool-api = { path = "crates/harness-tool-api" }
 harness-model-api = { path = "crates/harness-model-api" }
 harness-runtime-api = { path = "crates/harness-runtime-api" }
 harness-responses-protocol = { path = "crates/harness-responses-protocol" }
-harness-openai-chat-protocol = { path = "crates/harness-openai-chat-protocol" }
-harness-openai-chat-transport = { path = "crates/harness-openai-chat-transport" }
+harness-chat-completions-protocol = { path = "crates/harness-chat-completions-protocol" }
+harness-chat-completions-transport = { path = "crates/harness-chat-completions-transport" }
 harness-session-store = { path = "crates/harness-session-store" }
 harness-conversation-runtime = { path = "crates/harness-conversation-runtime" }
 harness-provider = { path = "crates/harness-provider" }
@@ -56,6 +56,8 @@ futures-util = "0.3"
 tokio-util = { version = "0.7", features = ["rt"] }
 
 http = "1"
+inventory = "0.3"
+portable-pty = "0.9.0"
 http-body-util = "0.1"
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "tls12", "webpki-roots"] }
 hyper = { version = "1", features = ["http1", "server"] }
@@ -64,7 +66,6 @@ libc = "0.2"
 ratatui = "0.29"
 object = { version = "0.36", default-features = false, features = ["elf", "read_core", "std"] }
 postcard = { version = "1", features = ["alloc"] }
-portable-pty = "0.9.0"
 criterion = "0.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

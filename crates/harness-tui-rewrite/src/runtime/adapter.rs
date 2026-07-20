@@ -51,12 +51,16 @@ pub(super) fn adapt_runtime_event(event: RuntimeEvent) -> DomainEvent {
         RuntimeEvent::ActivityChanged(activity) => {
             DomainEvent::ActivityChanged(convert_activity(activity))
         }
+        RuntimeEvent::ModelAwaiting(awaiting) => DomainEvent::ModelAwaiting(awaiting),
         RuntimeEvent::ResponseStarted => DomainEvent::ResponseStreamStarted,
         RuntimeEvent::AssistantTextDelta(delta) => {
             DomainEvent::AssistantTextDelta(ExternalText::new(delta))
         }
         RuntimeEvent::ReasoningSummaryDelta(delta) | RuntimeEvent::ReasoningContentDelta(delta) => {
             DomainEvent::ThinkingDelta(ExternalText::new(delta))
+        }
+        RuntimeEvent::CompactionCompleted(summary) => {
+            DomainEvent::CompactionCompleted(ExternalText::new(summary))
         }
         RuntimeEvent::ResponseFinished(outcome) => match outcome {
             harness_model_api::ModelTerminalOutcome::Completed(_) => {
@@ -75,9 +79,6 @@ pub(super) fn adapt_runtime_event(event: RuntimeEvent) -> DomainEvent {
             max_input_tokens: usage.max_input_tokens,
             compact_at_tokens: usage.compact_at_tokens,
         }),
-        RuntimeEvent::CompactionCompleted(summary) => {
-            DomainEvent::CompactionCompleted(ExternalText::new(summary))
-        }
         RuntimeEvent::AgenticLoopStarted => DomainEvent::AgenticLoopStarted,
         RuntimeEvent::AgenticLoopCompleted => DomainEvent::AgenticLoopCompleted,
         RuntimeEvent::DeveloperModeChanged(enabled) => DomainEvent::DeveloperModeChanged(enabled),
@@ -94,6 +95,17 @@ pub(super) fn export_runtime_request(request: RuntimeRequest) -> RuntimeCommand 
     match request {
         RuntimeRequest::SubmitInput { text } => RuntimeCommand::SubmitPrompt { text },
         RuntimeRequest::QueueSteering { text } => RuntimeCommand::QueueSteering { text },
+        RuntimeRequest::Retry => RuntimeCommand::Retry,
+        RuntimeRequest::SetToolAvailability { pattern, enabled } => {
+            RuntimeCommand::SetToolAvailability { pattern, enabled }
+        }
+        RuntimeRequest::Compact { instruction } => RuntimeCommand::Compact { instruction },
+        RuntimeRequest::RetryCompaction { instruction } => {
+            RuntimeCommand::RetryCompaction { instruction }
+        }
+        RuntimeRequest::CancelCompaction => RuntimeCommand::CancelCompaction,
+        RuntimeRequest::StopRequestLoop => RuntimeCommand::StopRequestLoop,
+        RuntimeRequest::AbortResponse => RuntimeCommand::AbortResponse,
         RuntimeRequest::ApplySteering { text } => RuntimeCommand::Interrupt { text },
         RuntimeRequest::LoadTranscriptPage { before_sequence } => {
             RuntimeCommand::LoadOlderTranscript { before_sequence }
@@ -431,6 +443,11 @@ mod tests {
             panic!("page request exports to LoadOlderTranscript");
         };
         assert_eq!(before_sequence, Some(73));
+
+        assert_eq!(
+            export_runtime_request(RuntimeRequest::Retry),
+            RuntimeCommand::Retry
+        );
     }
 
     #[test]

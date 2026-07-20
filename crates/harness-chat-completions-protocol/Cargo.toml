@@ -1,5 +1,5 @@
 [package]
-name = "harness-openai-chat-protocol"
+name = "harness-chat-completions-protocol"
 edition.workspace = true
 license.workspace = true
 version.workspace = true

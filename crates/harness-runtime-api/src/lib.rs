@@ -37,6 +37,20 @@ pub enum RuntimeCommand {
     SubmitPrompt { text: String },
     /// Queues steering text for a later attempt.
     QueueSteering { text: String },
+    /// Retries the current turn when its last durable message is retryable.
+    Retry,
+    /// Changes dynamic availability for tools matching a glob pattern.
+    SetToolAvailability { pattern: String, enabled: bool },
+    /// Starts compaction using optional user instructions.
+    Compact { instruction: String },
+    /// Redoes the latest staged compaction from its original source.
+    RetryCompaction { instruction: Option<String> },
+    /// Cancels staged compaction without changing active history.
+    CancelCompaction,
+    /// Stops the current agentic/request loop after the active response boundary.
+    StopRequestLoop,
+    /// Aborts the active model response immediately.
+    AbortResponse,
     /// Interrupts the active attempt with exact user text.
     Interrupt { text: String },
     /// Changes the selected model.
@@ -71,6 +85,8 @@ pub enum RuntimeEvent {
     AgentRemoved(u64),
     /// A background activity changes.
     ActivityChanged(Activity),
+    /// A model request is waiting for the provider to begin streaming.
+    ModelAwaiting(bool),
     /// Model response streaming starts.
     ResponseStarted,
     /// Assistant text arrives incrementally.
@@ -81,10 +97,10 @@ pub enum RuntimeEvent {
     ReasoningContentDelta(String),
     /// Model response reaches a terminal outcome.
     ResponseFinished(ModelTerminalOutcome),
+    /// A compaction summary was durably committed.
+    CompactionCompleted(String),
     /// Estimated context-window token usage.
     ContextUsage(ContextUsage),
-    /// A compaction operation completed with a summary.
-    CompactionCompleted(String),
     /// The root agentic work cycle started.
     AgenticLoopStarted,
     /// The root agentic work cycle completed.

@@ -1,0 +1,8 @@
+start: field* command
+field: key ":" value LF?
+key: "workdir" | "rows" | "cols"
+command: "command:" inline LF? | "command:" LF body
+value: /[^\n]*/
+inline: /[^\n]+/
+body: /[\s\S]+/
+%import common.LF

@@ -378,6 +378,8 @@ pub(crate) enum DomainEvent {
     AgenticLoopCompleted,
     /// Prompt role routing changed.
     DeveloperModeChanged(bool),
+    /// A model request is waiting for the provider.
+    ModelAwaiting(bool),
     /// Assistant streaming started.
     ResponseStreamStarted,
     /// First-token timing was observed.
@@ -413,6 +415,20 @@ pub(crate) enum RuntimeRequest {
     SubmitInput { text: String },
     /// Queue steering for the current turn.
     QueueSteering { text: String },
+    /// Retry the latest durable user or tool turn.
+    Retry,
+    /// Change availability for tools matching a glob pattern.
+    SetToolAvailability { pattern: String, enabled: bool },
+    /// Start compaction with optional instructions.
+    Compact { instruction: String },
+    /// Redo staged compaction from the original source.
+    RetryCompaction { instruction: Option<String> },
+    /// Cancel staged compaction.
+    CancelCompaction,
+    /// Stop the current agentic/request loop after the active boundary.
+    StopRequestLoop,
+    /// Abort the active model response immediately.
+    AbortResponse,
     /// Apply steering immediately.
     ApplySteering { text: String },
     /// Load the next older persisted transcript page.
@@ -439,6 +455,8 @@ pub(crate) struct SessionState {
     pub(crate) developer_mode: bool,
     /// Whether the runtime reports an active response stream.
     pub(crate) response_streaming: bool,
+    /// Whether a model request is awaiting provider output.
+    pub(crate) model_awaiting: bool,
     /// Last time-to-first-token value.
     pub(crate) last_ttft_ms: Option<u64>,
     /// Current context-window usage.
@@ -486,6 +504,7 @@ impl SessionState {
             ),
             developer_mode: initial.developer_mode,
             response_streaming: initial.response_streaming,
+            model_awaiting: false,
             last_ttft_ms: initial.last_ttft_ms,
             context_usage: None,
             agentic_loop_working: false,

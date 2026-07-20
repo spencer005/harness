@@ -1,4 +1,4 @@
-//! Supervised OpenAI Chat Completions streaming transport.
+//! Supervised Chat Completions Completions streaming transport.
 
 use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 
@@ -7,7 +7,7 @@ use harness_model_api::{
     ModelAttempt, ModelAttemptHandle, ModelCancellation, ModelEvent, ModelFailure,
     ModelFailureKind, ModelInterruption, ModelTerminalOutcome, ModelTransport,
 };
-use harness_openai_chat_protocol::{ChatEventDecoder, encode_request};
+use harness_chat_completions_protocol::{ChatEventDecoder, encode_request};
 use thiserror::Error;
 use tokio::{
     sync::{Mutex, mpsc},
@@ -29,22 +29,22 @@ pub enum ChatStreamChunk {
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ChatStreamError {
     /// Authentication is rejected.
-    #[error("OpenAI Chat authentication failed: {0}")]
+    #[error("Chat Completions authentication failed: {0}")]
     Authentication(String),
     /// Provider rate limit is reached.
-    #[error("OpenAI Chat rate limit reached: {0}")]
+    #[error("Chat Completions rate limit reached: {0}")]
     RateLimited(String),
     /// Provider rejects the request.
-    #[error("OpenAI Chat request rejected: {0}")]
+    #[error("Chat Completions request rejected: {0}")]
     ProviderRejected(String),
     /// Network transport fails.
-    #[error("OpenAI Chat transport failed: {0}")]
+    #[error("Chat Completions transport failed: {0}")]
     Transport(String),
     /// Request is cancelled.
-    #[error("OpenAI Chat request cancelled")]
+    #[error("Chat Completions request cancelled")]
     Cancelled,
     /// Request or stream times out.
-    #[error("OpenAI Chat request timed out")]
+    #[error("Chat Completions request timed out")]
     Timeout,
 }
 
@@ -85,13 +85,13 @@ impl Default for ChatTransportConfiguration {
         Self {
             event_capacity: 128,
             chunk_timeout: Duration::from_secs(300),
-            max_event_bytes: harness_openai_chat_protocol::DEFAULT_MAX_EVENT_BYTES,
+            max_event_bytes: harness_chat_completions_protocol::DEFAULT_MAX_EVENT_BYTES,
         }
     }
 }
 
-/// OpenAI Chat transport owning every attempt task through joined shutdown.
-pub struct OpenAiChatTransport<C> {
+/// Chat Completions transport owning every attempt task through joined shutdown.
+pub struct ChatCompletionsTransport<C> {
     client: Arc<C>,
     configuration: ChatTransportConfiguration,
     state: Arc<Mutex<TransportState>>,
@@ -108,7 +108,7 @@ struct OwnedAttempt {
     handle: JoinHandle<()>,
 }
 
-impl<C> OpenAiChatTransport<C>
+impl<C> ChatCompletionsTransport<C>
 where
     C: ChatStreamingClient + 'static,
 {
@@ -131,7 +131,7 @@ where
     }
 }
 
-impl<C> ModelTransport for OpenAiChatTransport<C>
+impl<C> ModelTransport for ChatCompletionsTransport<C>
 where
     C: ChatStreamingClient + 'static,
 {
@@ -153,7 +153,7 @@ where
             if !state.accepting {
                 return Err(ModelFailure {
                     kind: ModelFailureKind::Transport,
-                    message: "OpenAI Chat transport is shutting down".to_owned(),
+                    message: "Chat Completions transport is shutting down".to_owned(),
                 });
             }
             let handle = tokio::spawn(async move {
@@ -191,7 +191,7 @@ where
             for attempt in attempts {
                 attempt.handle.await.map_err(|error| ModelFailure {
                     kind: ModelFailureKind::Transport,
-                    message: format!("OpenAI Chat attempt failed to join: {error}"),
+                    message: format!("Chat Completions attempt failed to join: {error}"),
                 })?;
             }
             Ok(())
@@ -228,7 +228,7 @@ async fn run_attempt<C>(
     if let Err(failure) = result {
         let outcome = match failure {
             AttemptFailure::Cancelled => ModelTerminalOutcome::Cancelled(ModelCancellation {
-                reason: "OpenAI Chat attempt cancelled".to_owned(),
+                reason: "Chat Completions attempt cancelled".to_owned(),
             }),
             AttemptFailure::Interrupted(reason) => {
                 ModelTerminalOutcome::Interrupted(ModelInterruption { reason })
@@ -265,12 +265,12 @@ where
             next = timeout(configuration.chunk_timeout, stream.next()) => next
                 .map_err(|_| AttemptFailure::Failed(ModelFailure {
                     kind: ModelFailureKind::Timeout,
-                    message: "OpenAI Chat stream chunk timed out".to_owned(),
+                    message: "Chat Completions stream chunk timed out".to_owned(),
                 }))?,
         };
         let Some(chunk) = next else {
             return Err(AttemptFailure::Interrupted(
-                "OpenAI Chat stream ended without [DONE]".to_owned(),
+                "Chat Completions stream ended without [DONE]".to_owned(),
             ));
         };
         match chunk.map_err(map_stream_error)? {
@@ -290,7 +290,7 @@ where
                     return Ok(());
                 }
                 return Err(AttemptFailure::Interrupted(
-                    "OpenAI Chat stream ended without a terminal outcome".to_owned(),
+                    "Chat Completions stream ended without a terminal outcome".to_owned(),
                 ));
             }
         }
@@ -348,6 +348,6 @@ enum AttemptFailure {
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub enum ChatTransportError {
     /// Event queue capacity is zero.
-    #[error("OpenAI Chat event capacity must be greater than zero")]
+    #[error("Chat Completions event capacity must be greater than zero")]
     ZeroCapacity,
 }

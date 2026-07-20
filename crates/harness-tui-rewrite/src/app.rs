@@ -731,9 +731,13 @@ impl Application {
             DomainEvent::DeveloperModeChanged(enabled) => {
                 self.session.developer_mode = enabled;
             }
+            DomainEvent::ModelAwaiting(awaiting) => {
+                self.session.model_awaiting = awaiting;
+            }
             DomainEvent::ResponseStreamStarted => match self.transcript.begin_response_stream() {
                 Ok(()) => {
                     self.session.response_streaming = true;
+                    self.session.model_awaiting = false;
                     self.session.last_ttft_ms = None;
                 }
                 Err(error) => self.record_transcript_error(error),
@@ -753,7 +757,10 @@ impl Application {
             }
             DomainEvent::ResponseStreamCompleted => {
                 match self.transcript.complete_response_stream() {
-                    Ok(()) => self.session.response_streaming = false,
+                    Ok(()) => {
+                        self.session.response_streaming = false;
+                        self.session.model_awaiting = false;
+                    }
                     Err(error) => self.record_transcript_error(error),
                 }
             }
@@ -762,6 +769,7 @@ impl Application {
                     self.record_transcript_error(error);
                 }
                 self.session.response_streaming = false;
+                self.session.model_awaiting = false;
             }
             DomainEvent::AgentUpdated(agent) => {
                 self.session.agents.insert(agent.id, agent);
@@ -901,7 +909,7 @@ impl Application {
         let Some(submission) = self.prompt.prepare_submission() else {
             return Vec::new();
         };
-        let request = if self.session.response_streaming
+        let request = if (self.session.response_streaming || self.session.model_awaiting)
             && !submission.text().trim_start().starts_with('/')
         {
             RuntimeRequest::QueueSteering {
@@ -920,7 +928,8 @@ impl Application {
     }
 
     fn interrupt_response(&mut self) -> Vec<AppEffect> {
-        if !self.session.response_streaming || self.interaction.prompt_delivery_pending {
+        let model_busy = self.session.response_streaming || self.session.model_awaiting;
+        if !model_busy || self.interaction.prompt_delivery_pending {
             return Vec::new();
         }
         if let Some(submission) = self.prompt.prepare_submission() {
@@ -947,8 +956,23 @@ impl Application {
             self.interaction.exit_armed = false;
             return Vec::new();
         }
+        if self.session.response_streaming && !self.interaction.prompt_delivery_pending {
+            if self.interaction.exit_armed {
+                self.interaction.exit_armed = false;
+                return vec![AppEffect::Runtime {
+                    request: RuntimeRequest::AbortResponse,
+                    completion: DeliveryCompletion::None,
+                }];
+            }
+            self.interaction.exit_armed = true;
+            return vec![AppEffect::Runtime {
+                request: RuntimeRequest::StopRequestLoop,
+                completion: DeliveryCompletion::None,
+            }];
+        }
         if self.interaction.exit_armed && !self.interaction.shutdown_requested {
             self.interaction.shutdown_requested = true;
+            self.should_exit = true;
             return vec![AppEffect::Runtime {
                 request: RuntimeRequest::Shutdown,
                 completion: DeliveryCompletion::Shutdown,

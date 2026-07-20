@@ -1,4 +1,4 @@
-//! OpenAI Chat Completions request encoding and incremental stream decoding.
+//! OpenAPI-compatible Chat Completions request encoding and incremental stream decoding.
 
 use std::collections::BTreeMap;
 
@@ -14,8 +14,8 @@ use thiserror::Error;
 /// Default maximum size of one Chat Completions SSE event.
 pub const DEFAULT_MAX_EVENT_BYTES: usize = harness_responses_protocol::DEFAULT_MAX_EVENT_BYTES;
 
-/// Encodes one immutable semantic attempt as an OpenAI Chat Completions request body.
-pub fn encode_request(attempt: &ModelAttempt) -> Result<Value, ChatProtocolError> {
+/// Encodes one immutable semantic attempt as an OpenAPI-compatible Chat Completions request body.
+pub fn encode_request(attempt: &ModelAttempt) -> Result<Value, ChatCompletionsProtocolError> {
     let request = &attempt.request;
     let messages = encode_messages(&request.input)?;
     let tools = request
@@ -25,7 +25,7 @@ pub fn encode_request(attempt: &ModelAttempt) -> Result<Value, ChatProtocolError
             let parameters = match &tool.input_schema {
                 ToolInputSchema::JsonSchema(schema) => {
                     sonic_rs::from_str(schema.as_str())
-                        .map_err(ChatProtocolError::InvalidToolSchema)?
+                        .map_err(ChatCompletionsProtocolError::InvalidToolSchema)?
                 }
                 ToolInputSchema::FreeformGrammar {
                     syntax,
@@ -53,7 +53,7 @@ pub fn encode_request(attempt: &ModelAttempt) -> Result<Value, ChatProtocolError
                 }
             }))
         })
-        .collect::<Result<Vec<_>, ChatProtocolError>>()?;
+        .collect::<Result<Vec<_>, ChatCompletionsProtocolError>>()?;
 
     let mut body_map = BTreeMap::new();
     body_map.insert("model".to_string(), json!(request.selection.model.clone()));
@@ -80,7 +80,7 @@ pub fn encode_request(attempt: &ModelAttempt) -> Result<Value, ChatProtocolError
     Ok(json!(body_map))
 }
 
-fn encode_messages(input: &[ModelInput]) -> Result<Vec<Value>, ChatProtocolError> {
+fn encode_messages(input: &[ModelInput]) -> Result<Vec<Value>, ChatCompletionsProtocolError> {
     let mut messages = Vec::new();
     let mut index = 0;
     while index < input.len() {
@@ -94,14 +94,26 @@ fn encode_messages(input: &[ModelInput]) -> Result<Vec<Value>, ChatProtocolError
                 messages.push(json!({ "role": role, "content": text }));
                 index += 1;
             }
-            ModelInput::AssistantToolCall { .. } => {
+            ModelInput::AssistantToolCall { .. } | ModelInput::FreeformToolCall { .. } => {
                 let mut calls = Vec::new();
-                while let Some(ModelInput::AssistantToolCall {
-                    call_id,
-                    name,
-                    arguments,
-                }) = input.get(index)
-                {
+                while let Some(item) = input.get(index) {
+                    let (call_id, name, arguments) = match item {
+                        ModelInput::AssistantToolCall {
+                            call_id,
+                            name,
+                            arguments,
+                        } => (call_id, name, arguments.clone()),
+                        ModelInput::FreeformToolCall {
+                            call_id,
+                            name,
+                            input,
+                        } => (
+                            call_id,
+                            name,
+                            json!({ "input": input }).to_string(),
+                        ),
+                        _ => break,
+                    };
                     calls.push(json!({
                         "id": call_id,
                         "type": "function",
@@ -114,9 +126,8 @@ fn encode_messages(input: &[ModelInput]) -> Result<Vec<Value>, ChatProtocolError
                 }
                 messages.push(json!({
                     "role": "assistant",
-                     "content": json!(null),
-                     "tool_calls": calls
-
+                    "content": json!(null),
+                    "tool_calls": calls
                 }));
             }
             ModelInput::ToolResult { call_id, output } => {
@@ -127,11 +138,16 @@ fn encode_messages(input: &[ModelInput]) -> Result<Vec<Value>, ChatProtocolError
                 }));
                 index += 1;
             }
-            ModelInput::FreeformToolCall { .. } | ModelInput::FreeformToolResult { .. } => {
-                return Err(ChatProtocolError::UnsupportedFreeformInput);
+            ModelInput::FreeformToolResult { call_id, output } => {
+                messages.push(json!({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": output
+                }));
+                index += 1;
             }
             ModelInput::Reasoning { .. } => {
-                return Err(ChatProtocolError::UnsupportedReasoningInput);
+                return Err(ChatCompletionsProtocolError::UnsupportedReasoningInput);
             }
         }
     }
@@ -189,17 +205,17 @@ impl ChatEventDecoder {
     }
 
     /// Feeds bytes and returns every complete typed event.
-    pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<ModelEvent>, ChatProtocolError> {
+    pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<ModelEvent>, ChatCompletionsProtocolError> {
         let events = self.sse.push(bytes)?;
         self.decode_sse_events(events)
     }
 
     /// Finishes framing and rejects a stream without the `[DONE]` sentinel.
-    pub fn finish(&mut self) -> Result<Vec<ModelEvent>, ChatProtocolError> {
+    pub fn finish(&mut self) -> Result<Vec<ModelEvent>, ChatCompletionsProtocolError> {
         let events = self.sse.finish()?;
         let decoded = self.decode_sse_events(events)?;
         if !self.terminal_seen {
-            return Err(ChatProtocolError::MissingDone);
+            return Err(ChatCompletionsProtocolError::MissingDone);
         }
         Ok(decoded)
     }
@@ -207,7 +223,7 @@ impl ChatEventDecoder {
     fn decode_sse_events(
         &mut self,
         events: Vec<harness_responses_protocol::SseEvent>,
-    ) -> Result<Vec<ModelEvent>, ChatProtocolError> {
+    ) -> Result<Vec<ModelEvent>, ChatCompletionsProtocolError> {
         let mut decoded = Vec::new();
         for event in events {
             if event.data.trim() == "[DONE]" {
@@ -219,16 +235,16 @@ impl ChatEventDecoder {
         Ok(decoded)
     }
 
-    fn decode_chunk(&mut self, payload: &str) -> Result<Vec<ModelEvent>, ChatProtocolError> {
+    fn decode_chunk(&mut self, payload: &str) -> Result<Vec<ModelEvent>, ChatCompletionsProtocolError> {
         if self.terminal_seen {
-            return Err(ChatProtocolError::EventAfterTerminal);
+            return Err(ChatCompletionsProtocolError::EventAfterTerminal);
         }
         let value: Value = sonic_rs::from_str(payload)?;
         if let Some(error) = value.get("error") {
             let message = error
                 .get("message")
                 .and_then(Value::as_str)
-                .unwrap_or("OpenAI Chat API reported an error");
+                .unwrap_or("Chat Completions API reported an error");
             self.terminal_seen = true;
             return Ok(vec![ModelEvent::Terminal(ModelTerminalOutcome::Failed(
                 ModelFailure {
@@ -287,7 +303,7 @@ impl ChatEventDecoder {
                 let index = call
                     .get("index")
                     .and_then(Value::as_u64)
-                    .ok_or(ChatProtocolError::InvalidField("tool_calls.index"))?;
+                    .ok_or(ChatCompletionsProtocolError::InvalidField("tool_calls.index"))?;
                 let partial = self.tool_calls.entry(index).or_default();
                 if let Some(call_id) = call.get("id").and_then(Value::as_str) {
                     partial.call_id = Some(call_id.to_owned());
@@ -300,7 +316,7 @@ impl ChatEventDecoder {
                         let call_id = partial
                             .call_id
                             .clone()
-                            .ok_or(ChatProtocolError::InvalidField("tool_calls.id"))?;
+                            .ok_or(ChatCompletionsProtocolError::InvalidField("tool_calls.id"))?;
                         partial.arguments.push_str(arguments);
                         events.push(ModelEvent::ToolInputDelta(ToolInputDelta {
                             call_id,
@@ -313,9 +329,9 @@ impl ChatEventDecoder {
         Ok(events)
     }
 
-    fn complete(&mut self) -> Result<Vec<ModelEvent>, ChatProtocolError> {
+    fn complete(&mut self) -> Result<Vec<ModelEvent>, ChatCompletionsProtocolError> {
         if self.terminal_seen {
-            return Err(ChatProtocolError::DuplicateTerminal);
+            return Err(ChatCompletionsProtocolError::DuplicateTerminal);
         }
         self.terminal_seen = true;
         let reason = self.finish_reason.as_deref().unwrap_or("stop");
@@ -323,7 +339,7 @@ impl ChatEventDecoder {
             return Ok(vec![ModelEvent::Terminal(ModelTerminalOutcome::Failed(
                 ModelFailure {
                     kind: ModelFailureKind::ProviderRejected,
-                    message: format!("OpenAI Chat API finished with reason {reason:?}"),
+                    message: format!("Chat Completions API finished with reason {reason:?}"),
                 },
             ))]);
         }
@@ -332,15 +348,15 @@ impl ChatEventDecoder {
         for (_, partial) in std::mem::take(&mut self.tool_calls) {
             let call_id = partial
                 .call_id
-                .ok_or(ChatProtocolError::InvalidField("tool_calls.id"))?;
+                .ok_or(ChatCompletionsProtocolError::InvalidField("tool_calls.id"))?;
             let name = partial
                 .name
-                .ok_or(ChatProtocolError::InvalidField("tool_calls.function.name"))?;
+                .ok_or(ChatCompletionsProtocolError::InvalidField("tool_calls.function.name"))?;
             let input = if self.freeform_tools.contains(&name) {
                 let wrapped: Value = sonic_rs::from_str(&partial.arguments)
-                    .map_err(ChatProtocolError::InvalidFreeformArguments)?;
+                    .map_err(ChatCompletionsProtocolError::InvalidFreeformArguments)?;
                 let input = wrapped.get("input").and_then(Value::as_str).ok_or(
-                    ChatProtocolError::InvalidField("tool_calls.function.arguments.input"),
+                    ChatCompletionsProtocolError::InvalidField("tool_calls.function.arguments.input"),
                 )?;
                 ToolInput::Freeform(input.to_owned())
             } else {
@@ -368,9 +384,9 @@ impl Default for ChatEventDecoder {
     }
 }
 
-/// OpenAI Chat request or stream protocol failure.
+/// Chat Completions request or stream protocol failure.
 #[derive(Debug, Error)]
-pub enum ChatProtocolError {
+pub enum ChatCompletionsProtocolError {
     /// SSE framing fails.
     #[error(transparent)]
     Sse(#[from] SseDecodeError),
@@ -378,27 +394,27 @@ pub enum ChatProtocolError {
     #[error("JSON parsing fails: {0}")]
     Json(#[from] sonic_rs::Error),
     /// A required field is absent or invalid.
-    #[error("OpenAI Chat field `{0}` is missing or invalid")]
+    #[error("Chat Completions field `{0}` is missing or invalid")]
     InvalidField(&'static str),
     /// A wrapped freeform call does not contain the exact string input contract.
-    #[error("OpenAI Chat freeform compatibility arguments are not valid JSON: {0}")]
+    #[error("Chat Completions freeform compatibility arguments are not valid JSON: {0}")]
     InvalidFreeformArguments(sonic_rs::Error),
     /// A function tool contains an invalid JSON schema.
-    #[error("OpenAI Chat function tool schema is not valid JSON: {0}")]
+    #[error("Chat Completions function tool schema is not valid JSON: {0}")]
     InvalidToolSchema(sonic_rs::Error),
     /// Native freeform input requires the Responses custom-tool format.
-    #[error("OpenAI Chat cannot encode native freeform input")]
+    #[error("Chat Completions cannot encode native freeform input")]
     UnsupportedFreeformInput,
     /// Responses reasoning items do not have a Chat Completions input format.
-    #[error("OpenAI Chat cannot encode Responses reasoning items")]
+    #[error("Chat Completions cannot encode Responses reasoning items")]
     UnsupportedReasoningInput,
     /// The stream closes without the required terminal sentinel.
-    #[error("OpenAI Chat stream ended without [DONE]")]
+    #[error("Chat Completions stream ended without [DONE]")]
     MissingDone,
     /// More than one terminal marker is received.
-    #[error("OpenAI Chat stream contains more than one terminal marker")]
+    #[error("Chat Completions stream contains more than one terminal marker")]
     DuplicateTerminal,
     /// Data arrives after a terminal outcome.
-    #[error("OpenAI Chat stream contains data after its terminal outcome")]
+    #[error("Chat Completions stream contains data after its terminal outcome")]
     EventAfterTerminal,
 }
