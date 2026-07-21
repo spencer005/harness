@@ -83,15 +83,28 @@ pub fn encode_request(attempt: &ModelAttempt) -> Result<Value, ChatCompletionsPr
 fn encode_messages(input: &[ModelInput]) -> Result<Vec<Value>, ChatCompletionsProtocolError> {
     let mut messages = Vec::new();
     let mut index = 0;
+    let mut pending_reasoning: Option<(Option<String>, Option<String>)> = None;
     while index < input.len() {
         match &input[index] {
             ModelInput::Message { role, text } => {
                 let role = match role {
+                    ModelMessageRole::System => "system",
                     ModelMessageRole::Developer => "developer",
                     ModelMessageRole::User => "user",
                     ModelMessageRole::Assistant => "assistant",
                 };
-                messages.push(json!({ "role": role, "content": text }));
+                let mut message = json!({ "role": role, "content": text });
+                if role == "assistant" {
+                    if let Some((content, summary)) = pending_reasoning.take() {
+                        if let Some(content) = content {
+                            message["reasoning_content"] = json!(content);
+                        }
+                        if let Some(summary) = summary {
+                            message["reasoning_summary"] = json!(summary);
+                        }
+                    }
+                }
+                messages.push(message);
                 index += 1;
             }
             ModelInput::AssistantToolCall { .. } | ModelInput::FreeformToolCall { .. } => {
@@ -124,11 +137,16 @@ fn encode_messages(input: &[ModelInput]) -> Result<Vec<Value>, ChatCompletionsPr
                     }));
                     index += 1;
                 }
-                messages.push(json!({
-                    "role": "assistant",
-                    "content": json!(null),
-                    "tool_calls": calls
-                }));
+                let mut message = json!({ "role": "assistant", "tool_calls": calls });
+                if let Some((content, summary)) = pending_reasoning.take() {
+                    if let Some(content) = content {
+                        message["reasoning_content"] = json!(content);
+                    }
+                    if let Some(summary) = summary {
+                        message["reasoning_summary"] = json!(summary);
+                    }
+                }
+                messages.push(message);
             }
             ModelInput::ToolResult { call_id, output } => {
                 messages.push(json!({
@@ -146,8 +164,13 @@ fn encode_messages(input: &[ModelInput]) -> Result<Vec<Value>, ChatCompletionsPr
                 }));
                 index += 1;
             }
-            ModelInput::Reasoning { .. } => {
-                return Err(ChatCompletionsProtocolError::UnsupportedReasoningInput);
+            ModelInput::Reasoning {
+                content,
+                encrypted_content: _,
+                summary,
+            } => {
+                pending_reasoning = Some((content.clone(), summary.clone()));
+                index += 1;
             }
         }
     }
@@ -294,6 +317,20 @@ impl ChatEventDecoder {
                 self.assistant_text.push_str(content);
                 events.push(ModelEvent::AssistantTextDelta(content.to_owned()));
             }
+            if let Some(reasoning) = delta
+                .get("reasoning_content")
+                .or_else(|| delta.get("reasoning"))
+                .and_then(Value::as_str)
+            {
+                events.push(ModelEvent::ReasoningContentDelta(reasoning.to_owned()));
+            }
+            if let Some(summary) = delta
+                .get("reasoning_summary")
+                .or_else(|| delta.get("summary"))
+                .and_then(Value::as_str)
+            {
+                events.push(ModelEvent::ReasoningSummaryDelta(summary.to_owned()));
+            }
             for call in delta
                 .get("tool_calls")
                 .and_then(Value::as_array)
@@ -405,9 +442,6 @@ pub enum ChatCompletionsProtocolError {
     /// Native freeform input requires the Responses custom-tool format.
     #[error("Chat Completions cannot encode native freeform input")]
     UnsupportedFreeformInput,
-    /// Responses reasoning items do not have a Chat Completions input format.
-    #[error("Chat Completions cannot encode Responses reasoning items")]
-    UnsupportedReasoningInput,
     /// The stream closes without the required terminal sentinel.
     #[error("Chat Completions stream ended without [DONE]")]
     MissingDone,

@@ -12,12 +12,9 @@ fn run(workspace: &WorkspaceRoot, command: &str, args: &[ShellWord]) -> Result<S
         .iter()
         .map(|arg| arg.value.as_str())
         .collect::<Vec<_>>();
-    let output = Command::new("cargo")
-        .arg(command)
-        .arg("--locked")
-        .args(values)
-        .current_dir(workspace.path())
-        .output()
+    let mut cmd = Command::new("cargo");
+    cmd.arg(command).args(values).current_dir(workspace.path());
+    let output = cmd.output()
         .map_err(|e| format!("failed to execute `cargo {command}`: {e}"))?;
     let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
     text.push_str(&String::from_utf8_lossy(&output.stderr));

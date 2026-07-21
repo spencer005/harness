@@ -29,7 +29,7 @@ use crate::WorkspaceRoot;
 pub const NAME: &str = "edit_file";
 
 /// Model-facing description of the native edit format.
-pub const DESCRIPTION: &str = "Edit files using line anchors from inspect read output. Use raw lines, not JSON. Use section headers: `§ Edit <path>`, `§ Add <path>`, `§ Remove <path>`, and `§ Move <old_path>` followed by `§ To <new_path>`. Inside `§ Edit`, use segment headers: `§ Replace <start_anchor> <end_anchor>`, `§ Delete <start_anchor> <end_anchor>`, `§ Before <anchor>`, `§ After <anchor>`, and `§ Append <last_line_anchor>`. A segment body continues until the next `§` header or the end of input. Escape every literal `§` in a body as `\\§`; the escape is removed from written content. Anchors use a positive line number followed by one vocabulary word, such as `24 bucket`. Replace and delete ranges are inclusive. `***` patch delimiters are invalid. Anchors refer to the file state before this edit; re-read after mutating segments in the same call.";
+pub const DESCRIPTION: &str = "Edit files using line anchors from `inspect` read output. Use raw lines, not JSON. Uses `§` section headers: `§ Edit <path>`, `§ Add <path>`, `§ Remove <path>`, and `§ Move <old_path>` followed by `§ To <new_path>`. Inside `§ Edit`, segment headers are `§ Replace <start_anchor> <end_anchor>`, `§ Delete <start_anchor> <end_anchor>`, `§ Before <anchor>`, `§ After <anchor>`, and `§ Append <last_line_anchor>`. A segment body continues until the next `§` header or end of input. Every literal `§` in a body must be escaped as `\\§`; the escape is removed from written content. Anchors use a positive line number followed by one vocabulary word, e.g. `24 bucket`. Replace/Delete ranges are inclusive. `***` patch delimiters are invalid. Anchors refer to the file state before this edit; re-read after mutating segments in the same call.";
 
 /// Lark grammar advertised for the native freeform tool.
 pub const LARK_GRAMMAR: &str = include_str!("edit_file.lark");
@@ -213,38 +213,11 @@ fn compact_error(message: &str) -> String {
 
 fn apply_operation(workspace: &WorkspaceRoot, operation: &Operation) -> Result<(), String> {
     match operation {
-        Operation::Add { path, body } => {
-            reject_git_path(path)?;
-            apply_add(workspace, path, body)
-        }
-        Operation::Remove { path } => {
-            reject_git_path(path)?;
-            apply_remove(workspace, path)
-        }
-        Operation::Move { from, to } => {
-            reject_git_path(from)?;
-            reject_git_path(to)?;
-            apply_move(workspace, from, to)
-        }
-        Operation::Edit { path, segments } => {
-            reject_git_path(path)?;
-            apply_segments(workspace, path, segments)
-        }
+        Operation::Add { path, body } => apply_add(workspace, path, body),
+        Operation::Remove { path } => apply_remove(workspace, path),
+        Operation::Move { from, to } => apply_move(workspace, from, to),
+        Operation::Edit { path, segments } => apply_segments(workspace, path, segments),
     }
-}
-
-fn reject_git_path(path: &str) -> Result<(), String> {
-    if Path::new(path).components().any(|component| {
-        matches!(
-            component,
-            std::path::Component::Normal(name) if name == ".git"
-        )
-    }) {
-        return Err(format!(
-            "failed to edit {path}: paths inside `.git` are sandboxed and cannot be modified"
-        ));
-    }
-    Ok(())
 }
 
 fn resolve_path(workspace: &WorkspaceRoot, path: &str) -> Result<PathBuf, String> {
@@ -798,10 +771,10 @@ impl<'a> Parser<'a> {
 
 fn decode_body(body: &str) -> Result<String, String> {
     let mut decoded = String::with_capacity(body.len());
-    let mut characters = body.chars();
-    while let Some(character) = characters.next() {
-        if character == '\\' && characters.clone().next() == Some('§') {
-            let _ = characters.next();
+    let mut chars = body.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character == '\\' && chars.peek() == Some(&'§') {
+            chars.next();
             decoded.push('§');
         } else if character == '§' {
             return Err(
@@ -828,20 +801,48 @@ fn parse_path(value: &str, header: &str) -> Result<String, String> {
 fn parse_anchor_pair(value: &str, header: &str) -> Result<(LineAnchor, LineAnchor), String> {
     let mut parts = value.split_whitespace();
     let start_line = parts.next().ok_or_else(|| {
-        format!("failed to parse `edit_file` input: {header} requires start anchor")
+        format!(
+            "failed to parse `edit_file` input: {header} requires \
+             `<start_line> <start_word> <end_line> <end_word>`. \
+             Example: `read src/main.rs 1+3` returns `1 maplefn main()`\n\
+             2 cedar    let x = 1\n\
+             3 willow    return x` — use `§ Replace 1 maple 3 willow`"
+        )
     })?;
     let start_word = parts.next().ok_or_else(|| {
-        format!("failed to parse `edit_file` input: {header} requires start anchor")
+        format!(
+            "failed to parse `edit_file` input: {header} requires \
+             `<start_line> <start_word> <end_line> <end_word>`. \
+             Example: `read src/main.rs 1+3` returns `1 maplefn main()`\n\
+             2 cedar    let x = 1\n\
+             3 willow    return x` — use `§ Replace 1 maple 3 willow`"
+        )
     })?;
     let end_line = parts.next().ok_or_else(|| {
-        format!("failed to parse `edit_file` input: {header} requires end anchor")
+        format!(
+            "failed to parse `edit_file` input: {header} requires \
+             `<start_line> <start_word> <end_line> <end_word>`. \
+             Example: `read src/main.rs 1+3` returns `1 maplefn main()`\n\
+             2 cedar    let x = 1\n\
+             3 willow    return x` — use `§ Replace 1 maple 3 willow`"
+        )
     })?;
     let end_word = parts.next().ok_or_else(|| {
-        format!("failed to parse `edit_file` input: {header} requires end anchor")
+        format!(
+            "failed to parse `edit_file` input: {header} requires \
+             `<start_line> <start_word> <end_line> <end_word>`. \
+             Example: `read src/main.rs 1+3` returns `1 maplefn main()`\n\
+             2 cedar    let x = 1\n\
+             3 willow    return x` — use `§ Replace 1 maple 3 willow`"
+        )
     })?;
     if parts.next().is_some() {
         return Err(format!(
-            "failed to parse `edit_file` input: {header} accepts exactly two anchors"
+            "failed to parse `edit_file` input: {header} accepts exactly two anchors, \
+             `<start_line> <start_word> <end_line> <end_word>`. \
+             Example: `read src/main.rs 1+3` returns `1 maplefn main()`\n\
+             2 cedar    let x = 1\n\
+             3 willow    return x` — use `§ Replace 1 maple 3 willow`"
         ));
     }
     Ok((
@@ -853,14 +854,27 @@ fn parse_anchor_pair(value: &str, header: &str) -> Result<(LineAnchor, LineAncho
 fn parse_single_anchor(value: &str, header: &str) -> Result<LineAnchor, String> {
     let mut parts = value.split_whitespace();
     let line_number = parts.next().ok_or_else(|| {
-        format!("failed to parse `edit_file` input: {header} requires one anchor")
+        format!(
+            "failed to parse `edit_file` input: {header} requires \
+             `<line> <word>`. \
+             Example: `read src/main.rs 1+1` returns `1 maplefn main()` — \
+             use `§ Before 1 maple`"
+        )
     })?;
     let word = parts.next().ok_or_else(|| {
-        format!("failed to parse `edit_file` input: {header} requires one anchor")
+        format!(
+            "failed to parse `edit_file` input: {header} requires \
+             `<line> <word>`. \
+             Example: `read src/main.rs 1+1` returns `1 maplefn main()` — \
+             use `§ Before 1 maple`"
+        )
     })?;
     if parts.next().is_some() {
         return Err(format!(
-            "failed to parse `edit_file` input: {header} accepts exactly one anchor"
+            "failed to parse `edit_file` input: {header} accepts exactly one anchor, \
+             `<line> <word>`. \
+             Example: `read src/main.rs 1+1` returns `1 maplefn main()` — \
+             use `§ Before 1 maple`"
         ));
     }
     parse_anchor(&format!("{line_number} {word}"))

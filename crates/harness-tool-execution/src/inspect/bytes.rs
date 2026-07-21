@@ -4,7 +4,6 @@ use std::{
 };
 
 use super::{ShellWord, resolve};
-const MAX: usize = 16_384;
 
 pub(crate) fn execute(
     workspace: &super::WorkspaceRoot,
@@ -85,8 +84,8 @@ fn range(value: &str) -> Result<(u64, usize), String> {
     let length = length
         .parse()
         .map_err(|_| "length must be a positive integer")?;
-    if length == 0 || length > MAX {
-        return Err(format!("length must be between 1 and {MAX} bytes"));
+    if length == 0 {
+        return Err("length must be positive".to_string());
     }
     Ok((offset, length))
 }
@@ -113,5 +112,11 @@ fn digit(value: u8) -> Option<u8> {
     }
 }
 fn hex(data: &[u8]) -> String {
-    data.iter().map(|byte| format!("{byte:02x}")).collect()
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = vec![0u8; data.len() * 2];
+    for (i, byte) in data.iter().enumerate() {
+        out[i * 2] = DIGITS[(byte >> 4) as usize];
+        out[i * 2 + 1] = DIGITS[(byte & 0xf) as usize];
+    }
+    unsafe { String::from_utf8_unchecked(out) }
 }

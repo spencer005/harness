@@ -167,6 +167,8 @@ pub enum ModelInput {
 /// Role used by provider-neutral text messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelMessageRole {
+    /// System instruction.
+    System,
     /// Developer instruction.
     Developer,
     /// User message.

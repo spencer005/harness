@@ -6,6 +6,7 @@ use std::{
     env,
     ffi::OsString,
     fmt::Write as _,
+    fs,
     future::Future,
     io,
     io::Write as IoWrite,
@@ -51,7 +52,7 @@ use harness_session_store::{
     SessionPayload, SessionReader, SessionRecord, SessionStore, SessionStoreError, SessionWriter,
 };
 use harness_tool_api::{
-    AvailabilityToolExecutor, ToolAvailability, ToolExecutor, ToolRegistry,
+    AvailabilityToolExecutor, ToolAvailability, ToolExecutor, ToolFailure, ToolRegistry,
 };
 use harness_tool_execution::{ToolInventory, WorkspaceRoot};
 use harness_tui_rewrite::domain::{
@@ -576,6 +577,7 @@ impl SessionWriter for FileSessionWriter {
 struct RealModelRequestBuilder {
     tool_registry: Arc<RwLock<ToolRegistry>>,
     tool_availability: Arc<RwLock<ToolAvailability>>,
+    base_instructions: String,
 }
 
 impl ModelRequestBuilder for RealModelRequestBuilder {
@@ -602,6 +604,12 @@ impl ModelRequestBuilder for RealModelRequestBuilder {
         };
 
         let mut input = Vec::new();
+        if !self.base_instructions.is_empty() {
+            input.push(ModelInput::Message {
+                role: ModelMessageRole::System,
+                text: self.base_instructions.clone(),
+            });
+        }
         for payload in history {
             match payload {
                 SessionPayload::InputMessage { text, .. } => {
@@ -751,13 +759,27 @@ impl ModelRequestBuilder for RealModelRequestBuilder {
             .iter()
             .map(|tool| {
                 let mut tool = tool.clone();
-                if matches!(
-                    &tool.input_schema,
-                    harness_tool_api::ToolInputSchema::FreeformGrammar { .. }
-                ) {
+                if let harness_tool_api::ToolInputSchema::FreeformGrammar {
+                    syntax,
+                    definition,
+                } = &tool.input_schema
+                {
+                    let schema = sonic_rs::json!({
+                        "type": "object",
+                        "properties": {
+                            "input": {
+                                "type": "string",
+                                "description": format!(
+                                    "Exact freeform tool input. Grammar syntax: {syntax:?}. Native tool instructions:\n{definition}"
+                                )
+                            }
+                        },
+                        "required": ["input"],
+                        "additionalProperties": false
+                    });
                     tool.input_schema = harness_tool_api::ToolInputSchema::JsonSchema(
                         harness_tool_api::JsonSchema::new(
-                            r#"{"type":"object","properties":{"input":{"type":"string"}},"required":["input"],"additionalProperties":false}"#,
+                            sonic_rs::to_string(&schema).expect("tool schema is valid JSON"),
                         ),
                     );
                 }
@@ -833,6 +855,38 @@ impl ProviderSelectionStore for FileProviderSelectionStore {
                 .await
                 .map_err(|e| ProviderError::Persistence(e.to_string()))?;
             Ok(())
+        })
+    }
+
+    fn load(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<ProviderSelection>, ProviderError>> + Send + '_>> {
+        let path = self.root.join("provider-bound.json");
+        Box::pin(async move {
+            let data = match tokio::fs::read_to_string(&path).await {
+                Ok(data) => data,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(err) => {
+                    return Err(ProviderError::Persistence(format!(
+                        "failed to read provider-bound.json: {err}"
+                    )));
+                }
+            };
+            let ser: SerializableProviderSelection = serde_json::from_str(&data)
+                .map_err(|e| ProviderError::Persistence(format!("invalid provider-bound.json: {e}")))?;
+            let provider = harness_model_api::ProviderId::new(ser.provider)
+                .map_err(|e| ProviderError::Persistence(format!("invalid provider ID in persisted selection: {e}")))?;
+            let model = ModelSelection::new(
+                provider.clone(),
+                ser.model.model,
+                ser.model.reasoning_effort,
+                ser.model.service_tier,
+            );
+            Ok(Some(ProviderSelection {
+                provider,
+                generation: ProviderGeneration(ser.generation),
+                model,
+            }))
         })
     }
 }
@@ -1589,6 +1643,7 @@ enum AppAction {
     },
     Retry,
     SetToolAvailability { pattern: String, enabled: bool },
+    SetGoal { instruction: String },
     Compact { instruction: String },
     RetryCompaction { instruction: Option<String> },
     CancelCompaction,
@@ -1687,6 +1742,21 @@ fn model(_app: &mut App, mut context: Context<'_>) -> CommandResult<AppAction> {
     })
 }
 
+fn goal(_app: &mut App, mut context: Context<'_>) -> CommandResult<AppAction> {
+    let text = context.args.next();
+    match text {
+        Some(first) => {
+            let mut instruction = first.to_owned();
+            for part in context.args {
+                instruction.push(' ');
+                instruction.push_str(part);
+            }
+            Ok(AppAction::SetGoal { instruction })
+        }
+        None => Err(CommandError::message("usage: /goal <task>")),
+    }
+}
+
 fn commands(_app: &mut App, context: Context<'_>) -> CommandResult<AppAction> {
     context.args.finish()?;
 
@@ -1749,6 +1819,11 @@ fn build_commands() -> Result<Commands, Box<dyn std::error::Error>> {
                 .usage("[instruction|redo [instruction]|cancel]")
                 .summary("Compact, redo, or cancel session compaction"),
         )
+        .command(
+            CommandSpec::new("goal", goal)
+                .usage("<task>")
+                .summary("Set a persisted goal; the agent loop keeps going until the model calls goal complete"),
+        )
         .build()?)
 }
 
@@ -1757,6 +1832,8 @@ async fn execute_app_action(
     app_state: &mut App,
     provider_config: &ProviderConfig,
     runtime: &mut ConversationRuntime,
+    command_rx: &mut harness_runtime_api::RuntimeCommandReceiver,
+    commands: &harness_runtime_api::RuntimeCommandSender,
     event_tx: &harness_runtime_api::RuntimeEventSender,
     session_root: &Path,
     active_generation: &Arc<AtomicU64>,
@@ -1886,7 +1963,25 @@ async fn execute_app_action(
                 .dispatch_command(harness_runtime_api::RuntimeCommand::Retry)
                 .await
                 .map_err(|error| format!("Failed to retry turn: {error}"))?;
-            if !drive_runtime_effects(runtime, effects, event_tx, seq).await {
+            if !drive_runtime_effects(runtime, command_rx, commands, effects, event_tx, seq).await {
+                return Err("Runtime event channel closed".to_string());
+            }
+            Ok(())
+        }
+        AppAction::SetGoal { instruction } => {
+            let goal_text = instruction.clone();
+            runtime
+                .dispatch_command(harness_runtime_api::RuntimeCommand::SetGoal { instruction })
+                .await
+                .map_err(|error| format!("Failed to set goal: {error}"))?;
+            // Submit the goal as a prompt to start the agent loop.
+            let effects = runtime
+                .dispatch_command(harness_runtime_api::RuntimeCommand::SubmitPrompt {
+                    text: goal_text,
+                })
+                .await
+                .map_err(|error| format!("Failed to submit goal prompt: {error}"))?;
+            if !drive_runtime_effects(runtime, command_rx, commands, effects, event_tx, seq).await {
                 return Err("Runtime event channel closed".to_string());
             }
             Ok(())
@@ -1906,7 +2001,7 @@ async fn execute_app_action(
                 .dispatch_command(harness_runtime_api::RuntimeCommand::Compact { instruction })
                 .await
                 .map_err(|error| format!("Failed to start compaction: {error}"))?;
-            if !drive_runtime_effects(runtime, effects, event_tx, seq).await {
+            if !drive_runtime_effects(runtime, command_rx, commands, effects, event_tx, seq).await {
                 return Err("Runtime event channel closed".to_string());
             }
             Ok(())
@@ -1918,7 +2013,7 @@ async fn execute_app_action(
                 })
                 .await
                 .map_err(|error| format!("Failed to redo compaction: {error}"))?;
-            if !drive_runtime_effects(runtime, effects, event_tx, seq).await {
+            if !drive_runtime_effects(runtime, command_rx, commands, effects, event_tx, seq).await {
                 return Err("Runtime event channel closed".to_string());
             }
             Ok(())
@@ -2020,6 +2115,8 @@ async fn execute_app_action(
 
 async fn run_model_attempt(
     runtime: &mut ConversationRuntime,
+    command_rx: &mut harness_runtime_api::RuntimeCommandReceiver,
+    commands: &harness_runtime_api::RuntimeCommandSender,
     turn_id: u64,
     attempt: Arc<ModelAttempt>,
     route: ResolvedModelRoute,
@@ -2057,7 +2154,66 @@ async fn run_model_attempt(
     };
 
     let mut deferred = Vec::new();
-    while let Some(event) = handle.next_event().await {
+    loop {
+        // Race the command channel against the event stream so that an
+        // interrupt (Esc/Ctrl-C) preempts the blocking next_event() call
+        // immediately rather than waiting for the next model delta.
+        enum Gate {
+            Command(harness_runtime_api::RuntimeCommand),
+            Event(harness_model_api::ModelEvent),
+            Closed,
+        }
+        let gate = tokio::select! {
+            cmd = command_rx.recv() => match cmd {
+                Ok(cmd) => Gate::Command(cmd),
+                Err(_) => Gate::Closed,
+            },
+            event = handle.next_event() => match event {
+                Some(event) => Gate::Event(event),
+                None => Gate::Closed,
+            },
+        };
+        let event = match gate {
+            Gate::Command(command) => {
+                let is_interrupt = matches!(
+                    command,
+                    harness_runtime_api::RuntimeCommand::Interrupt { .. }
+                        | harness_runtime_api::RuntimeCommand::StopRequestLoop
+                        | harness_runtime_api::RuntimeCommand::AbortResponse
+                );
+                if !is_interrupt {
+                    let _ = commands.try_send(command);
+                    // Non-interrupt commands break out so the outer loop can
+                    // dispatch them after the model attempt completes.
+                    break;
+                }
+                // StopRequestLoop just sets the stop-requested flag so the
+                // turn ends at the next continuation — don't cancel the
+                // transport, let the current response finish naturally.
+                let needs_cancel = !matches!(
+                    command,
+                    harness_runtime_api::RuntimeCommand::StopRequestLoop
+                );
+                if let Err(error) = runtime.dispatch_command(command).await {
+                    emit_runtime_failure(
+                        event_tx,
+                        seq,
+                        harness_runtime_api::RuntimeFailureCategory::Command,
+                        format!("runtime command failed: {error}"),
+                    )
+                    .await;
+                }
+                if needs_cancel {
+                    handle.cancel(harness_model_api::ModelCancellation {
+                        reason: "user interrupt".to_owned(),
+                    });
+                }
+                // After handling a command, loop back for the next event.
+                continue;
+            }
+            Gate::Event(event) => event,
+            Gate::Closed => break,
+        };
         let compatibility_failure = match &event {
             harness_model_api::ModelEvent::Terminal(outcome)
                 if !compaction_attempt && is_custom_tool_compatibility_failure(outcome) =>
@@ -2224,6 +2380,8 @@ async fn emit_runtime_event(
 
 async fn drive_runtime_effects(
     runtime: &mut ConversationRuntime,
+    command_rx: &mut harness_runtime_api::RuntimeCommandReceiver,
+    commands: &harness_runtime_api::RuntimeCommandSender,
     effects: Vec<RuntimeEffect>,
     event_tx: &harness_runtime_api::RuntimeEventSender,
     seq: &mut u64,
@@ -2261,7 +2419,7 @@ async fn drive_runtime_effects(
                 {
                     return false;
                 }
-                let result = run_model_attempt(runtime, turn_id, attempt, route, event_tx, seq).await;
+                let result = run_model_attempt(runtime, command_rx, commands, turn_id, attempt, route, event_tx, seq).await;
                 if !emit_runtime_event(
                     event_tx,
                     seq,
@@ -2284,7 +2442,7 @@ async fn drive_runtime_effects(
                 compaction_id: _,
                 attempt,
                 route,
-            } => match run_model_attempt(runtime, 0, attempt, route, event_tx, seq).await {
+            } => match run_model_attempt(runtime, command_rx, commands, 0, attempt, route, event_tx, seq).await {
                 Ok(Some(effects)) => Ok(effects),
                 Ok(None) => return false,
                 Err(error) => Err((
@@ -2343,7 +2501,15 @@ async fn drive_runtime_effects(
                 let output = match runtime.tool_executor() {
                     Ok(executor) => match executor.execute(request).await {
                         Ok(result) => result.model_output,
-                        Err(error) => format!("tool execution failed: {error:?}"),
+                        Err(error) => {
+                            let message = match &error {
+                                ToolFailure::InvalidInput(msg) => msg.clone(),
+                                ToolFailure::Execution(msg) => msg.clone(),
+                                ToolFailure::TimedOut => "The tool timed out before completing.".to_string(),
+                                ToolFailure::Cancelled => "The tool was cancelled.".to_string(),
+                            };
+                            format!("The tool reported: {message}\n\nReview the error and retry the tool call with corrected input.")
+                        },
                     },
                     Err(error) => {
                         return emit_effect_failure(
@@ -2410,6 +2576,7 @@ fn start_conversation_runtime(
     session_root: PathBuf,
 ) -> RuntimeHandle {
     let (commands, events, event_tx, mut command_rx) = channel_pair(64);
+    let commands_handle = commands.clone();
 
     tokio::spawn(async move {
         let mut runtime = ConversationRuntime::new(RuntimeConfiguration {
@@ -2473,6 +2640,8 @@ fn start_conversation_runtime(
                             &mut app_state,
                             &provider_config,
                             &mut runtime,
+                            &mut command_rx,
+                            &commands,
                             &event_tx,
                             &session_root,
                             &active_generation,
@@ -2511,7 +2680,7 @@ fn start_conversation_runtime(
                 }
             };
 
-            if !drive_runtime_effects(&mut runtime, effects, &event_tx, &mut seq).await {
+            if !drive_runtime_effects(&mut runtime, &mut command_rx, &commands, effects, &event_tx, &mut seq).await {
                 break;
             }
 
@@ -2560,7 +2729,7 @@ fn start_conversation_runtime(
         }
     });
 
-    RuntimeHandle { commands, events }
+    RuntimeHandle { commands: commands_handle, events }
 }
 
 async fn run_tui(_auth_mode: AuthMode, resume: ResumeSelection) -> CliResult<()> {
@@ -2591,24 +2760,54 @@ async fn run_tui(_auth_mode: AuthMode, resume: ResumeSelection) -> CliResult<()>
         ))
     })?;
 
-    let initial_profile_id = provider_config.default_profile_id.clone();
-    let initial_profile = provider_config
-        .profile(&initial_profile_id)
-        .ok_or_else(|| {
-            CliError::ProviderRuntime(ProviderError::InvalidProfile(format!(
-                "default provider profile not found: {initial_profile_id}"
-            )))
-        })?;
-    let initial_model = initial_profile.default_model.clone();
+    // Try to restore a previously persisted provider selection so that
+    // /provider use survives session restarts.
+    let persisted = FileProviderSelectionStore {
+        root: session_root.clone(),
+    }
+    .load()
+    .await
+    .unwrap_or(None);
+
+    let (profile_id, model_slug, reasoning_effort, service_tier) =
+        if let Some(selection) = &persisted {
+            let profile_name = selection.provider.as_str();
+            let pid = ProviderProfileId::new(profile_name);
+            if provider_config.profile(&pid).is_some() {
+                (
+                    pid,
+                    selection.model.model.clone(),
+                    selection.model.reasoning_effort.clone(),
+                    selection.model.service_tier.clone(),
+                )
+            } else {
+                // Persisted profile no longer exists in config; fall back.
+                let default_id = provider_config.default_profile_id.clone();
+                let default_profile = provider_config.profile(&default_id).ok_or_else(|| {
+                    CliError::ProviderRuntime(ProviderError::InvalidProfile(format!(
+                        "default provider profile not found: {default_id}"
+                    )))
+                })?;
+                (default_id, default_profile.default_model.clone(), None, None)
+            }
+        } else {
+            let default_id = provider_config.default_profile_id.clone();
+            let default_profile = provider_config.profile(&default_id).ok_or_else(|| {
+                CliError::ProviderRuntime(ProviderError::InvalidProfile(format!(
+                    "default provider profile not found: {default_id}"
+                )))
+            })?;
+            (default_id, default_profile.default_model.clone(), None, None)
+        };
 
     let (resolved_provider, initial_transport) = resolve_provider_and_transport(
         &provider_config,
         &session_id_text,
-        &initial_profile_id,
-        &initial_model,
+        &profile_id,
+        &model_slug,
         1,
-        None,
-        None,
+        reasoning_effort,
+        service_tier,
     )
     .await?;
 
@@ -2679,6 +2878,7 @@ async fn run_tui(_auth_mode: AuthMode, resume: ResumeSelection) -> CliResult<()>
         request_builder: Arc::new(RealModelRequestBuilder {
             tool_registry: Arc::clone(&tool_registry),
             tool_availability: Arc::clone(&tool_availability),
+            base_instructions: load_base_instructions()?,
         }),
         model_route: resolved_provider.routes.root.clone(),
         compaction_route: resolved_provider.routes.compaction.clone(),
@@ -2988,6 +3188,15 @@ fn harness_state_dir() -> CliResult<PathBuf> {
         source,
     })?;
     Ok(PathBuf::from(home).join(".local/state/new_harness"))
+}
+
+fn load_base_instructions() -> CliResult<String> {
+    let path = harness_state_dir()?.join("instructions.md");
+    match fs::read_to_string(&path) {
+        Ok(text) => Ok(text),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(String::new()),
+        Err(source) => Err(CliError::ReadBaseInstructions { path, source }),
+    }
 }
 
 fn generate_session_id() -> CliResult<String> {

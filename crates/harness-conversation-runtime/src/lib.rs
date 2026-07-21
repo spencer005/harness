@@ -743,9 +743,16 @@ impl ConversationRuntime {
     }
 
     /// Verifies that model events belong to the active attempt.
+    /// Accepts both `AwaitingModel` (streaming) and `Cancelling` (draining after
+    /// interrupt) because the transport may deliver buffered events after the
+    /// cancellation signal is sent but before the terminal event arrives.
     pub fn ensure_model_attempt(&self, turn_id: u64, attempt_id: u64) -> Result<(), RuntimeError> {
         match &self.phase {
             ConversationPhase::AwaitingModel {
+                turn_id: active_turn,
+                attempt_id: active_attempt,
+            }
+            | ConversationPhase::Cancelling {
                 turn_id: active_turn,
                 attempt_id: active_attempt,
             } if *active_turn == turn_id && *active_attempt == attempt_id => Ok(()),
@@ -973,8 +980,18 @@ impl ConversationRuntime {
                 self.ensure_model_attempt(turn_id, attempt_id)?;
                 Ok(Vec::new())
             }
-            ModelEvent::Terminal(_) if !self.pending_tool_inputs.is_empty() => {
-                Err(RuntimeError::IncompleteToolInput)
+            ModelEvent::Terminal(outcome)
+                if !self.pending_tool_inputs.is_empty() =>
+            {
+                // The model stream ended with partial tool input deltas that
+                // never completed into full ToolCall events (e.g. user
+                // interrupt or cancellation mid-tool-call).  Discard the
+                // partial state so finish_model_attempt can record the
+                // outcome cleanly instead of erroring out.
+                self.pending_tool_inputs.clear();
+                self.pending_tool_calls.clear();
+                self.finish_model_attempt(turn_id, attempt_id, outcome)
+                    .await
             }
             ModelEvent::Terminal(outcome) => {
                 self.finish_model_attempt(turn_id, attempt_id, outcome)
@@ -1168,6 +1185,7 @@ impl ConversationRuntime {
     }
 
     /// Requests cancellation for the active model attempt.
+    /// No-ops if already cancelling (buffered events still draining).
     pub fn interrupt(&mut self, turn_id: u64, attempt_id: u64) -> Result<(), RuntimeError> {
         match &self.phase {
             ConversationPhase::AwaitingModel {
@@ -1180,6 +1198,9 @@ impl ConversationRuntime {
                 };
                 Ok(())
             }
+            // Already cancelling — the first interrupt already fired, transport
+            // is draining, and we're just waiting for the terminal event.
+            ConversationPhase::Cancelling { .. } => Ok(()),
             _ => Err(RuntimeError::InvalidPhase),
         }
     }
@@ -1465,11 +1486,18 @@ impl ConversationRuntime {
                 Ok(Vec::new())
             }
             RuntimeCommand::AbortResponse => {
-                let (turn_id, attempt_id) = match &self.phase {
-                    ConversationPhase::AwaitingModel { turn_id, attempt_id } => (*turn_id, *attempt_id),
-                    _ => return Err(RuntimeError::InvalidPhase),
-                };
-                self.interrupt(turn_id, attempt_id)?;
+                if self.lifecycle != RuntimeLifecycle::Ready {
+                    return Err(RuntimeError::InvalidLifecycle);
+                }
+                match &self.phase {
+                    ConversationPhase::AwaitingModel { turn_id, attempt_id } => {
+                        self.interrupt(*turn_id, *attempt_id)?;
+                    }
+                    ConversationPhase::Cancelling { .. } => {}
+                    _ => {
+                        self.request_loop_stopped = true;
+                    }
+                }
                 Ok(Vec::new())
             }
             RuntimeCommand::Interrupt { text } => {
@@ -1525,6 +1553,16 @@ impl ConversationRuntime {
                     before_sequence,
                     page_size: PageSize::DEFAULT,
                 }])
+            }
+            RuntimeCommand::SetGoal { instruction } => {
+                if self.lifecycle != RuntimeLifecycle::Ready {
+                    return Err(RuntimeError::InvalidLifecycle);
+                }
+                if instruction.is_empty() {
+                    return Err(RuntimeError::EmptyCommandText);
+                }
+                self.enable_persist(instruction, CompletionPolicy::ModelMayComplete)?;
+                Ok(Vec::new())
             }
             RuntimeCommand::Shutdown => {
                 self.begin_shutdown()?;
@@ -1777,6 +1815,27 @@ impl ConversationRuntime {
         }
         if self.pending_tool_calls.is_empty() {
             if !self.queued_steering.is_empty() {
+                self.phase = ConversationPhase::PreparingAttempt { turn_id };
+                return Ok(vec![RuntimeEffect::ContinueModel { turn_id }]);
+            }
+            // Keep the agent loop running when a goal is active so the model
+            // can work autonomously until it calls `goal complete`.
+            // Inject a continuation user message (via steering) to prevent
+            // consecutive assistant messages, which the Chat Completions API
+            // rejects. Mirrors the old harness-core approach of appending a
+            // durable continuation prompt before each re-request.
+            if let PersistState::Active(task) = &self.persist_state {
+                self.queued_steering.push(format!(
+                    "Persist mode is active.\n\nPersisted task:\n{}\n\n\
+                     Continue working on the persisted task after this response \
+                     completion. Do not stop just because a response is done. \
+                     Before calling the `goal` tool, verify the persisted \
+                     task's completion criteria against the conversation and \
+                     observed results. Only call `goal` with exactly \
+                     `complete` after those criteria are satisfied; that tool \
+                     has no output and ends persist mode.",
+                    task.instruction,
+                ));
                 self.phase = ConversationPhase::PreparingAttempt { turn_id };
                 return Ok(vec![RuntimeEffect::ContinueModel { turn_id }]);
             }

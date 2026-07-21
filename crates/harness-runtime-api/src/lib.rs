@@ -57,6 +57,8 @@ pub enum RuntimeCommand {
     SetModel { selection: ModelSelection },
     /// Requests older persisted transcript entries.
     LoadOlderTranscript { before_sequence: Option<u64> },
+    /// Sets or clears a persisted goal that keeps the agent loop running.
+    SetGoal { instruction: String },
     /// Requests joined runtime shutdown.
     Shutdown,
 }
@@ -362,6 +364,14 @@ impl RuntimeCommandReceiver {
     /// Receive the next command.
     pub async fn recv(&mut self) -> Result<RuntimeCommand, RuntimeClosed> {
         self.rx.recv().await.map_err(|_| RuntimeClosed)
+    }
+
+    /// Non-blocking receive: returns `Ok(Some(cmd))` if a command is buffered,
+    /// `Ok(None)` if the mailbox is empty or disconnected. The caller treats
+    /// disconnection the same as empty mid-turn; the outer loop detects a
+    /// closed channel on its next blocking `recv`.
+    pub fn try_recv(&mut self) -> Option<RuntimeCommand> {
+        self.rx.try_recv().ok()
     }
 }
 

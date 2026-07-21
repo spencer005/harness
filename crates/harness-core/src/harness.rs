@@ -8917,20 +8917,48 @@ fn parse_edit_file_anchor_pair(
 ) -> Result<(LineAnchor, LineAnchor), String> {
     let mut parts = value.split_whitespace();
     let start_line = parts.next().ok_or_else(|| {
-        format!("failed to parse `edit_file` input: {header} requires start anchor")
+        format!(
+            "failed to parse `edit_file` input: {header} requires \
+             `<start_line> <start_word> <end_line> <end_word>`. \
+             Example: `read src/main.rs 1+3` returns `1 maplefn main()`\n\
+             2 cedar    let x = 1\n\
+             3 willow    return x` — use `§ Replace 1 maple 3 willow`"
+        )
     })?;
     let start_word = parts.next().ok_or_else(|| {
-        format!("failed to parse `edit_file` input: {header} requires start anchor")
+        format!(
+            "failed to parse `edit_file` input: {header} requires \
+             `<start_line> <start_word> <end_line> <end_word>`. \
+             Example: `read src/main.rs 1+3` returns `1 maplefn main()`\n\
+             2 cedar    let x = 1\n\
+             3 willow    return x` — use `§ Replace 1 maple 3 willow`"
+        )
     })?;
     let end_line = parts.next().ok_or_else(|| {
-        format!("failed to parse `edit_file` input: {header} requires end anchor")
+        format!(
+            "failed to parse `edit_file` input: {header} requires \
+             `<start_line> <start_word> <end_line> <end_word>`. \
+             Example: `read src/main.rs 1+3` returns `1 maplefn main()`\n\
+             2 cedar    let x = 1\n\
+             3 willow    return x` — use `§ Replace 1 maple 3 willow`"
+        )
     })?;
     let end_word = parts.next().ok_or_else(|| {
-        format!("failed to parse `edit_file` input: {header} requires end anchor")
+        format!(
+            "failed to parse `edit_file` input: {header} requires \
+             `<start_line> <start_word> <end_line> <end_word>`. \
+             Example: `read src/main.rs 1+3` returns `1 maplefn main()`\n\
+             2 cedar    let x = 1\n\
+             3 willow    return x` — use `§ Replace 1 maple 3 willow`"
+        )
     })?;
     if parts.next().is_some() {
         return Err(format!(
-            "failed to parse `edit_file` input: {header} accepts exactly two anchors"
+            "failed to parse `edit_file` input: {header} accepts exactly two anchors, \
+             `<start_line> <start_word> <end_line> <end_word>`. \
+             Example: `read src/main.rs 1+3` returns `1 maplefn main()`\n\
+             2 cedar    let x = 1\n\
+             3 willow    return x` — use `§ Replace 1 maple 3 willow`"
         ));
     }
     Ok((
@@ -8942,14 +8970,27 @@ fn parse_edit_file_anchor_pair(
 fn parse_single_edit_file_anchor(value: &str, header: &str) -> Result<LineAnchor, String> {
     let mut parts = value.split_whitespace();
     let line_number = parts.next().ok_or_else(|| {
-        format!("failed to parse `edit_file` input: {header} requires one anchor")
+        format!(
+            "failed to parse `edit_file` input: {header} requires \
+             `<line> <word>`. \
+             Example: `read src/main.rs 1+1` returns `1 maplefn main()` — \
+             use `§ Before 1 maple`"
+        )
     })?;
     let word = parts.next().ok_or_else(|| {
-        format!("failed to parse `edit_file` input: {header} requires one anchor")
+        format!(
+            "failed to parse `edit_file` input: {header} requires \
+             `<line> <word>`. \
+             Example: `read src/main.rs 1+1` returns `1 maplefn main()` — \
+             use `§ Before 1 maple`"
+        )
     })?;
     if parts.next().is_some() {
         return Err(format!(
-            "failed to parse `edit_file` input: {header} accepts exactly one anchor"
+            "failed to parse `edit_file` input: {header} accepts exactly one anchor, \
+             `<line> <word>`. \
+             Example: `read src/main.rs 1+1` returns `1 maplefn main()` — \
+             use `§ Before 1 maple`"
         ));
     }
     parse_line_anchor(&format!("{line_number} {word}"))

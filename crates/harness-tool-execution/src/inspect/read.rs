@@ -16,7 +16,11 @@ pub fn format_read_output(request: &InspectReadOutputRequest, text: &str) -> Str
     }
 
     let start_index = request.start_line - 1;
-    let end_index = total_lines.min(start_index + request.line_count);
+    let end_index = if request.line_count == usize::MAX {
+        total_lines
+    } else {
+        total_lines.min(start_index.saturating_add(request.line_count))
+    };
     let first_line = request.start_line;
     let mut output = String::new();
     for (index, line) in lines[start_index..end_index].iter().enumerate() {
@@ -47,7 +51,11 @@ pub fn format_read_display(
     }
 
     let start_index = request.start_line - 1;
-    let end_index = total_lines.min(start_index + request.line_count);
+    let end_index = if request.line_count == usize::MAX {
+        total_lines
+    } else {
+        total_lines.min(start_index.saturating_add(request.line_count))
+    };
     let next = (end_index < total_lines).then_some(InspectReadNextRecord {
         start_line: end_index + 1,
         line_count: request.line_count,

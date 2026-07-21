@@ -24,7 +24,7 @@ pub use read::{format_read_display, format_read_output};
 pub use shell::{ShellWord, parse_shell_words};
 
 pub const NAME: &str = "inspect";
-pub const DESCRIPTION: &str = "Batch compact inspection jobs. Commands: read, list (alias: ls), stat, bytes, byte-search, strings, elf, search, which, check, test, ps, and pwd. Read output includes stable line anchors for edit_file.";
+pub const DESCRIPTION: &str = "Batch compact inspection jobs. Each command-start line runs as an independent job.\nread <path> [range ...] — Print file lines. Ranges are `start+count` or `start-end`; pass several to batch. Quoted paths are supported. Each output line is prefixed with an anchor word; use `<line> <word>` as `edit_file` anchors.\nlist [path] [--depth <n>] [--exact] — List directory entries. Direct children are shown by default; directories end in `/`, symlinks use `->`, text files show line counts, and other files show rounded whole-unit sizes. `--exact` also shows exact byte sizes for text files and uses exact sizes for other files. Output is limited to 500 entries.\nstat <path> [path ...] [--exact] [--metadata] — Show stat-like size, modification time, and permissions without following symlinks. `--exact` prints exact byte sizes and subsecond timestamps. `--metadata` includes uncommon ownership, inode, device, link, access/change time, and block fields.\nbytes <path> <offset>+<length> — Read a bounded byte range as contiguous lowercase hex without separators. Recognize it; don't decode it. Your immediate read is usually right. Decode byte by byte only to resolve ambiguity or verify an exact detail. Reads are limited to 16384 bytes; offsets and requested lengths use exact byte counts, while total size uses a rounded whole-unit representation.\nbyte-search <path> <hex> — Find an exact contiguous hex sequence in a file. Returns exact byte offsets, including overlapping matches; output is limited to 100 offsets.\nstrings <path> [literal] — Index printable UTF-8 runs of at least four characters and return exact byte offsets. An optional literal filters whole runs. Output is limited to 100 strings and 160 preview characters per string.\nelf <path> [summary|sections|segments|symbols [literal]|relocations [literal]|dynamic [literal]|address <virtual>|offset <file>] — Inspect ELF structure without disassembling. The default summary reports class, architecture, endianness, kind, entry mapping, and interpreter. Other queries report exact file/virtual ranges, symbols, relocations, dynamic tags/imports, or translate between virtual addresses and file offsets. Symbol, relocation, and dynamic literals filter output.\nsearch <pattern> [path] — Regex search; returns matches with file names grouped once and line numbers. Patterns with regex metacharacters are treated as regex; plain identifiers are literal. Example: `search fn .*(needle|pin) src` or `search TODO src --exclude *.generated.rs`. Options: `-F` literal, `-i` ignore-case, `-g/--glob <glob>` include filter, `--exclude <glob>` exclude filter (repeatable), `--files` list paths.\nwhich <query> — Fuzzy-search executable commands in PATH and print command names with resolved paths.\ncheck [pkg ...] [--lib] [--all-targets] — Rust compiler diagnostics grouped by file under the `E0 err lineposition` header. Both flags work independently and together with package names.\ntest [cargo selectors] [filter ...] [-- libtest options] — Run `cargo test` with compact output. No filter runs the entire selected suite. Multiple positional filters run independently, which stock `cargo test` cannot do in one invocation. Cargo selectors include `-p/--package`, `--workspace`, `--lib`, `--bin`, `--test`, `--doc`, and `--all-targets`. Example: `test -p harness-core module::first module::second -- --exact`.\nps [name] — List processes; pass a name to filter instead of dumping all.\npwd — Print working directory.";
 pub const LARK_GRAMMAR: &str = "start: command\ncommand: /(?s).+/";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,29 +157,52 @@ pub fn execute(workspace: &WorkspaceRoot, input: &ToolInput) -> Result<ToolResul
                 index += 1;
             }
             if ranges.is_empty() {
-                return Err(ToolFailure::InvalidInput(format!(
-                    "failed to parse `inspect` input: read `{}` needs at least one range",
-                    path.value
-                )));
+                let (name, file) =
+                    resolve(workspace, &path.value).map_err(ToolFailure::InvalidInput)?;
+                let text = fs::read(&file)
+                    .map_err(|e| format!("inspect read {name}: {e}"))
+                    .and_then(|bytes| {
+                        String::from_utf8(bytes)
+                            .map_err(|_| format!("inspect read {name}: file is not UTF-8; use `bytes`"))
+                    })
+                    .map_err(ToolFailure::InvalidInput)?;
+                let total_lines = text.lines().count();
+                let hint = if total_lines > 1000 {
+                    format!(
+                        "\nfile has {total_lines} lines; read the rest with `read {name} 1001-end`\n"
+                    )
+                } else {
+                    String::new()
+                };
+                output_text.push_str(&format_read_output(
+                    &InspectReadOutputRequest {
+                        path: name,
+                        start_line: 1,
+                        line_count: 1000,
+                    },
+                    &text,
+                ));
+                output_text.push_str(&hint);
+                continue;
             }
             for (start, count) in ranges {
-                output_text.push_str(
-                    &read_file(
-                        workspace,
-                        &[
-                            path.clone(),
-                            ShellWord {
-                                value: start.to_string(),
-                                quoted: false,
-                            },
-                            ShellWord {
-                                value: count.to_string(),
-                                quoted: false,
-                            },
-                        ],
-                    )
-                    .map_err(ToolFailure::InvalidInput)?,
-                );
+                let (name, file) =
+                    resolve(workspace, &path.value).map_err(ToolFailure::InvalidInput)?;
+                let text = fs::read(&file)
+                    .map_err(|e| format!("inspect read {name}: {e}"))
+                    .and_then(|bytes| {
+                        String::from_utf8(bytes)
+                            .map_err(|_| format!("inspect read {name}: file is not UTF-8; use `bytes`"))
+                    })
+                    .map_err(ToolFailure::InvalidInput)?;
+                output_text.push_str(&format_read_output(
+                    &InspectReadOutputRequest {
+                        path: name,
+                        start_line: start,
+                        line_count: count,
+                    },
+                    &text,
+                ));
             }
             continue;
         }
@@ -251,13 +274,19 @@ fn parse_range(value: &str) -> Result<(usize, usize), String> {
         let start = shell::parse_positive_usize_value(start).map_err(|_| {
             "failed to parse `inspect` input: range start must be a positive integer".to_string()
         })?;
-        let end = shell::parse_positive_usize_value(end).map_err(|_| {
-            "failed to parse `inspect` input: range end must be a positive integer".to_string()
-        })?;
-        if end < start {
-            return Err("failed to parse `inspect` input: range end must be >= start".into());
-        }
-        return Ok((start, end - start + 1));
+        let count = if end.eq_ignore_ascii_case("end") {
+            usize::MAX
+        } else {
+            let end = shell::parse_positive_usize_value(end).map_err(|_| {
+                "failed to parse `inspect` input: range end must be a positive integer or `end`"
+                    .to_string()
+            })?;
+            if end < start {
+                return Err("failed to parse `inspect` input: range end must be >= start".into());
+            }
+            end - start + 1
+        };
+        return Ok((start, count));
     }
     Err("failed to parse `inspect` input: range must be `start+count` or `start-end`".into())
 }
@@ -282,37 +311,11 @@ fn resolve(workspace: &WorkspaceRoot, value: &str) -> Result<(String, PathBuf), 
         workspace.path().join(relative.as_str()),
     ))
 }
-fn positive(value: &str, command: &str) -> Result<usize, String> {
+
+pub(crate) fn positive(value: &str, command: &str) -> Result<usize, String> {
     value
         .parse()
         .ok()
         .filter(|v| *v > 0)
         .ok_or_else(|| format!("inspect {command}: expected a positive integer"))
-}
-fn read_file(workspace: &WorkspaceRoot, args: &[ShellWord]) -> Result<String, String> {
-    if !(1..=3).contains(&args.len()) {
-        return Err("inspect read: expected PATH [START_LINE] [LINE_COUNT]".into());
-    }
-    let (name, file) = resolve(workspace, &args[0].value)?;
-    let start = args
-        .get(1)
-        .map(|v| positive(&v.value, "read"))
-        .transpose()?
-        .unwrap_or(1);
-    let count = args
-        .get(2)
-        .map(|v| positive(&v.value, "read"))
-        .transpose()?
-        .unwrap_or(200)
-        .min(400);
-    let text = String::from_utf8(fs::read(&file).map_err(|e| format!("inspect read {name}: {e}"))?)
-        .map_err(|_| format!("inspect read {name}: file is not UTF-8; use `bytes`"))?;
-    Ok(format_read_output(
-        &InspectReadOutputRequest {
-            path: name,
-            start_line: start,
-            line_count: count,
-        },
-        &text,
-    ))
 }

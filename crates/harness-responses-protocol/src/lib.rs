@@ -558,6 +558,7 @@ pub fn encode_input(input: &[ModelInput]) -> Vec<sonic_rs::Value> {
         .map(|item| match item {
             ModelInput::Message { role, text } => {
                 let role = match role {
+                    ModelMessageRole::System => "system",
                     ModelMessageRole::Developer => "developer",
                     ModelMessageRole::User => "user",
                     ModelMessageRole::Assistant => "assistant",

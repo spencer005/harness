@@ -2,14 +2,13 @@ use std::{fs, path::Path};
 
 use super::{ShellWord, resolve};
 
-const LIMIT: usize = 500;
-
 pub(crate) fn execute(
     workspace: &super::WorkspaceRoot,
     args: &[ShellWord],
 ) -> Result<String, String> {
     let mut depth = 1usize;
     let mut exact = false;
+    let mut limit = 500usize;
     let mut paths: Vec<String> = Vec::new();
     let mut index = 0;
     while index < args.len() {
@@ -29,10 +28,16 @@ pub(crate) fn execute(
                 depth = super::positive(&value.value, "list --depth")?;
                 index += 1;
             }
+            "--limit" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or("failed to parse `inspect` list input: `--limit` needs a value")?;
+                limit = super::positive(&value.value, "list --limit")?;
+                index += 1;
+            }
             value if value.starts_with('-') => {
-                return Err(format!(
-                    "failed to parse `inspect` list input: unsupported option `{value}`"
-                ));
+                index += 1;
             }
             value => {
                 paths.push(value.to_owned());
@@ -44,7 +49,7 @@ pub(crate) fn execute(
         paths.push(".".to_owned());
     }
     let mut output = String::new();
-    let mut remaining = LIMIT;
+    let mut remaining = limit;
     for (index, path) in paths.iter().enumerate() {
         let (name, root) = resolve(workspace, path)?;
         if !root.is_dir() {
@@ -67,9 +72,9 @@ pub(crate) fn execute(
         }
     }
     if remaining == 0 {
-        output.push_str(
-            "[list output truncated: showing first 500 entries; use a narrower path or depth]\n",
-        );
+        output.push_str(&format!(
+            "[list output truncated: showing first {limit} entries; use --limit or a narrower path]\n",
+        ));
     }
     Ok(output)
 }
