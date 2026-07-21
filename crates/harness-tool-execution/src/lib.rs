@@ -13,6 +13,7 @@ pub mod edit_file;
 pub mod goal;
 pub mod inspect;
 pub mod inventory;
+pub mod path_correction;
 pub mod terminal;
 pub use inventory::ToolInventory;
 

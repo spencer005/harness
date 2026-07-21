@@ -29,7 +29,39 @@ use crate::WorkspaceRoot;
 pub const NAME: &str = "edit_file";
 
 /// Model-facing description of the native edit format.
-pub const DESCRIPTION: &str = "Edit files using line anchors from `inspect` read output. Use raw lines, not JSON. Uses `§` section headers: `§ Edit <path>`, `§ Add <path>`, `§ Remove <path>`, and `§ Move <old_path>` followed by `§ To <new_path>`. Inside `§ Edit`, segment headers are `§ Replace <start_anchor> <end_anchor>`, `§ Delete <start_anchor> <end_anchor>`, `§ Before <anchor>`, `§ After <anchor>`, and `§ Append <last_line_anchor>`. A segment body continues until the next `§` header or end of input. Every literal `§` in a body must be escaped as `\\§`; the escape is removed from written content. Anchors use a positive line number followed by one vocabulary word, e.g. `24 bucket`. Replace/Delete ranges are inclusive. `***` patch delimiters are invalid. Anchors refer to the file state before this edit; re-read after mutating segments in the same call.";
+pub const DESCRIPTION: &str = r#"Edit workspace files using line anchors copied from `inspect` output. Input is plain text, not JSON.
+
+Operation headers:
+- `§ Edit <path>` modifies an existing text file.
+- `§ Add <path>` creates a file.
+- `§ Remove <path>` removes a file; directory paths must end in `/`.
+- `§ Move <old_path>` followed by `§ To <new_path>` moves or renames a path.
+
+Inside `§ Edit`, use:
+- `§ Replace <start_line><start_hash><end_line><end_hash>`
+- `§ Delete <start_line><start_hash><end_line><end_hash>`
+- `§ Before <line><hash>`
+- `§ After <line><hash>`
+- `§ Append <last_line><hash>`
+
+Example `inspect` output:
+`1é fn main() {`
+`2ä     println!("Hello");`
+`3é }`
+
+Replace all three lines:
+`§ Edit src/main.rs`
+`§ Replace 1é3ä`
+`fn main() {`
+`    println!("Hello, world!");`
+`}`
+
+Insert before line 2:
+`§ Edit src/main.rs`
+`§ Before 2ä`
+`    println!("Starting...");`
+
+Every literal `§` in file content must be written as `\§`; the escape is removed before writing. Do not use `***` patch delimiters. Anchors refer to the file state before the current edit, so inspect the file again after it changes."#;
 
 /// Lark grammar advertised for the native freeform tool.
 pub const LARK_GRAMMAR: &str = include_str!("edit_file.lark");
@@ -147,6 +179,66 @@ pub struct LineAnchor {
     pub hash: u8,
 }
 
+fn validate_body_line(line: &str) -> Result<(), String> {
+    let trimmed = line.trim_start();
+    let first = match trimmed.split_whitespace().next() {
+        Some(w) => w,
+        None => return Ok(()),
+    };
+
+    // Check for a full anchor prefix like `42!` (digits + hash char).
+    if parse_anchor(first).is_ok() {
+        return Err(format!(
+            "failed to parse `edit_file` input: replacement content appears to \
+             include an `inspect` line prefix: `{first}`.\n\
+             \n\
+             Anchor markers are labels printed by `inspect`; they are not part \
+             of the file content.\n\
+             \n\
+             Wrong:\n\
+             `{line}`\n\
+             \n\
+             Correct: remove `{first}` from the beginning of the line.\n\
+             Use anchors only in edit headers, for example:\n\
+             `§ Replace 42é108ä`"
+        ));
+    }
+
+    Ok(())
+}
+
+fn invalid_edit_header(line: &str) -> String {
+    match line {
+        line if line.starts_with("§ To ") => {
+            "failed to parse `edit_file` input: `§ To` is not valid inside an \
+             `§ Edit` operation. `§ To <new_path>` may only appear immediately \
+             after `§ Move <old_path>`. If this line is intended as file content, \
+             escape the section symbol as `\\§ To`."
+                .to_string()
+        }
+
+        line if line.starts_with("§ Edit ")
+            || line.starts_with("§ Add ")
+            || line.starts_with("§ Remove ")
+            || line.starts_with("§ Move ") =>
+        {
+            format!(
+                "failed to parse `edit_file` input: `{}` starts a new file \
+                 operation and cannot be used as an edit segment. If it is \
+                 intended as file content, escape the section symbol as `\\§`.",
+                line.trim()
+            )
+        }
+
+        _ => format!(
+            "failed to parse `edit_file` input: unsupported edit header `{line}`. \
+             Valid edit headers are `§ Replace`, `§ Delete`, `§ Before`, \
+             `§ After`, and `§ Append`. If this line is intended as file \
+             content, escape the section symbol as `\\§`."
+        ),
+    }
+}
+
 /// Parses and executes one `edit_file` request.
 pub fn execute(workspace: &WorkspaceRoot, input: &ToolInput) -> Result<ToolResult, ToolFailure> {
     let request = match parse_input(input.as_str()) {
@@ -225,6 +317,34 @@ fn resolve_path(workspace: &WorkspaceRoot, path: &str) -> Result<PathBuf, String
         .relative_path(path)
         .map_err(|error| format!("failed to edit {path}: {error}"))?;
     Ok(workspace.path().join(relative.as_str()))
+}
+
+/// Like `resolve_path` but also checks that the resolved path exists. If it
+/// doesn't, tries to suggest a correction via fuzzy path matching.
+fn resolve_existing_path(workspace: &WorkspaceRoot, path: &str) -> Result<PathBuf, String> {
+    let resolved = resolve_path(workspace, path)?;
+    if resolved.exists() {
+        return Ok(resolved);
+    }
+
+    // Path doesn't exist — try to suggest a correction.
+    if let Some(correction) = crate::path_correction::suggest_correction(workspace.path(), path) {
+        let mut msg = format!("failed to edit {path}: file does not exist");
+        msg.push_str(&format!("\nDid you mean: `{}`?", correction.suggested));
+        if !correction.listing.is_empty() {
+            msg.push_str(&format!(
+                "\nFiles in `{}`:",
+                correction.deepest_prefix,
+            ));
+            for entry in &correction.listing {
+                msg.push_str(&format!("\n  {entry}"));
+            }
+        }
+        msg.push('\n');
+        return Err(msg);
+    }
+
+    Err(format!("failed to edit {path}: file does not exist\n"))
 }
 
 fn temporary_path(target: &Path) -> PathBuf {
@@ -374,7 +494,7 @@ fn apply_add(workspace: &WorkspaceRoot, path: &str, body: &str) -> Result<(), St
 }
 
 fn apply_remove(workspace: &WorkspaceRoot, path: &str) -> Result<(), String> {
-    let resolved = resolve_path(workspace, path)?;
+    let resolved = resolve_existing_path(workspace, path)?;
     let metadata = fs::symlink_metadata(&resolved)
         .map_err(|error| format!("failed to read {}: {error}", resolved.display()))?;
     let parent = resolved.parent().ok_or_else(|| {
@@ -421,7 +541,7 @@ fn apply_remove(workspace: &WorkspaceRoot, path: &str) -> Result<(), String> {
 }
 
 fn apply_move(workspace: &WorkspaceRoot, from: &str, to: &str) -> Result<(), String> {
-    let resolved_from = resolve_path(workspace, from)?;
+    let resolved_from = resolve_existing_path(workspace, from)?;
     let resolved_to = resolve_path(workspace, to)?;
     let source_parent = resolved_from.parent().ok_or_else(|| {
         format!(
@@ -476,7 +596,7 @@ fn apply_segments(
             "failed to edit {path}: EDIT requires at least one segment"
         ));
     }
-    let resolved = resolve_path(workspace, path)?;
+    let resolved = resolve_existing_path(workspace, path)?;
     let text = fs::read_to_string(&resolved)
         .map_err(|error| format!("failed to read {}: {error}", resolved.display()))?;
     let lines = text.lines().collect::<Vec<_>>();
@@ -577,10 +697,24 @@ fn validate_anchor(path: &str, lines: &[&str], anchor: LineAnchor) -> Result<(),
         ));
     }
     let current_hash = line_hash(lines[anchor.line_number - 1]);
-    if current_hash != anchor.hash {
-        let rendered = format_line_anchor(anchor).ok_or_else(|| {
-            "edit anchor vocabulary is missing an entry for the stale anchor".to_string()
-        })?;
+
+    // Compare dictionary *words* rather than raw hash values so that
+    // modulo wrapping (dictionary < 256 entries) doesn't produce false
+    // "stale anchor" errors.  Multiple hash values may map to the same
+    // dictionary word: we only care that the user supplied the correct
+    // *character* from the inspect output.
+    let current_word = edit_anchor_word(current_hash);
+    let anchor_word = edit_anchor_word(anchor.hash);
+    if current_word != anchor_word {
+        let rendered = anchor_word.or(current_word).map_or_else(
+            || {
+                "edit anchor vocabulary is missing an entry for the stale anchor".to_string()
+            },
+            |w| {
+                let c = w.chars().next().unwrap_or('?');
+                format!("{}{c} ", anchor.line_number)
+            },
+        );
         return Err(format!("{path} stale anchor {rendered}"));
     }
     Ok(())
@@ -710,9 +844,7 @@ impl<'a> Parser<'a> {
                     body: self.take_body_until_header()?,
                 });
             } else {
-                return Err(format!(
-                    "failed to parse `edit_file` input: unsupported edit header `{line}`"
-                ));
+                return Err(invalid_edit_header(line));
             }
         }
         if segments.is_empty() {
@@ -752,19 +884,25 @@ impl<'a> Parser<'a> {
 
     fn take_body_until_header(&mut self) -> Result<String, String> {
         let start = self.offset;
+
         while self.offset < self.input.len() {
             let Some(line) = self.peek_line() else {
                 break;
             };
+
             if any_header(line) {
                 break;
             }
+
+            validate_body_line(line)?;
+
             if self.next_line().is_none() {
                 return Err(
                     "failed to parse `edit_file` input: failed to consume body line".to_string(),
                 );
             }
         }
+
         decode_body(&self.input[start..self.offset])
     }
 }
@@ -799,85 +937,104 @@ fn parse_path(value: &str, header: &str) -> Result<String, String> {
 }
 
 fn parse_anchor_pair(value: &str, header: &str) -> Result<(LineAnchor, LineAnchor), String> {
-    let mut parts = value.split_whitespace();
-    let start_line = parts.next().ok_or_else(|| {
+    let trimmed = value.trim();
+
+    // Format: "42é108ä" — start_line + start_hash + end_line + end_hash, no separators.
+    // Hash chars are never ASCII digits, so the split is unambiguous.
+    let v = trimmed.as_bytes();
+
+    // Find end of start line digits.
+    let start_line_end = v.iter().position(|b| !b.is_ascii_digit()).ok_or_else(|| {
         format!(
             "failed to parse `edit_file` input: {header} requires \
-             `<start_line> <start_word> <end_line> <end_word>`. \
-             Example: `read src/main.rs 1+3` returns `1 maplefn main()`\n\
-             2 cedar    let x = 1\n\
-             3 willow    return x` — use `§ Replace 1 maple 3 willow`"
+             `<start_line><start_hash><end_line><end_hash>`, e.g. `42é108ä`"
         )
     })?;
-    let start_word = parts.next().ok_or_else(|| {
+    let start_line = &trimmed[..start_line_end];
+
+    // Hash char starts at start_line_end. Its UTF-8 byte width varies.
+    let rest = &trimmed[start_line_end..];
+    let hash_char = rest.chars().next().ok_or_else(|| {
         format!(
-            "failed to parse `edit_file` input: {header} requires \
-             `<start_line> <start_word> <end_line> <end_word>`. \
-             Example: `read src/main.rs 1+3` returns `1 maplefn main()`\n\
-             2 cedar    let x = 1\n\
-             3 willow    return x` — use `§ Replace 1 maple 3 willow`"
+            "failed to parse `edit_file` input: {header} requires a hash character \
+             after the start line number, e.g. `42é108ä`"
         )
     })?;
-    let end_line = parts.next().ok_or_else(|| {
+    let hash_end = start_line_end + hash_char.len_utf8();
+    let start_hash = &trimmed[start_line_end..hash_end];
+
+    // End line digits start after the hash char.
+    let end_rest = &trimmed[hash_end..];
+    let end_line_end_rel = end_rest
+        .as_bytes()
+        .iter()
+        .position(|b| !b.is_ascii_digit())
+        .ok_or_else(|| {
+            format!(
+                "failed to parse `edit_file` input: {header} requires \
+                 an end line number after the start hash, e.g. `42é108ä`"
+            )
+        })?;
+    let end_line = &end_rest[..end_line_end_rel];
+
+    // End hash char.
+    let end_hash_rest = &end_rest[end_line_end_rel..];
+    let end_hash_char = end_hash_rest.chars().next().ok_or_else(|| {
         format!(
-            "failed to parse `edit_file` input: {header} requires \
-             `<start_line> <start_word> <end_line> <end_word>`. \
-             Example: `read src/main.rs 1+3` returns `1 maplefn main()`\n\
-             2 cedar    let x = 1\n\
-             3 willow    return x` — use `§ Replace 1 maple 3 willow`"
+            "failed to parse `edit_file` input: {header} requires a hash character \
+             after the end line number, e.g. `42é108ä`"
         )
     })?;
-    let end_word = parts.next().ok_or_else(|| {
-        format!(
-            "failed to parse `edit_file` input: {header} requires \
-             `<start_line> <start_word> <end_line> <end_word>`. \
-             Example: `read src/main.rs 1+3` returns `1 maplefn main()`\n\
-             2 cedar    let x = 1\n\
-             3 willow    return x` — use `§ Replace 1 maple 3 willow`"
-        )
-    })?;
-    if parts.next().is_some() {
+    let end_hash_end = end_line_end_rel + end_hash_char.len_utf8();
+    let end_hash = &end_rest[end_line_end_rel..end_hash_end];
+
+    // No trailing content allowed.
+    if end_hash_end < end_rest.len() {
         return Err(format!(
             "failed to parse `edit_file` input: {header} accepts exactly two anchors, \
-             `<start_line> <start_word> <end_line> <end_word>`. \
-             Example: `read src/main.rs 1+3` returns `1 maplefn main()`\n\
-             2 cedar    let x = 1\n\
-             3 willow    return x` — use `§ Replace 1 maple 3 willow`"
+             `<start_line><start_hash><end_line><end_hash>`, e.g. `42é108ä`"
         ));
     }
+
     Ok((
-        parse_anchor(&format!("{start_line} {start_word}"))?,
-        parse_anchor(&format!("{end_line} {end_word}"))?,
+        parse_anchor(&format!("{start_line}{start_hash}"))?,
+        parse_anchor(&format!("{end_line}{end_hash}"))?,
     ))
 }
 
 fn parse_single_anchor(value: &str, header: &str) -> Result<LineAnchor, String> {
-    let mut parts = value.split_whitespace();
-    let line_number = parts.next().ok_or_else(|| {
-        format!(
-            "failed to parse `edit_file` input: {header} requires \
-             `<line> <word>`. \
-             Example: `read src/main.rs 1+1` returns `1 maplefn main()` — \
-             use `§ Before 1 maple`"
-        )
-    })?;
-    let word = parts.next().ok_or_else(|| {
-        format!(
-            "failed to parse `edit_file` input: {header} requires \
-             `<line> <word>`. \
-             Example: `read src/main.rs 1+1` returns `1 maplefn main()` — \
-             use `§ Before 1 maple`"
-        )
-    })?;
-    if parts.next().is_some() {
+    let trimmed = value.trim();
+
+    // Format: "42!" — leading digits then a single hash character.
+    let digit_end = trimmed
+        .char_indices()
+        .find(|(_, c)| !c.is_ascii_digit())
+        .ok_or_else(|| {
+            format!(
+                "failed to parse `edit_file` input: {header} requires \
+                 `<line><hash>`, e.g. `42!`"
+            )
+        })?;
+    let (num_str, hash_str) = trimmed.split_at(digit_end.0);
+
+    if hash_str.is_empty() {
         return Err(format!(
-            "failed to parse `edit_file` input: {header} accepts exactly one anchor, \
-             `<line> <word>`. \
-             Example: `read src/main.rs 1+1` returns `1 maplefn main()` — \
-             use `§ Before 1 maple`"
+            "failed to parse `edit_file` input: {header} requires a hash character \
+             after the line number, e.g. `42!`"
         ));
     }
-    parse_anchor(&format!("{line_number} {word}"))
+
+    // The hash is exactly one Unicode character.
+    let mut chars = hash_str.chars();
+    let _ = chars.next();
+    if chars.next().is_some() {
+        return Err(format!(
+            "failed to parse `edit_file` input: {header} accepts exactly one anchor, \
+             `<line><hash>`, e.g. `42!` — found extra content after hash character"
+        ));
+    }
+
+    parse_anchor(&format!("{num_str}{hash_str}"))
 }
 
 fn patch_delimiter(line: &str) -> bool {
@@ -896,26 +1053,22 @@ fn any_header(line: &str) -> bool {
 }
 
 fn parse_anchor(value: &str) -> Result<LineAnchor, String> {
-    let mut parts = value.split_whitespace();
-    let Some(line_number) = parts.next() else {
-        return Err(
-            "failed to parse `edit_file` input: anchor requires a line number and word".to_string(),
-        );
-    };
-    let Some(word) = parts.next() else {
-        return Err(
-            "failed to parse `edit_file` input: anchor requires a line number and word".to_string(),
-        );
-    };
-    if parts.next().is_some() {
-        return Err(
-            "failed to parse `edit_file` input: anchor accepts exactly a line number and word"
-                .to_string(),
-        );
-    }
+    let trimmed = value.trim();
 
-    let line_number = line_number.parse::<usize>().map_err(|_| {
-        "failed to parse `edit_file` input: anchor line number must be positive".to_string()
+    // Format: "42!" — leading digits for line number, then a single hash character.
+    let digit_end = trimmed
+        .char_indices()
+        .find(|(_, c)| !c.is_ascii_digit())
+        .ok_or_else(|| {
+            "failed to parse `edit_file` input: anchor requires a line number \
+             followed by a hash character, e.g. `42!`"
+                .to_string()
+        })?;
+    let (num_str, rest) = trimmed.split_at(digit_end.0);
+
+    let line_number = num_str.parse::<usize>().map_err(|_| {
+        "failed to parse `edit_file` input: anchor line number must be a positive integer"
+            .to_string()
     })?;
     if line_number == 0 {
         return Err(
@@ -923,17 +1076,31 @@ fn parse_anchor(value: &str) -> Result<LineAnchor, String> {
         );
     }
 
+    let hash_char = rest.chars().next().ok_or_else(|| {
+        "failed to parse `edit_file` input: anchor requires a hash character \
+         after the line number, e.g. `42!`"
+            .to_string()
+    })?;
+
+    // Look up the hash character in the dictionary to find its index.
     let hash = (0..=u8::MAX)
-        .find(|&hash| edit_anchor_word(hash) == Some(word))
+        .find(|&h| {
+            edit_anchor_word(h)
+                .map_or(false, |word| word.chars().next() == Some(hash_char))
+        })
         .ok_or_else(|| {
-            "failed to parse `edit_file` input: anchor word is not in the vocabulary".to_string()
+            format!(
+                "failed to parse `edit_file` input: hash character `{}` is not \
+                 in the dictionary",
+                hash_char
+            )
         })?;
     Ok(LineAnchor { line_number, hash })
 }
 
 fn format_line_anchor(anchor: LineAnchor) -> Option<String> {
     Some(format!(
-        "{} {}",
+        "{}{} ",
         anchor.line_number,
         edit_anchor_word(anchor.hash)?
     ))
@@ -948,16 +1115,23 @@ fn line_hash(line: &str) -> u8 {
     (hash & 0xff) as u8
 }
 
-const EDIT_ANCHOR_VOCABULARY: &str = include_str!("../../../../o200k_anchor_candidates.txt");
+const EDIT_ANCHOR_VOCABULARY: &str = include_str!("../../../../dictionary.txt");
 
 fn edit_anchor_word(hash: u8) -> Option<&'static str> {
-    let line = EDIT_ANCHOR_VOCABULARY.lines().nth(hash as usize)?;
-    line.split_once("\": \"")
-        .and_then(|(_, value)| value.strip_suffix("\","))
-        .or_else(|| {
-            line.split_once("\": \"")
-                .and_then(|(_, value)| value.strip_suffix("\"}"))
-        })
+    static CHARS: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    let chars = CHARS.get_or_init(|| {
+        EDIT_ANCHOR_VOCABULARY
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                line.strip_prefix('\'')?.strip_suffix('\'')
+            })
+            .collect()
+    });
+    if chars.is_empty() {
+        return None;
+    }
+    Some(chars[hash as usize % chars.len()])
 }
 
 #[cfg(test)]

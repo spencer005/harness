@@ -34,6 +34,7 @@ bytes = "1"
 crossfire = { version = "3.1.16", features = ["tokio"] }
 crossterm = { version = "0.28", features = ["event-stream"] }
 fff_search = { package = "fff-search", git = "https://github.com/dmtrkovalenko/fff" }
+memchr = "2"
 harness-responses-api = { path = "crates/harness-responses-api" }
 harness-tui-rewrite = { path = "crates/harness-tui-rewrite" }
 harness-tool-api = { path = "crates/harness-tool-api" }

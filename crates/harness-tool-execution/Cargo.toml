@@ -10,8 +10,11 @@ harness-tool-api.workspace = true
 inventory.workspace = true
 fff_search.workspace = true
 libc.workspace = true
+memchr.workspace = true
 object.workspace = true
 portable-pty.workspace = true
+serde = { workspace = true, features = ["derive"] }
+sonic-rs.workspace = true
 thiserror.workspace = true
 tiktoken-rs.workspace = true
 tokio.workspace = true

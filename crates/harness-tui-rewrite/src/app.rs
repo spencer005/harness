@@ -777,6 +777,12 @@ impl Application {
             DomainEvent::AgentRemoved(agent) => {
                 self.session.agents.remove(&agent);
             }
+            DomainEvent::CompactionStarted => {
+                self.transcript
+                    .append(crate::domain::TranscriptPayload::Event(ExternalText::new(
+                        "compact: in progress".to_string(),
+                    )));
+            }
             DomainEvent::CompactionCompleted(summary) => {
                 self.transcript
                     .append(crate::domain::TranscriptPayload::Event(ExternalText::new(

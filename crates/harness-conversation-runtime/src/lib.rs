@@ -843,20 +843,26 @@ impl ConversationRuntime {
                 }
                 ModelEvent::AssistantTextDelta(delta) => {
                     self.record_compaction_delta(&delta)?;
-                    Ok(Vec::new())
+                    Ok(vec![RuntimeEffect::Emit(RuntimeEvent::AssistantTextDelta(
+                        delta,
+                    ))])
                 }
                 ModelEvent::Terminal(outcome) => {
                     let started = self.model_started;
                     self.model_started = false;
                     self.phase = ConversationPhase::Idle;
                     if !started {
-                        return Ok(vec![RuntimeEffect::Emit(RuntimeEvent::Failure(
-                            harness_runtime_api::RuntimeFailure {
-                                category: harness_runtime_api::RuntimeFailureCategory::Protocol,
-                                message: "compaction stream completed before it started"
-                                    .to_string(),
-                            },
-                        ))]);
+                        return Ok(vec![
+                            RuntimeEffect::Emit(RuntimeEvent::AgenticLoopCompleted),
+                            RuntimeEffect::Emit(RuntimeEvent::Failure(
+                                harness_runtime_api::RuntimeFailure {
+                                    category:
+                                        harness_runtime_api::RuntimeFailureCategory::Protocol,
+                                    message: "compaction stream completed before it started"
+                                        .to_string(),
+                                },
+                            )),
+                        ]);
                     }
                     match outcome {
                         ModelTerminalOutcome::Completed(completion) => {
@@ -877,9 +883,10 @@ impl ConversationRuntime {
                                 },
                             ])
                         }
-                        other => Ok(vec![RuntimeEffect::Emit(RuntimeEvent::ResponseFinished(
-                            other,
-                        ))]),
+                        other => Ok(vec![
+                            RuntimeEffect::Emit(RuntimeEvent::AgenticLoopCompleted),
+                            RuntimeEffect::Emit(RuntimeEvent::ResponseFinished(other)),
+                        ]),
                     }
                 }
                 ModelEvent::ReasoningSummaryDelta(_)
@@ -1449,11 +1456,19 @@ impl ConversationRuntime {
             }
             RuntimeCommand::Compact { instruction } => {
                 self.begin_compaction(instruction)?;
-                Ok(vec![self.start_compaction_request()?])
+                Ok(vec![
+                    RuntimeEffect::Emit(RuntimeEvent::CompactionStarted),
+                    RuntimeEffect::Emit(RuntimeEvent::AgenticLoopStarted),
+                    self.start_compaction_request()?,
+                ])
             }
             RuntimeCommand::RetryCompaction { instruction } => {
                 self.redo_compaction_with_instruction(instruction)?;
-                Ok(vec![self.start_compaction_request()?])
+                Ok(vec![
+                    RuntimeEffect::Emit(RuntimeEvent::CompactionStarted),
+                    RuntimeEffect::Emit(RuntimeEvent::AgenticLoopStarted),
+                    self.start_compaction_request()?,
+                ])
             }
             RuntimeCommand::CancelCompaction => {
                 self.cancel_compaction()?;

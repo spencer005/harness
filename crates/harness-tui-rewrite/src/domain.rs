@@ -396,6 +396,8 @@ pub(crate) enum DomainEvent {
     AgentUpdated(AgentState),
     /// A subagent was removed.
     AgentRemoved(AgentId),
+    /// A compaction operation started.
+    CompactionStarted,
     /// A compaction operation completed.
     CompactionCompleted(ExternalText),
     /// Runtime steering queue state changed.

@@ -41,14 +41,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_prompt_excludes_request_instructions_from_summary() {
+    fn default_prompt_omits_transient_wording() {
         assert!(DEFAULT_COMPACTION_PROMPT.contains(
-            "Do not include, quote, paraphrase, summarize, or restate base/system/developer instructions that are supplied as request instructions"
+            "Omit only transient wording and redundant chatter"
         ));
-        assert!(
-            DEFAULT_COMPACTION_PROMPT
-                .contains("those instructions are supplied separately on continuation")
-        );
     }
 
     #[test]

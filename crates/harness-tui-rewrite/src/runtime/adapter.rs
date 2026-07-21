@@ -59,6 +59,7 @@ pub(super) fn adapt_runtime_event(event: RuntimeEvent) -> DomainEvent {
         RuntimeEvent::ReasoningSummaryDelta(delta) | RuntimeEvent::ReasoningContentDelta(delta) => {
             DomainEvent::ThinkingDelta(ExternalText::new(delta))
         }
+        RuntimeEvent::CompactionStarted => DomainEvent::CompactionStarted,
         RuntimeEvent::CompactionCompleted(summary) => {
             DomainEvent::CompactionCompleted(ExternalText::new(summary))
         }

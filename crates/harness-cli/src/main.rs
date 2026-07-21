@@ -2182,10 +2182,29 @@ async fn run_model_attempt(
                         | harness_runtime_api::RuntimeCommand::AbortResponse
                 );
                 if !is_interrupt {
+                    // QueueSteering: queue text for the next attempt and let the
+                    // current stream finish naturally — do NOT cancel.
+                    if let harness_runtime_api::RuntimeCommand::QueueSteering { .. } = &command {
+                        if let Ok(effects) = runtime.dispatch_command(command).await {
+                            for effect in effects {
+                                if let RuntimeEffect::Emit(event) = effect {
+                                    let envelope =
+                                        harness_runtime_api::RuntimeEventEnvelope::new(*seq, event);
+                                    *seq += 1;
+                                    let _ = event_tx.send(envelope).await;
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    // Other non-interrupt commands: forward to the outer loop and
+                    // cancel the stream so we get a clean Terminal event instead
+                    // of the "model stream ended before a terminal event" error.
                     let _ = commands.try_send(command);
-                    // Non-interrupt commands break out so the outer loop can
-                    // dispatch them after the model attempt completes.
-                    break;
+                    handle.cancel(harness_model_api::ModelCancellation {
+                        reason: "non-interrupt command during streaming".to_owned(),
+                    });
+                    continue;
                 }
                 // StopRequestLoop just sets the stop-requested flag so the
                 // turn ends at the next continuation — don't cancel the

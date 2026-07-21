@@ -99,6 +99,8 @@ pub enum RuntimeEvent {
     ReasoningContentDelta(String),
     /// Model response reaches a terminal outcome.
     ResponseFinished(ModelTerminalOutcome),
+    /// Compaction has started.
+    CompactionStarted,
     /// A compaction summary was durably committed.
     CompactionCompleted(String),
     /// Estimated context-window token usage.

@@ -3,8 +3,8 @@
 use std::fmt::Write as _;
 
 use crate::inspect::{
-    InspectReadDisplayRecord, InspectReadNextRecord, InspectReadOutputRequest, line_anchor_word,
-    edit_line_hash,
+    InspectReadDisplayRecord, InspectReadNextRecord, InspectReadOutputRequest, edit_line_hash,
+    line_anchor_word,
 };
 
 /// Format one read range as the model-facing anchor-prefixed text.
@@ -72,5 +72,5 @@ pub fn format_read_display(
 }
 
 pub(crate) fn format_line_anchor(line_number: usize, hash: u8) -> String {
-    format!("{line_number} {}", line_anchor_word(hash))
+    format!("{}{} ", line_number, line_anchor_word(hash))
 }
