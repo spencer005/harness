@@ -306,6 +306,8 @@ impl ResponsesEventDecoder {
                 | "response.reasoning_summary_text.done"
                 | "response.reasoning_summary_part.done"
                 | "response.reasoning_text.done"
+                | "response.function_call_arguments.done"
+                | "response.custom_tool_call_input.done"
         ) {
             return Ok(None);
         }

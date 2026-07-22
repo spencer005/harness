@@ -84,9 +84,19 @@ pub(crate) fn test(workspace: &WorkspaceRoot, args: &[ShellWord]) -> Result<Stri
 fn parse_cargo_check_command(args: &[ShellWord]) -> Result<Vec<String>, String> {
     let mut command_args = vec!["check".to_string(), "--locked".to_string()];
     for word in args {
-        match word.value.as_str() {
+        let value = word.value.as_str();
+        match value {
             "--lib" | "--all-targets" => command_args.push(word.value.clone()),
             package if !package.starts_with('-') && !package.contains('=') => {
+                if package.ends_with(".rs")
+                    || package.contains('/')
+                    || package.contains('\\')
+                    || package.starts_with('.')
+                {
+                    return Err(format!(
+                        "failed to parse `inspect` check input: `{package}` appears to be a file path, but `check` expects package names (e.g., `tool-grammar`), `--lib`, or `--all-targets`"
+                    ));
+                }
                 command_args.push("-p".to_string());
                 command_args.push(package.to_string());
             }
@@ -229,34 +239,56 @@ enum CargoMessage {
 
 #[derive(Deserialize, Debug)]
 struct CompilerMessageDetail {
+    #[serde(default)]
     code: Option<CompilerMessageCode>,
     level: String,
     message: String,
+    #[serde(default)]
     spans: Vec<CompilerMessageSpan>,
     #[serde(default)]
-    children: Vec<CompilerMessageChild>,
+    children: Vec<CompilerMessageDetail>,
+    #[serde(default)]
+    rendered: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
 struct CompilerMessageCode {
     code: String,
+    #[serde(default)]
+    explanation: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
 struct CompilerMessageSpan {
     file_name: String,
+    #[serde(default)]
     line_start: usize,
+    #[serde(default)]
+    line_end: Option<usize>,
+    #[serde(default)]
     column_start: usize,
+    #[serde(default)]
+    column_end: Option<usize>,
+    #[serde(default)]
     is_primary: bool,
     #[serde(default)]
     label: Option<String>,
+    #[serde(default)]
+    suggested_replacement: Option<String>,
+    #[serde(default)]
+    suggestion_applicability: Option<String>,
+    #[serde(default)]
+    expansion: Option<Box<CompilerMessageMacroExpansion>>,
 }
 
 #[derive(Deserialize, Debug)]
-struct CompilerMessageChild {
-    level: String,
-    message: String,
-    spans: Vec<CompilerMessageSpan>,
+struct CompilerMessageMacroExpansion {
+    #[serde(default)]
+    span: Option<CompilerMessageSpan>,
+    #[serde(default)]
+    macro_decl_name: Option<String>,
+    #[serde(default)]
+    def_site_span: Option<CompilerMessageSpan>,
 }
 
 fn parse_json_diagnostics(stdout: &str) -> Vec<RustErrorLocation> {
@@ -646,6 +678,12 @@ mod tests {
             error,
             "failed to parse `inspect` check input: expected package names, --lib, or --all-targets"
         );
+
+        let file_error = parse_cargo_check_command(&[word("crates/tool-grammar/src/lib.rs")]).unwrap_err();
+        assert_eq!(
+            file_error,
+            "failed to parse `inspect` check input: `crates/tool-grammar/src/lib.rs` appears to be a file path, but `check` expects package names (e.g., `tool-grammar`), `--lib`, or `--all-targets`"
+        );
     }
 
     #[test]
@@ -688,6 +726,21 @@ mod tests {
         assert_eq!(
             output,
             "E0 err lineposition\nsrc/lib.rs\n308 mismatched types 10:5\n425 cannot find value `missing` in this scope 20:9\nsrc/main.rs\n0 unexpected closing delimiter: `}` 55:1 the nearest open delimiter 42:1\n"
+        );
+    }
+
+    #[test]
+    fn inspect_check_rust_errors_handles_full_rustc_diagnostic_schema() {
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 101")
+            .status()
+            .unwrap();
+        let stdout = r#"{"reason":"compiler-message","package_id":"tool-grammar 0.0.0","target":{"name":"tool-grammar","kind":["lib"],"crate_types":["lib"],"src_path":"src/lib.rs","edition":"2021","doc":true,"doctest":true,"test":true},"message":{"$message_type":"diagnostic","message":"expected one of `!`, `.`, `::`, `;`, `?`, `{`, `}`, or an operator, found `=>`","code":null,"level":"error","spans":[{"file_name":"crates/tool-grammar/src/lib.rs","byte_start":22,"byte_end":24,"line_start":751,"line_end":751,"column_start":23,"column_end":25,"is_primary":true,"text":[{"text":"Tok::Star => {}","highlight_start":23,"highlight_end":25}],"label":"expected one of 8 possible tokens","suggested_replacement":null,"suggestion_applicability":null,"expansion":null}],"children":[{"message":"you might have meant to write a \"greater than or equal to\" comparison","code":null,"level":"help","spans":[{"file_name":"crates/tool-grammar/src/lib.rs","byte_start":22,"byte_end":24,"line_start":751,"line_end":751,"column_start":23,"column_end":25,"is_primary":true,"text":[{"text":"Tok::Star => {}","highlight_start":23,"highlight_end":25}],"label":null,"suggested_replacement":">=","suggestion_applicability":"MaybeIncorrect","expansion":null}],"children":[],"rendered":null}],"rendered":"error: expected one of..."}}"#;
+        let output = format_cargo_check_output(status, stdout, "");
+        assert_eq!(
+            output,
+            "E0 err lineposition\ncrates/tool-grammar/src/lib.rs\n0 expected one of `!`, `.`, `::`, `;`, `?`, `{`, `}`, or an operator, found `=>` 751:23\n"
         );
     }
 

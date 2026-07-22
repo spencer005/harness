@@ -45,3 +45,8 @@ hyper-rustls.workspace = true
 hyper-util.workspace = true
 hyper.workspace = true
 futures-util.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+fuzzy-matcher = "0.3.7"
+chrono = "0.4.45"
+harness-session-picker = { version = "0.0.0", path = "../harness-session-picker" }

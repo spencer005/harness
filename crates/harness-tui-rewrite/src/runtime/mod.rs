@@ -409,18 +409,21 @@ async fn execute_effects(
             AppEffect::Runtime {
                 request,
                 completion,
-            } => match commands
-                .send(adapter::export_runtime_request(request))
-                .await
-            {
+            } => match commands.try_send(adapter::export_runtime_request(request)) {
                 Ok(()) => application.delivery_accepted(completion),
-                Err(RuntimeClosed) => {
+                Err(harness_runtime_api::RuntimeSendError::Closed) => {
                     application.delivery_failed(
                         completion,
                         "runtime command delivery failed: actor mailbox closed",
                     );
                     application.runtime_disconnected();
                     return Ok(false);
+                }
+                Err(harness_runtime_api::RuntimeSendError::Full) => {
+                    application.delivery_failed(
+                        completion,
+                        "runtime command delivery failed: actor mailbox full",
+                    );
                 }
             },
             AppEffect::Clipboard(text) => terminal.copy_to_clipboard(&text)?,

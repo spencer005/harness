@@ -15,7 +15,7 @@ use crate::{
         BoundedInput, HorizontalUnit, InputFragment, PromptCapacityError, PromptEditor,
         PromptImportError, PromptPosition, VerticalDirection,
     },
-    transcript::{Transcript, TranscriptError, TranscriptPosition, TranscriptScrollDirection},
+    transcript::{Transcript, TranscriptPosition, TranscriptScrollDirection},
 };
 
 const TRANSCRIPT_SELECTION_SCROLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -246,8 +246,8 @@ pub(crate) enum DeliveryCompletion {
 pub(crate) enum ApplicationImportError {
     /// Prompt storage or cursor state is invalid.
     Prompt(PromptImportError),
-    /// Transcript identity state is contradictory.
-    Transcript(TranscriptError),
+    /// Transcript storage state or history bounds are invalid.
+    Transcript(crate::transcript::TranscriptError),
 }
 
 impl std::fmt::Display for ApplicationImportError {
@@ -267,11 +267,12 @@ impl From<PromptImportError> for ApplicationImportError {
     }
 }
 
-impl From<TranscriptError> for ApplicationImportError {
-    fn from(error: TranscriptError) -> Self {
+impl From<crate::transcript::TranscriptError> for ApplicationImportError {
+    fn from(error: crate::transcript::TranscriptError) -> Self {
         Self::Transcript(error)
     }
 }
+
 
 /// Rewrite-owned application state.
 #[derive(Debug)]
@@ -357,8 +358,7 @@ impl Application {
     /// Returns elapsed root work time.
     pub(crate) fn working_elapsed(&self, now: Instant) -> Option<Duration> {
         self.agentic_started_at.and_then(|started| {
-            self.session
-                .agentic_loop_working
+            (self.session.agentic_loop_working || self.session.compaction_working)
                 .then(|| now.duration_since(started))
         })
     }
@@ -683,7 +683,10 @@ impl Application {
         match event {
             DomainEvent::AppendTranscript(entry) => {
                 if let Err(error) = self.transcript.append_snapshot(entry) {
-                    self.record_transcript_error(error);
+                    self.set_notice(
+                        format!("runtime transcript protocol violation: {}", error),
+                        NoticeSeverity::Error,
+                    );
                 }
             }
             DomainEvent::TranscriptPage {
@@ -691,22 +694,26 @@ impl Application {
                 next_before_sequence,
                 reached_start,
             } => {
-                if let Err(error) =
-                    self.transcript
-                        .apply_page(entries, next_before_sequence, reached_start)
+                if let Err(error) = self.transcript
+                    .apply_page(entries, next_before_sequence, reached_start)
                 {
-                    self.record_transcript_error(error);
+                    self.set_notice(
+                        format!("runtime transcript protocol violation: {}", error),
+                        NoticeSeverity::Error,
+                    );
                 }
             }
             DomainEvent::TranscriptCommitted {
                 reasoning_sequence,
                 assistant_sequence,
             } => {
-                if let Err(error) = self
-                    .transcript
+                if let Err(error) = self.transcript
                     .reconcile_commit(reasoning_sequence, assistant_sequence)
                 {
-                    self.record_transcript_error(error);
+                    self.set_notice(
+                        format!("runtime transcript protocol violation: {}", error),
+                        NoticeSeverity::Error,
+                    );
                 }
             }
             DomainEvent::ModelChanged(model) => {
@@ -734,39 +741,52 @@ impl Application {
             DomainEvent::ModelAwaiting(awaiting) => {
                 self.session.model_awaiting = awaiting;
             }
-            DomainEvent::ResponseStreamStarted => match self.transcript.begin_response_stream() {
-                Ok(()) => {
-                    self.session.response_streaming = true;
-                    self.session.model_awaiting = false;
-                    self.session.last_ttft_ms = None;
+            DomainEvent::ResponseStreamStarted => {
+                if let Err(error) = self.transcript.begin_response_stream() {
+                    self.set_notice(
+                        format!("runtime transcript protocol violation: {}", error),
+                        NoticeSeverity::Error,
+                    );
                 }
-                Err(error) => self.record_transcript_error(error),
-            },
+                self.session.response_streaming = true;
+                self.session.model_awaiting = false;
+                self.session.last_ttft_ms = None;
+            }
             DomainEvent::AssistantFirstToken(milliseconds) => {
                 self.session.last_ttft_ms = Some(milliseconds);
             }
             DomainEvent::AssistantTextDelta(delta) => {
                 if let Err(error) = self.transcript.append_assistant_delta(delta) {
-                    self.record_transcript_error(error);
+                    self.set_notice(
+                        format!("runtime transcript protocol violation: {}", error),
+                        NoticeSeverity::Error,
+                    );
                 }
             }
             DomainEvent::ThinkingDelta(delta) => {
                 if let Err(error) = self.transcript.append_thinking_delta(delta) {
-                    self.record_transcript_error(error);
+                    self.set_notice(
+                        format!("runtime transcript protocol violation: {}", error),
+                        NoticeSeverity::Error,
+                    );
                 }
             }
             DomainEvent::ResponseStreamCompleted => {
-                match self.transcript.complete_response_stream() {
-                    Ok(()) => {
-                        self.session.response_streaming = false;
-                        self.session.model_awaiting = false;
-                    }
-                    Err(error) => self.record_transcript_error(error),
+                if let Err(error) = self.transcript.complete_response_stream() {
+                    self.set_notice(
+                        format!("runtime transcript protocol violation: {}", error),
+                        NoticeSeverity::Error,
+                    );
                 }
+                self.session.response_streaming = false;
+                self.session.model_awaiting = false;
             }
             DomainEvent::ResponseStreamFailed => {
                 if let Err(error) = self.transcript.complete_response_stream() {
-                    self.record_transcript_error(error);
+                    self.set_notice(
+                        format!("runtime transcript protocol violation: {}", error),
+                        NoticeSeverity::Error,
+                    );
                 }
                 self.session.response_streaming = false;
                 self.session.model_awaiting = false;
@@ -778,12 +798,20 @@ impl Application {
                 self.session.agents.remove(&agent);
             }
             DomainEvent::CompactionStarted => {
+                if !self.session.compaction_working && !self.session.agentic_loop_working {
+                    self.agentic_started_at = Some(Instant::now());
+                }
+                self.session.compaction_working = true;
                 self.transcript
                     .append(crate::domain::TranscriptPayload::Event(ExternalText::new(
                         "compact: in progress".to_string(),
                     )));
             }
             DomainEvent::CompactionCompleted(summary) => {
+                self.session.compaction_working = false;
+                if !self.session.agentic_loop_working {
+                    self.agentic_started_at = None;
+                }
                 self.transcript
                     .append(crate::domain::TranscriptPayload::Event(ExternalText::new(
                         format!("compact: {}", summary.as_str()),
@@ -915,16 +943,17 @@ impl Application {
         let Some(submission) = self.prompt.prepare_submission() else {
             return Vec::new();
         };
+        let text = submission.text().to_string();
         let request = if (self.session.response_streaming || self.session.model_awaiting)
-            && !submission.text().trim_start().starts_with('/')
+            && !text.trim_start().starts_with('/')
         {
-            RuntimeRequest::QueueSteering {
-                text: submission.text().to_string(),
-            }
+            self.transcript.append(crate::domain::TranscriptPayload::Message {
+                role: crate::domain::MessageRole::User,
+                text: crate::domain::ExternalText::new(text.clone()),
+            });
+            RuntimeRequest::QueueSteering { text }
         } else {
-            RuntimeRequest::SubmitInput {
-                text: submission.text().to_string(),
-            }
+            RuntimeRequest::SubmitInput { text }
         };
         self.interaction.prompt_delivery_pending = true;
         vec![AppEffect::Runtime {
@@ -938,21 +967,33 @@ impl Application {
         if !model_busy || self.interaction.prompt_delivery_pending {
             return Vec::new();
         }
+
         if let Some(submission) = self.prompt.prepare_submission() {
+            self.transcript.append(crate::domain::TranscriptPayload::Event(
+                crate::domain::ExternalText::new("Steering...".to_string()),
+            ));
             self.interaction.prompt_delivery_pending = true;
+            let text = submission.text().to_string();
+            self.transcript.append(crate::domain::TranscriptPayload::Message {
+                role: crate::domain::MessageRole::User,
+                text: crate::domain::ExternalText::new(text.clone()),
+            });
             vec![AppEffect::Runtime {
-                request: RuntimeRequest::ApplySteering {
-                    text: submission.text().to_string(),
-                },
+                request: RuntimeRequest::ApplySteering { text },
                 completion: DeliveryCompletion::Prompt(submission.token()),
             }]
-        } else {
+        } else if self.session.queued_steering.is_some() {
+            // No new steering text provided, but steering is already queued.
+            // Interrupt to apply the already queued steering immediately.
             vec![AppEffect::Runtime {
                 request: RuntimeRequest::ApplySteering {
                     text: String::new(),
                 },
                 completion: DeliveryCompletion::None,
             }]
+        } else {
+            // No text queued and no new text provided. This is a pure cancellation request.
+            self.handle_interrupt_key()
         }
     }
 
@@ -963,6 +1004,10 @@ impl Application {
             return Vec::new();
         }
         if self.session.response_streaming && !self.interaction.prompt_delivery_pending {
+            self.transcript.append(crate::domain::TranscriptPayload::Event(
+                crate::domain::ExternalText::new("Cancelling...".to_string()),
+            ));
+            
             if self.interaction.exit_armed {
                 self.interaction.exit_armed = false;
                 return vec![AppEffect::Runtime {
@@ -1000,12 +1045,7 @@ impl Application {
         }
     }
 
-    fn record_transcript_error(&mut self, error: TranscriptError) {
-        self.set_notice(
-            format!("runtime transcript protocol violation: {error}"),
-            NoticeSeverity::Error,
-        );
-    }
+
 
     fn set_notice(&mut self, text: impl Into<String>, severity: NoticeSeverity) {
         self.notice = Some(Notice {
@@ -1072,11 +1112,11 @@ mod tests {
     }
 
     #[test]
-    fn invalid_stream_order_is_visible_and_does_not_synthesize_content() {
+    fn invalid_stream_order_is_handled_gracefully() {
         let mut app = Application::import(initial()).unwrap();
         app.apply_domain_event(DomainEvent::AssistantTextDelta(ExternalText::new("orphan")));
         assert!(app.notice().is_some());
-        assert!(app.transcript.entries().next().is_none());
+        assert_eq!(app.transcript.entries().count(), 0);
     }
 
     #[test]

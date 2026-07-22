@@ -465,6 +465,8 @@ pub(crate) struct SessionState {
     pub(crate) context_usage: Option<ContextUsage>,
     /// Whether root agentic work is active.
     pub(crate) agentic_loop_working: bool,
+    /// Whether compaction work is active.
+    pub(crate) compaction_working: bool,
     /// Steering text acknowledged by the runtime.
     pub(crate) queued_steering: Option<ExternalText>,
     /// Subagent summaries keyed by stable ID.
@@ -510,6 +512,7 @@ impl SessionState {
             last_ttft_ms: initial.last_ttft_ms,
             context_usage: None,
             agentic_loop_working: false,
+            compaction_working: false,
             queued_steering: initial.queued_steering.take(),
             agents,
             activities,

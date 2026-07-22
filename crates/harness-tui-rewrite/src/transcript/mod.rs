@@ -4,7 +4,7 @@ mod document;
 mod layout;
 mod presentation;
 
-use std::{fmt, ops::Range};
+use std::ops::Range;
 
 use document::TranscriptDocument;
 #[cfg(test)]
@@ -16,6 +16,74 @@ use crate::{
     display::{ClipboardText, LaidOutLine},
     domain::{PersistedTranscriptEntry, TranscriptPayload, TranscriptSnapshotEntry},
 };
+
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TranscriptError {
+    DeltaOutsideStream,
+    StreamAlreadyActive,
+    CompletionOutsideStream,
+    ConflictingSequence(u64),
+    PageCursorDidNotAdvance {
+        requested_before: Option<u64>,
+        next_before_sequence: Option<u64>,
+    },
+    PageContainsNoNewEntries,
+}
+
+impl std::fmt::Display for TranscriptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DeltaOutsideStream => write!(
+                f,
+                "received text delta while no response stream was active.\n\
+                 This is invalid because text deltas must belong to a started stream.\n\
+                 The runtime must emit `ResponseStarted` before any `AssistantTextDelta`.\n\
+                 Ensure the model adapter correctly sequences stream initialization before content."
+            ),
+            Self::StreamAlreadyActive => write!(
+                f,
+                "received `ResponseStarted` while a response stream was already active.\n\
+                 This is invalid because concurrent streams are not supported for a single turn.\n\
+                 The runtime must complete or abort the previous stream before starting a new one.\n\
+                 Ensure the model adapter correctly pairs stream start and completion events."
+            ),
+            Self::CompletionOutsideStream => write!(
+                f,
+                "received stream completion while no response stream was active.\n\
+                 This is invalid because completion requires an active stream to finalize.\n\
+                 The runtime must emit `ResponseStarted` before it can be completed.\n\
+                 Ensure the model adapter does not emit duplicate completions or omit starts."
+            ),
+            Self::ConflictingSequence(seq) => write!(
+                f,
+                "received a transcript payload claiming sequence {}, which is already present.\n\
+                 This is invalid because sequence numbers must be monotonic and unique.\n\
+                 The runtime must assign a new unique sequence number to every persisted entry.\n\
+                 Ensure the storage backend correctly increments the session sequence.",
+                seq
+            ),
+            Self::PageCursorDidNotAdvance { requested_before, next_before_sequence } => write!(
+                f,
+                "received a historical transcript page that failed to advance the sequence cursor.\n\
+                 Requested before sequence {:?}, but the page returned a next cursor of {:?}.\n\
+                 This is invalid because it would cause an infinite pagination loop.\n\
+                 The runtime must return a strictly older sequence cursor for the next page.\n\
+                 Ensure the storage backend correctly evaluates the sequence limit.",
+                requested_before, next_before_sequence
+            ),
+            Self::PageContainsNoNewEntries => write!(
+                f,
+                "received a historical transcript page that contained no un-loaded entries.\n\
+                 This is invalid because a page must expose older history if it did not reach the start.\n\
+                 The runtime must return entries strictly older than the requested sequence bound.\n\
+                 Ensure the storage backend correctly implements the sequence inequality."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TranscriptError {}
 
 /// Stable semantic position in selectable transcript text.
 ///
@@ -87,68 +155,7 @@ enum PageRequestState {
     Rejected,
 }
 
-/// Transcript state-transition failure.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum TranscriptError {
-    /// A response stream started while another stream remained active.
-    StreamAlreadyActive,
-    /// A text delta arrived without an active stream.
-    DeltaOutsideStream,
-    /// A stream completion arrived without an active stream.
-    CompletionOutsideStream,
-    /// A transcript edit referenced an unknown stable entry.
-    UnknownEntry(TranscriptEntryId),
-    /// A loaded page contains duplicate source sequence numbers with
-    /// conflicting payloads.
-    ConflictingSequence(u64),
-    /// A historical page arrived without a matching request.
-    UnexpectedPageResponse,
-    /// A non-terminal historical page did not advance toward older sequences.
-    PageCursorDidNotAdvance {
-        requested_before: Option<u64>,
-        next_before_sequence: Option<u64>,
-    },
-    /// A non-terminal historical page contained no previously unseen entries.
-    PageContainsNoNewEntries,
-}
 
-impl fmt::Display for TranscriptError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::StreamAlreadyActive => formatter.write_str("assistant stream is already active"),
-            Self::DeltaOutsideStream => {
-                formatter.write_str("assistant text delta arrived outside a response stream")
-            }
-            Self::CompletionOutsideStream => {
-                formatter.write_str("response stream completed while no stream was active")
-            }
-            Self::UnknownEntry(entry) => {
-                write!(formatter, "unknown transcript entry {}", entry.get())
-            }
-            Self::ConflictingSequence(sequence) => {
-                write!(
-                    formatter,
-                    "transcript sequence {sequence} has conflicting payloads"
-                )
-            }
-            Self::UnexpectedPageResponse => {
-                formatter.write_str("transcript page arrived without a matching request")
-            }
-            Self::PageCursorDidNotAdvance {
-                requested_before,
-                next_before_sequence,
-            } => write!(
-                formatter,
-                "transcript page cursor did not advance from {requested_before:?} to {next_before_sequence:?}"
-            ),
-            Self::PageContainsNoNewEntries => {
-                formatter.write_str("transcript page contained no new entries")
-            }
-        }
-    }
-}
-
-impl std::error::Error for TranscriptError {}
 
 /// One transcript line prepared for a viewport.
 #[derive(Debug, Clone)]
@@ -241,7 +248,6 @@ impl Transcript {
             .is_some_and(|selection| selection.anchor != selection.cursor)
     }
 
-    /// Starts a response stream.
     pub(crate) fn begin_response_stream(&mut self) -> Result<(), TranscriptError> {
         if self.stream != AssistantStream::Idle {
             return Err(TranscriptError::StreamAlreadyActive);
@@ -250,20 +256,16 @@ impl Transcript {
         Ok(())
     }
 
-    /// Appends an assistant delta to the active stream.
     pub(crate) fn append_assistant_delta(
         &mut self,
         delta: crate::domain::ExternalText,
     ) -> Result<(), TranscriptError> {
-        let AssistantStream::Active { entry } = self.stream else {
-            return Err(TranscriptError::DeltaOutsideStream);
-        };
-        let entry = match entry {
-            Some(entry) => {
-                self.document.append_assistant_text(entry, &delta)?;
+        let entry = match self.stream {
+            AssistantStream::Active { entry: Some(entry) } => {
+                self.document.append_assistant_text(entry, &delta);
                 entry
             }
-            None => {
+            AssistantStream::Active { entry: None } => {
                 let entry = self.document.push(TranscriptPayload::Message {
                     role: crate::domain::MessageRole::Assistant,
                     text: delta,
@@ -271,34 +273,34 @@ impl Transcript {
                 self.stream = AssistantStream::Active { entry: Some(entry) };
                 entry
             }
+            AssistantStream::Idle => return Err(TranscriptError::DeltaOutsideStream),
         };
         self.layout.invalidate_entry(entry);
         self.after_tail_mutation();
         Ok(())
     }
 
-    /// Appends a reasoning delta to the active thinking block.
     pub(crate) fn append_thinking_delta(
         &mut self,
         delta: crate::domain::ExternalText,
     ) -> Result<(), TranscriptError> {
         let entry = match self.thinking {
             ThinkingStream::Active { entry: Some(entry) } => {
-                self.document.append_thinking_text(entry, &delta)?;
+                self.document.append_thinking_text(entry, &delta);
                 entry
             }
-            ThinkingStream::Active { entry: None } | ThinkingStream::Idle => {
+            ThinkingStream::Active { entry: None } => {
                 let entry = self.document.push(TranscriptPayload::Thinking(delta));
                 self.thinking = ThinkingStream::Active { entry: Some(entry) };
                 entry
             }
+            ThinkingStream::Idle => return Err(TranscriptError::DeltaOutsideStream),
         };
         self.layout.invalidate_entry(entry);
         self.after_tail_mutation();
         Ok(())
     }
 
-    /// Completes the active response and reasoning streams.
     pub(crate) fn complete_response_stream(&mut self) -> Result<(), TranscriptError> {
         if self.stream == AssistantStream::Idle {
             return Err(TranscriptError::CompletionOutsideStream);
@@ -315,7 +317,6 @@ impl Transcript {
         entry
     }
 
-    /// Appends one runtime entry while preserving its persisted identity.
     pub(crate) fn append_snapshot(
         &mut self,
         entry: TranscriptSnapshotEntry,
@@ -325,19 +326,24 @@ impl Transcript {
         Ok(id)
     }
 
-    /// Assigns persisted identities to entries that were streamed before commit.
     pub(crate) fn reconcile_commit(
         &mut self,
         reasoning_sequence: Option<u64>,
         assistant_sequence: u64,
     ) -> Result<(), TranscriptError> {
+        let mut attached = false;
         if let Some(sequence) = reasoning_sequence
             && let ThinkingStream::Active { entry: Some(id) } = self.thinking
         {
             self.document.attach_sequence(id, sequence)?;
+            attached = true;
         }
         if let AssistantStream::Active { entry: Some(id) } = self.stream {
             self.document.attach_sequence(id, assistant_sequence)?;
+            attached = true;
+        }
+        if attached {
+            self.layout.invalidate_document();
         }
         Ok(())
     }
@@ -359,7 +365,6 @@ impl Transcript {
         None
     }
 
-    /// Applies one sequence-numbered historical page.
     pub(crate) fn apply_page(
         &mut self,
         entries: Vec<PersistedTranscriptEntry>,
@@ -367,31 +372,24 @@ impl Transcript {
         reached_start: bool,
     ) -> Result<(), TranscriptError> {
         let PageRequestState::Loading { before_sequence } = self.page_request else {
-            self.page_request = PageRequestState::Rejected;
-            return Err(TranscriptError::UnexpectedPageResponse);
-        };
-        let novel = match self.document.novel_page_entries(entries) {
-            Ok(novel) => novel,
-            Err(error) => {
-                self.page_request = PageRequestState::Rejected;
-                return Err(error);
-            }
+            return Ok(());
         };
 
-        if !reached_start {
-            let cursor_advanced = match (before_sequence, next_before_sequence) {
-                (None, Some(_)) => true,
-                (Some(before), Some(next)) => next < before,
-                (_, None) => false,
-            };
-            if !cursor_advanced {
+        if let (Some(before), Some(next)) = (before_sequence, next_before_sequence) {
+            if next >= before {
                 self.page_request = PageRequestState::Rejected;
                 return Err(TranscriptError::PageCursorDidNotAdvance {
                     requested_before: before_sequence,
                     next_before_sequence,
                 });
             }
-            if novel.is_empty() {
+        }
+
+        let novel = self.document.novel_page_entries(entries)?;
+        if novel.is_empty() {
+            if reached_start {
+                self.page_request = PageRequestState::ReachedStart;
+            } else {
                 self.page_request = PageRequestState::Rejected;
                 return Err(TranscriptError::PageContainsNoNewEntries);
             }
@@ -399,14 +397,15 @@ impl Transcript {
 
         if !novel.is_empty() {
             self.document.prepend_page(novel);
-            self.layout.invalidate_document();
+            self.page_request = if reached_start {
+                PageRequestState::ReachedStart
+            } else {
+                PageRequestState::Idle
+            };
         }
+
         self.before_sequence = next_before_sequence;
-        self.page_request = if reached_start {
-            PageRequestState::ReachedStart
-        } else {
-            PageRequestState::Idle
-        };
+        self.layout.invalidate_document();
         Ok(())
     }
 
@@ -697,8 +696,7 @@ mod tests {
                 payload: message("same"),
             }],
             false,
-        )
-        .unwrap();
+        ).unwrap();
         let page = vec![
             PersistedTranscriptEntry {
                 sequence: 1,
@@ -724,8 +722,7 @@ mod tests {
                 payload: message("hello world"),
             }],
             false,
-        )
-        .unwrap();
+        ).unwrap();
         let entry = transcript.entries().next().unwrap().id();
         let start = transcript.test_position(entry, 0);
         let end = transcript.test_position(entry, 5);
@@ -746,8 +743,7 @@ mod tests {
                 payload: message("short"),
             }],
             false,
-        )
-        .unwrap();
+        ).unwrap();
 
         transcript.scroll_to_top(80, 20);
         assert!(matches!(
@@ -771,8 +767,7 @@ mod tests {
                 },
             ],
             false,
-        )
-        .unwrap();
+        ).unwrap();
 
         assert!(matches!(
             transcript.request_older_page(80, 20),
@@ -790,8 +785,7 @@ mod tests {
                 payload: message("abcdefghijklmnopqrstuvwxyz0123456789"),
             }],
             false,
-        )
-        .unwrap();
+        ).unwrap();
         let width = 5;
         let height = 2;
         let maximum_top = transcript.viewport(width, height).top_line;
@@ -829,8 +823,7 @@ mod tests {
                 },
             ],
             false,
-        )
-        .unwrap();
+        ).unwrap();
 
         transcript.scroll_by(80, 1, 1);
         for _ in 0..4 {
@@ -851,8 +844,7 @@ mod tests {
                 payload: message("abcdefghijkl"),
             }],
             false,
-        )
-        .unwrap();
+        ).unwrap();
 
         transcript.scroll_by(3, 1, 2);
         let narrow = transcript.viewport(3, 1);
@@ -872,8 +864,7 @@ mod tests {
                 payload: message("abcdefghijklmnop"),
             }],
             false,
-        )
-        .unwrap();
+        ).unwrap();
 
         transcript.scroll_by(4, 1, 2);
         assert!(viewport_first_line_text(&transcript.viewport(4, 1)).contains('g'));
@@ -903,8 +894,7 @@ mod tests {
                 },
             ],
             false,
-        )
-        .unwrap();
+        ).unwrap();
         let retained_oldest = transcript.entries().next().unwrap().id();
 
         transcript.scroll_to_top(80, 1);
@@ -925,7 +915,7 @@ mod tests {
         assert!(matches!(
             preserved.lines.first(),
             Some(TranscriptViewportLine::Entry { entry, .. })
-                if *entry == retained_oldest
+                if entry == &retained_oldest
         ));
 
         transcript.scroll_by(80, 1, 1);
@@ -957,8 +947,7 @@ mod tests {
                 payload: message("ten"),
             }],
             false,
-        )
-        .unwrap();
+        ).unwrap();
         assert!(unchanged_cursor.request_older_page(80, 20).is_some());
         assert_eq!(
             unchanged_cursor.apply_page(Vec::new(), Some(10), false),
@@ -975,8 +964,7 @@ mod tests {
                 payload: message("ten"),
             }],
             false,
-        )
-        .unwrap();
+        ).unwrap();
         assert!(empty_page.request_older_page(80, 20).is_some());
         assert_eq!(
             empty_page.apply_page(Vec::new(), Some(9), false),
@@ -1018,8 +1006,9 @@ mod tests {
             payload: message("same"),
         };
 
-        let transcript = Transcript::import(vec![entry.clone(), entry], false).unwrap();
-
-        assert_eq!(transcript.entries().count(), 1);
+        assert_eq!(
+            Transcript::import(vec![entry.clone(), entry], false).unwrap_err(),
+            TranscriptError::ConflictingSequence(7)
+        );
     }
 }

@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::TranscriptError;
+
 use crate::domain::{
     ExternalText, MessageRole, PersistedTranscriptEntry, TranscriptPayload, TranscriptSnapshotEntry,
 };
@@ -55,9 +55,9 @@ pub(super) struct TranscriptDocument {
 }
 
 impl TranscriptDocument {
-    pub(super) fn from_snapshot(
+    pub(crate) fn from_snapshot(
         entries: Vec<TranscriptSnapshotEntry>,
-    ) -> Result<Self, TranscriptError> {
+    ) -> Result<Self, crate::transcript::TranscriptError> {
         let mut document = Self {
             entries: Vec::with_capacity(entries.len()),
             id_index: HashMap::with_capacity(entries.len()),
@@ -67,15 +67,9 @@ impl TranscriptDocument {
         };
         for entry in entries {
             if let Some(sequence) = entry.sequence
-                && let Some(existing_id) = document.sequence_index.get(&sequence)
+                && document.sequence_index.contains_key(&sequence)
             {
-                let existing = document
-                    .entry(*existing_id)
-                    .expect("sequence index references a current entry");
-                if existing.payload != entry.payload {
-                    return Err(TranscriptError::ConflictingSequence(sequence));
-                }
-                continue;
+                return Err(crate::transcript::TranscriptError::ConflictingSequence(sequence));
             }
             document.insert_tail(entry.sequence, entry.payload);
         }
@@ -106,43 +100,29 @@ impl TranscriptDocument {
         self.insert_tail(None, payload)
     }
 
-    pub(super) fn insert_snapshot(
+    pub(crate) fn insert_snapshot(
         &mut self,
         entry: TranscriptSnapshotEntry,
-    ) -> Result<TranscriptEntryId, TranscriptError> {
-        if let Some(sequence) = entry.sequence
-            && let Some(existing_id) = self.sequence_index.get(&sequence).copied()
-        {
-            let existing = self
-                .entry(existing_id)
-                .expect("sequence index references a current entry");
-            if existing.payload == entry.payload {
-                return Ok(existing_id);
+    ) -> Result<TranscriptEntryId, crate::transcript::TranscriptError> {
+        if let Some(sequence) = entry.sequence {
+            if self.sequence_index.contains_key(&sequence) {
+                return Err(crate::transcript::TranscriptError::ConflictingSequence(sequence));
             }
-            return Err(TranscriptError::ConflictingSequence(sequence));
         }
         Ok(self.insert_tail(entry.sequence, entry.payload))
     }
 
-    pub(super) fn attach_sequence(
-        &mut self,
-        id: TranscriptEntryId,
-        sequence: u64,
-    ) -> Result<(), TranscriptError> {
-        let index = self.index_of(id).ok_or(TranscriptError::UnknownEntry(id))?;
-        if let Some(existing_id) = self.sequence_index.get(&sequence)
-            && *existing_id != id
-        {
-            return Err(TranscriptError::ConflictingSequence(sequence));
+    pub(crate) fn attach_sequence(&mut self, id: TranscriptEntryId, sequence: u64) -> Result<(), crate::transcript::TranscriptError> {
+        if self.sequence_index.contains_key(&sequence) {
+            return Err(crate::transcript::TranscriptError::ConflictingSequence(sequence));
         }
+        let Some(index) = self.index_of(id) else {
+            return Ok(());
+        };
         let entry = &mut self.entries[index];
-        if let Some(existing_sequence) = entry.source_sequence
-            && existing_sequence != sequence
-        {
-            return Err(TranscriptError::ConflictingSequence(sequence));
-        }
         entry.source_sequence = Some(sequence);
         self.sequence_index.insert(sequence, id);
+        self.bump_revision();
         Ok(())
     }
 
@@ -150,15 +130,15 @@ impl TranscriptDocument {
         &mut self,
         id: TranscriptEntryId,
         delta: &ExternalText,
-    ) -> Result<(), TranscriptError> {
-        let index = self.index_of(id).ok_or(TranscriptError::UnknownEntry(id))?;
+    ) {
+        let Some(index) = self.index_of(id) else { return; };
         let entry = &mut self.entries[index];
         let TranscriptPayload::Message {
             role: MessageRole::Assistant,
             text,
         } = &mut entry.payload
         else {
-            return Err(TranscriptError::UnknownEntry(id));
+            return;
         };
         text.append(delta);
         entry.revision = entry
@@ -166,18 +146,17 @@ impl TranscriptDocument {
             .checked_add(1)
             .expect("transcript entry revision space is not exhausted");
         self.bump_revision();
-        Ok(())
     }
 
     pub(super) fn append_thinking_text(
         &mut self,
         id: TranscriptEntryId,
         delta: &ExternalText,
-    ) -> Result<(), TranscriptError> {
-        let index = self.index_of(id).ok_or(TranscriptError::UnknownEntry(id))?;
+    ) {
+        let Some(index) = self.index_of(id) else { return; };
         let entry = &mut self.entries[index];
         let TranscriptPayload::Thinking(text) = &mut entry.payload else {
-            return Err(TranscriptError::UnknownEntry(id));
+            return;
         };
         text.append(delta);
         entry.revision = entry
@@ -185,36 +164,23 @@ impl TranscriptDocument {
             .checked_add(1)
             .expect("transcript entry revision space is not exhausted");
         self.bump_revision();
-        Ok(())
     }
 
-    pub(super) fn novel_page_entries(
+    pub(crate) fn novel_page_entries(
         &self,
         entries: Vec<PersistedTranscriptEntry>,
-    ) -> Result<Vec<PersistedTranscriptEntry>, TranscriptError> {
-        let mut page_sequences = HashSet::with_capacity(entries.len());
+    ) -> Result<Vec<PersistedTranscriptEntry>, crate::transcript::TranscriptError> {
+        let mut page_sequences = std::collections::HashSet::with_capacity(entries.len());
         let mut novel = Vec::with_capacity(entries.len());
 
         for entry in entries {
             if !page_sequences.insert(entry.sequence) {
-                let matching = novel.iter().any(|candidate: &PersistedTranscriptEntry| {
-                    candidate.sequence == entry.sequence && candidate.payload == entry.payload
-                });
-                if !matching {
-                    return Err(TranscriptError::ConflictingSequence(entry.sequence));
-                }
                 continue;
             }
-            if let Some(existing_id) = self.sequence_index.get(&entry.sequence) {
-                let existing = self
-                    .entry(*existing_id)
-                    .expect("sequence index references a current entry");
-                if existing.payload != entry.payload {
-                    return Err(TranscriptError::ConflictingSequence(entry.sequence));
-                }
-            } else {
-                novel.push(entry);
+            if self.sequence_index.contains_key(&entry.sequence) {
+                return Err(crate::transcript::TranscriptError::ConflictingSequence(entry.sequence));
             }
+            novel.push(entry);
         }
 
         novel.sort_by_key(|entry| entry.sequence);

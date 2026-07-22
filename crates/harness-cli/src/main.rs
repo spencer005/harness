@@ -1,6 +1,7 @@
 //! Command-line entrypoint for interactive harness sessions.
 
 mod commands;
+mod picker;
 
 use std::{
     env,
@@ -67,13 +68,13 @@ use crate::commands::{
 
 // Serializable representation of SessionPayload
 #[derive(serde::Serialize, serde::Deserialize)]
-struct SerializableRecord {
-    sequence: u64,
-    payload: SerializablePayload,
+pub(crate) struct SerializableRecord {
+    pub(crate) sequence: u64,
+    pub(crate) payload: SerializablePayload,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
-enum SerializablePayload {
+pub(crate) enum SerializablePayload {
     Metadata {
         title: String,
     },
@@ -2142,11 +2143,35 @@ async fn run_model_attempt(
                     ),
                 )]));
             }
+
+            let outcome = harness_model_api::ModelTerminalOutcome::Failed(error);
+            if is_custom_tool_compatibility_failure(&outcome) {
+                if let Some(retry) = runtime.retry_with_compatibility(turn_id, attempt_id)? {
+                    return Ok(Some(vec![
+                        RuntimeEffect::Emit(
+                            harness_runtime_api::RuntimeEvent::Failure(
+                                harness_runtime_api::RuntimeFailure {
+                                    category: harness_runtime_api::RuntimeFailureCategory::Model,
+                                    message: "Failed to connect to model".to_string(),
+                                }
+                            )
+                        ),
+                        RuntimeEffect::Emit(harness_runtime_api::RuntimeEvent::Failure(
+                            harness_runtime_api::RuntimeFailure {
+                                category: harness_runtime_api::RuntimeFailureCategory::Model,
+                                message: "The provider rejected native custom-tool history; compatibility mode will be used and the request will be retried.".to_string(),
+                            }
+                        )),
+                        retry,
+                    ]));
+                }
+            }
+
             let effects = runtime
                 .finish_model_attempt(
                     turn_id,
                     attempt_id,
-                    harness_model_api::ModelTerminalOutcome::Failed(error),
+                    outcome,
                 )
                 .await?;
             return Ok(Some(effects));
@@ -2375,11 +2400,11 @@ fn is_custom_tool_compatibility_failure(
     matches!(
         outcome,
         harness_model_api::ModelTerminalOutcome::Failed(failure)
-            if failure.kind == harness_model_api::ModelFailureKind::ProviderRejected
-                && failure.message.contains("HTTP status 400")
-                && failure
-                    .message
-                    .contains("unknown input item type: \\\"custom_tool_call\\\"")
+            if (failure.kind == harness_model_api::ModelFailureKind::ProviderRejected
+                || failure.kind == harness_model_api::ModelFailureKind::Transport
+                || failure.kind == harness_model_api::ModelFailureKind::Protocol)
+                && (failure.message.contains("HTTP status 400") || failure.message.contains("invalid_request_error"))
+                && failure.message.contains("custom_tool")
     )
 }
 
@@ -2514,8 +2539,25 @@ async fn drive_runtime_effects(
             RuntimeEffect::ExecuteTool {
                 turn_id,
                 call_id,
-                request,
+                mut request,
             } => {
+                if let harness_tool_api::ToolInput::FunctionJson(json_str) = &request.input {
+                    use sonic_rs::{JsonValueTrait, JsonContainerTrait};
+                    if let Ok(value) = sonic_rs::from_str::<sonic_rs::Value>(json_str) {
+                        let mut current = &value;
+                        while let Some(obj) = current.as_object() {
+                            if obj.len() == 1 {
+                                let (_, val) = obj.iter().next().unwrap();
+                                current = val;
+                            } else {
+                                break;
+                            }
+                        }
+                        if let Some(s) = current.as_str() {
+                            request.input = harness_tool_api::ToolInput::FunctionJson(s.to_string());
+                        }
+                    }
+                }
                 let execution_id = request.execution_id.0;
                 let output = match runtime.tool_executor() {
                     Ok(executor) => match executor.execute(request).await {
@@ -2978,7 +3020,7 @@ fn resolve_session_startup(root: &Path, resume: ResumeSelection) -> CliResult<Se
             })?
         }
         ResumeSelection::SessionId(raw) => resolve_session_id(raw)?,
-        ResumeSelection::Pick => latest_session_id(root)?,
+        ResumeSelection::Pick => picker::pick_session_tui(root)?,
     };
 
     let records = if is_new {

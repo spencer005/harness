@@ -1,0 +1,13 @@
+[package]
+name = "harness-session-picker"
+edition = "2024"
+
+[dependencies]
+harness-session-store.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+fuzzy-matcher = "0.3.7"
+chrono = "0.4"
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+harness-tui-rewrite.workspace = true

@@ -696,27 +696,6 @@ fn validate_anchor(path: &str, lines: &[&str], anchor: LineAnchor) -> Result<(),
             lines.len()
         ));
     }
-    let current_hash = line_hash(lines[anchor.line_number - 1]);
-
-    // Compare dictionary *words* rather than raw hash values so that
-    // modulo wrapping (dictionary < 256 entries) doesn't produce false
-    // "stale anchor" errors.  Multiple hash values may map to the same
-    // dictionary word: we only care that the user supplied the correct
-    // *character* from the inspect output.
-    let current_word = edit_anchor_word(current_hash);
-    let anchor_word = edit_anchor_word(anchor.hash);
-    if current_word != anchor_word {
-        let rendered = anchor_word.or(current_word).map_or_else(
-            || {
-                "edit anchor vocabulary is missing an entry for the stale anchor".to_string()
-            },
-            |w| {
-                let c = w.chars().next().unwrap_or('?');
-                format!("{}{c} ", anchor.line_number)
-            },
-        );
-        return Err(format!("{path} stale anchor {rendered}"));
-    }
     Ok(())
 }
 
