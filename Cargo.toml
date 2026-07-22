@@ -15,7 +15,7 @@ members = [
     "crates/harness-session-service",
     "crates/harness-tool-execution",
     "crates/harness-cli",
-    "crates/token_inspector",
+    "crates/token_inspector", "crates/harness-session-picker",
 ]
 resolver = "2"
 
@@ -47,7 +47,6 @@ harness-session-store = { path = "crates/harness-session-store" }
 harness-conversation-runtime = { path = "crates/harness-conversation-runtime" }
 harness-provider = { path = "crates/harness-provider" }
 harness-responses-transport = { path = "crates/harness-responses-transport" }
-harness-session-service = { path = "crates/harness-session-service" }
 harness-tool-execution = { path = "crates/harness-tool-execution" }
 
 
@@ -66,12 +65,10 @@ hyper-util = { version = "0.1", default-features = false, features = ["client-le
 libc = "0.2"
 ratatui = "0.29"
 object = { version = "0.36", default-features = false, features = ["elf", "read_core", "std"] }
-postcard = { version = "1", features = ["alloc"] }
 criterion = "0.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sonic-rs = "0.5.8"
-syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
 thiserror = "2"
 tiktoken-rs = "0.12.0"
 tokio = { version = "1", features = ["fs", "macros", "net", "rt", "sync", "time"] }
@@ -79,4 +76,3 @@ tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
 unicode-segmentation = "1"
 unicode-width = "0.2"
 url = "2"
-zstd = "0.13"

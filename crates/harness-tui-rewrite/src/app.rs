@@ -969,6 +969,7 @@ impl Application {
         }
 
         if let Some(submission) = self.prompt.prepare_submission() {
+            // Typed text present: apply it as steering and interrupt.
             self.transcript.append(crate::domain::TranscriptPayload::Event(
                 crate::domain::ExternalText::new("Steering...".to_string()),
             ));
@@ -983,8 +984,7 @@ impl Application {
                 completion: DeliveryCompletion::Prompt(submission.token()),
             }]
         } else if self.session.queued_steering.is_some() {
-            // No new steering text provided, but steering is already queued.
-            // Interrupt to apply the already queued steering immediately.
+            // No new text but queued steering exists — flush it immediately.
             vec![AppEffect::Runtime {
                 request: RuntimeRequest::ApplySteering {
                     text: String::new(),
@@ -992,8 +992,22 @@ impl Application {
                 completion: DeliveryCompletion::None,
             }]
         } else {
-            // No text queued and no new text provided. This is a pure cancellation request.
-            self.handle_interrupt_key()
+            // No text at all. Esc means: stop the response immediately.
+            // Unlike Ctrl-C this does NOT use the exit_armed state machine.
+            self.transcript.append(crate::domain::TranscriptPayload::Event(
+                crate::domain::ExternalText::new("Stopping...".to_string()),
+            ));
+            if self.session.response_streaming {
+                vec![AppEffect::Runtime {
+                    request: RuntimeRequest::AbortResponse,
+                    completion: DeliveryCompletion::None,
+                }]
+            } else {
+                vec![AppEffect::Runtime {
+                    request: RuntimeRequest::StopRequestLoop,
+                    completion: DeliveryCompletion::None,
+                }]
+            }
         }
     }
 

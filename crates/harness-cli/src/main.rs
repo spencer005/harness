@@ -948,9 +948,18 @@ impl StreamingClient for CodexWsClient {
                         let sender = sender.clone();
                         async move {
                             let chunk = match event {
-                                ResponsesStreamEvent::Frame(value) => sonic_rs::to_vec(&value)
-                                    .map(StreamChunk::Bytes)
-                                    .map_err(|error| StreamError::Transport(error.to_string())),
+                                ResponsesStreamEvent::Frame(value) => {
+                                    match sonic_rs::to_vec(&value) {
+                                        Ok(mut bytes) => {
+                                            let mut sse_bytes = Vec::with_capacity(bytes.len() + 8);
+                                            sse_bytes.extend_from_slice(b"data: ");
+                                            sse_bytes.append(&mut bytes);
+                                            sse_bytes.extend_from_slice(b"\n\n");
+                                            Ok(StreamChunk::Bytes(sse_bytes))
+                                        }
+                                        Err(error) => Err(StreamError::Transport(error.to_string())),
+                                    }
+                                }
                                 ResponsesStreamEvent::Completed { .. } => Ok(StreamChunk::End),
                                 ResponsesStreamEvent::ServerReasoningIncluded(_)
                                 | ResponsesStreamEvent::ModelsEtag(_)

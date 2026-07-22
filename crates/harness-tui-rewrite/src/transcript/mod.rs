@@ -253,6 +253,7 @@ impl Transcript {
             return Err(TranscriptError::StreamAlreadyActive);
         }
         self.stream = AssistantStream::Active { entry: None };
+        self.thinking = ThinkingStream::Active { entry: None };
         Ok(())
     }
 
