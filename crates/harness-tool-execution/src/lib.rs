@@ -50,6 +50,12 @@ impl WorkspaceRoot {
         &self,
         value: &'a str,
     ) -> Result<WorkspaceRelativePath<'a>, WorkspacePathError> {
+        let path = Path::new(value);
+        for component in path.components() {
+            if component.as_os_str() == ".git" {
+                return Err(WorkspacePathError::ProtectedPath);
+            }
+        }
         Ok(WorkspaceRelativePath { value })
     }
 }
@@ -340,4 +346,32 @@ pub enum WorkspacePathError {
     /// Path traverses or aliases the current/parent directory.
     #[error("workspace path contains traversal")]
     Traversal,
+    /// Path accesses protected directory (.git).
+    #[error("access to .git directory is protected")]
+    ProtectedPath,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relative_path_blocks_git_directory_access() {
+        let temp_dir = std::env::temp_dir();
+        let root = WorkspaceRoot::open(&temp_dir).unwrap();
+
+        assert_eq!(
+            root.relative_path(".git").unwrap_err(),
+            WorkspacePathError::ProtectedPath
+        );
+        assert_eq!(
+            root.relative_path(".git/config").unwrap_err(),
+            WorkspacePathError::ProtectedPath
+        );
+        assert_eq!(
+            root.relative_path("foo/bar/.git/HEAD").unwrap_err(),
+            WorkspacePathError::ProtectedPath
+        );
+        assert!(root.relative_path("src/git_util.rs").is_ok());
+    }
 }

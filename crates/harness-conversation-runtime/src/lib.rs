@@ -369,6 +369,7 @@ pub struct ConversationRuntime {
     compatibility_mode: bool,
 
     next_turn_id: u64,
+    active_attempt_response_id: Option<String>,
 }
 
 impl ConversationRuntime {
@@ -401,6 +402,7 @@ impl ConversationRuntime {
             compaction: None,
             next_compaction_id: 1,
             compatibility_mode: false,
+            active_attempt_response_id: None,
         }
     }
 
@@ -422,6 +424,24 @@ impl ConversationRuntime {
         Ok(())
     }
 
+    /// Re-binds runtime session store and reloads persisted history for session switching.
+    pub async fn switch_session(
+        &mut self,
+        session_id: harness_session_store::SessionId,
+    ) -> Result<(), RuntimeError> {
+        self.configuration.session_id = session_id.clone();
+        let history = self.load_persisted_history()?;
+        self.restore_history(history)?;
+        let writer = self
+            .configuration
+            .ports
+            .session_store
+            .writer(session_id)
+            .await?;
+        self.writer = Some(RuntimeSessionWriter::new(writer));
+        Ok(())
+    }
+
     fn load_persisted_history(&self) -> Result<Vec<SessionPayload>, RuntimeError> {
         let reader = self.configuration.ports.session_store.reader()?;
         let mut before_sequence = None;
@@ -440,8 +460,16 @@ impl ConversationRuntime {
                 Err(error) => return Err(error.into()),
             };
             let next_before_sequence = page.next_before;
-            records.extend(page.entries.into_iter().map(|record| record.payload));
-            if page.reached_start {
+            let mut hit_checkpoint = false;
+            for entry in page.entries {
+                let is_compaction = matches!(&entry.payload, SessionPayload::CompactionCheckpoint { .. });
+                records.push(entry.payload);
+                if is_compaction {
+                    hit_checkpoint = true;
+                    break;
+                }
+            }
+            if page.reached_start || hit_checkpoint {
                 break;
             }
             let Some(next_before_sequence) = next_before_sequence else {
@@ -484,7 +512,31 @@ impl ConversationRuntime {
                 SessionPayload::Metadata(_)
                 | SessionPayload::ProviderBinding(_)
                 | SessionPayload::CompactionCheckpoint { .. }
+                | SessionPayload::ModelResponseMetadata { .. }
                 | SessionPayload::SessionClosed => {}
+                SessionPayload::Goal { instruction, state } => {
+                    match state.as_str() {
+                        "active" => {
+                            self.persist_state = PersistState::Active(PersistTask {
+                                instruction: instruction.clone(),
+                                completion_policy: CompletionPolicy::ModelMayComplete,
+                            });
+                        }
+                        "paused" => {
+                            self.persist_state = PersistState::Paused(PersistTask {
+                                instruction: instruction.clone(),
+                                completion_policy: CompletionPolicy::ModelMayComplete,
+                            });
+                        }
+                        "completed" | "cleared" => {
+                            self.persist_state = PersistState::Completed(PersistTask {
+                                instruction: instruction.clone(),
+                                completion_policy: CompletionPolicy::ModelMayComplete,
+                            });
+                        }
+                        _ => {}
+                    }
+                }
             }
             if let SessionPayload::ModelAttemptStarted { attempt_id, .. } = payload {
                 highest_attempt_id = highest_attempt_id.max(*attempt_id);
@@ -659,15 +711,15 @@ impl ConversationRuntime {
         Ok(receipt)
     }
 
-    /// Persists attempt identity before building and scheduling its model request.
-    pub async fn start_model_request(&mut self) -> Result<RuntimeEffect, RuntimeError> {
+    /// Builds the next request and schedules compaction first when its estimated
+    /// input reaches the selected model's compaction threshold.
+    pub async fn start_model_request(&mut self) -> Result<Vec<RuntimeEffect>, RuntimeError> {
         let turn_id = match &self.phase {
             ConversationPhase::PreparingAttempt { turn_id } => *turn_id,
             _ => return Err(RuntimeError::InvalidPhase),
         };
 
         let attempt_id = self.next_attempt_id;
-        self.next_attempt_id = attempt_id.checked_add(1).ok_or(RuntimeError::IdExhausted)?;
         let next_revision = self
             .canonical_revision
             .checked_add(1)
@@ -704,6 +756,27 @@ impl ConversationRuntime {
             return Err(RuntimeError::RequestRevisionMismatch);
         }
 
+        let exceeds_compaction_threshold = request.context_usage.is_some_and(|usage| {
+            usage.estimated_input_tokens >= usage.compact_at_tokens
+                || usage.estimated_input_tokens > usage.max_input_tokens
+        });
+        let has_uncompacted_history = self
+            .canonical_history
+            .iter()
+            .any(|payload| !matches!(payload, SessionPayload::CompactionCheckpoint { .. }));
+        if exceeds_compaction_threshold && has_uncompacted_history {
+            self.phase = ConversationPhase::Idle;
+            self.begin_compaction(
+                "Summarize the conversation for continuation, preserving requirements, decisions, current state, and unfinished work."
+                    .to_owned(),
+            )?;
+            return Ok(vec![
+                RuntimeEffect::Emit(RuntimeEvent::CompactionStarted),
+                self.start_compaction_request()?,
+            ]);
+        }
+
+        self.next_attempt_id = attempt_id.checked_add(1).ok_or(RuntimeError::IdExhausted)?;
         match self
             .writer
             .as_mut()
@@ -735,11 +808,11 @@ impl ConversationRuntime {
             turn_id,
             attempt_id: attempt_id.0,
         };
-        Ok(RuntimeEffect::StartModel {
+        Ok(vec![RuntimeEffect::StartModel {
             turn_id,
             attempt: Arc::new(ModelAttempt::initial(request, attempt_id)),
             route: self.configuration.ports.model_route.clone(),
-        })
+        }])
     }
 
     /// Verifies that model events belong to the active attempt.
@@ -836,16 +909,14 @@ impl ConversationRuntime {
             return match event {
                 ModelEvent::Started => {
                     if self.model_started {
-                        return Err(RuntimeError::DuplicateModelStart);
+                        return Ok(Vec::new());
                     }
                     self.model_started = true;
-                    Ok(vec![RuntimeEffect::Emit(RuntimeEvent::ResponseStarted)])
+                    Ok(Vec::new())
                 }
                 ModelEvent::AssistantTextDelta(delta) => {
                     self.record_compaction_delta(&delta)?;
-                    Ok(vec![RuntimeEffect::Emit(RuntimeEvent::AssistantTextDelta(
-                        delta,
-                    ))])
+                    Ok(Vec::new())
                 }
                 ModelEvent::Terminal(outcome) => {
                     let started = self.model_started;
@@ -873,19 +944,19 @@ impl ConversationRuntime {
                                 .and_then(compaction::CompactionCoordinator::validated_summary)
                                 .ok_or(RuntimeError::CompactionInvalidResult)?
                                 .to_owned();
-                            Ok(vec![
-                                RuntimeEffect::Emit(RuntimeEvent::ResponseFinished(
-                                    ModelTerminalOutcome::Completed(completion),
-                                )),
-                                RuntimeEffect::CommitCompaction {
-                                    compaction_id,
-                                    summary,
-                                },
-                            ])
+                            Ok(vec![RuntimeEffect::CommitCompaction {
+                                compaction_id,
+                                summary,
+                            }])
                         }
                         other => Ok(vec![
                             RuntimeEffect::Emit(RuntimeEvent::AgenticLoopCompleted),
-                            RuntimeEffect::Emit(RuntimeEvent::ResponseFinished(other)),
+                            RuntimeEffect::Emit(RuntimeEvent::Failure(
+                                harness_runtime_api::RuntimeFailure {
+                                    category: harness_runtime_api::RuntimeFailureCategory::Model,
+                                    message: format!("compaction failed: {other:?}"),
+                                },
+                            )),
                         ]),
                     }
                 }
@@ -903,7 +974,7 @@ impl ConversationRuntime {
             ModelEvent::Started => {
                 self.ensure_model_attempt(turn_id, attempt_id)?;
                 if self.model_started {
-                    return Err(RuntimeError::DuplicateModelStart);
+                    return Ok(Vec::new());
                 }
                 self.model_started = true;
                 Ok(vec![RuntimeEffect::Emit(RuntimeEvent::ResponseStarted)])
@@ -983,7 +1054,14 @@ impl ConversationRuntime {
                 self.pending_tool_calls.push(call);
                 Ok(vec![transcript])
             }
-            ModelEvent::Metadata(_) | ModelEvent::Usage(_) => {
+            ModelEvent::Metadata(metadata) => {
+                self.ensure_model_attempt(turn_id, attempt_id)?;
+                if let Some(resp_id) = metadata.response_id {
+                    self.active_attempt_response_id = Some(resp_id);
+                }
+                Ok(Vec::new())
+            }
+            ModelEvent::Usage(_) => {
                 self.ensure_model_attempt(turn_id, attempt_id)?;
                 Ok(Vec::new())
             }
@@ -1039,6 +1117,7 @@ impl ConversationRuntime {
                 | SessionPayload::ToolCallAccepted { turn_id, .. }
                 | SessionPayload::ToolExecutionStarted { turn_id, .. }
                 | SessionPayload::ToolExecutionFinished { turn_id, .. }
+                | SessionPayload::ModelResponseMetadata { turn_id, .. }
                 | SessionPayload::TurnFinished { turn_id, .. } => Some(*turn_id),
                 _ => None,
             })
@@ -1111,6 +1190,21 @@ impl ConversationRuntime {
             turn_id,
             text: self.transient_assistant.clone(),
         });
+        if let Some(resp_id) = self.active_attempt_response_id.take() {
+            records.push(SessionPayload::ModelResponseMetadata {
+                turn_id,
+                attempt_id,
+                provider: self
+                    .configuration
+                    .ports
+                    .model_route
+                    .selection
+                    .provider
+                    .as_str()
+                    .to_string(),
+                response_id: resp_id,
+            });
+        }
         self.phase = ConversationPhase::PersistingAssistant {
             turn_id,
             attempt_id,
@@ -1249,6 +1343,8 @@ impl ConversationRuntime {
             ]);
         }
 
+        self.active_attempt_response_id = None;
+
         let next_revision = self
             .canonical_revision
             .checked_add(1)
@@ -1377,7 +1473,6 @@ impl ConversationRuntime {
             terminal_outcome: None,
         })
     }
-
     /// Applies one frontend command and returns typed effects.
     pub async fn dispatch_command(
         &mut self,
@@ -1385,10 +1480,30 @@ impl ConversationRuntime {
     ) -> Result<Vec<RuntimeEffect>, RuntimeError> {
         match command {
             RuntimeCommand::SubmitPrompt { text } => {
+                if self.phase != ConversationPhase::Idle {
+                    if self.lifecycle != RuntimeLifecycle::Ready {
+                        return Err(RuntimeError::InvalidLifecycle);
+                    }
+                    if text.is_empty() {
+                        return Err(RuntimeError::EmptyCommandText);
+                    }
+                    if !matches!(
+                        &self.phase,
+                        ConversationPhase::AwaitingModel { .. }
+                            | ConversationPhase::PreparingContinuation { .. }
+                            | ConversationPhase::Compacting { .. }
+                    ) {
+                        return Err(RuntimeError::InvalidPhase);
+                    }
+                    self.queued_steering.push(text);
+                    return Ok(vec![RuntimeEffect::Emit(RuntimeEvent::SteeringChanged(
+                        Some(self.queued_steering.join("\n")),
+                    ))]);
+                }
                 let persisted_text = text.clone();
                 let receipt = self.submit_prompt(text).await?;
                 let start_model = self.start_model_request().await?;
-                Ok(vec![
+                let mut effects = vec![
                     RuntimeEffect::Emit(RuntimeEvent::AgenticLoopStarted),
                     RuntimeEffect::Emit(RuntimeEvent::TranscriptAppended(
                         harness_runtime_api::TranscriptSnapshotEntry {
@@ -1399,8 +1514,9 @@ impl ConversationRuntime {
                             },
                         },
                     )),
-                    start_model,
-                ])
+                ];
+                effects.extend(start_model);
+                Ok(effects)
             }
             RuntimeCommand::Retry => {
                 if self.lifecycle != RuntimeLifecycle::Ready {
@@ -1577,6 +1693,27 @@ impl ConversationRuntime {
                     return Err(RuntimeError::EmptyCommandText);
                 }
                 self.enable_persist(instruction, CompletionPolicy::ModelMayComplete)?;
+                Ok(Vec::new())
+            }
+            RuntimeCommand::PauseGoal => {
+                if self.lifecycle != RuntimeLifecycle::Ready {
+                    return Err(RuntimeError::InvalidLifecycle);
+                }
+                self.pause_persist()?;
+                Ok(Vec::new())
+            }
+            RuntimeCommand::ResumeGoal => {
+                if self.lifecycle != RuntimeLifecycle::Ready {
+                    return Err(RuntimeError::InvalidLifecycle);
+                }
+                self.resume_persist()?;
+                Ok(Vec::new())
+            }
+            RuntimeCommand::ClearGoal => {
+                if self.lifecycle != RuntimeLifecycle::Ready {
+                    return Err(RuntimeError::InvalidLifecycle);
+                }
+                let _ = self.complete_persist();
                 Ok(Vec::new())
             }
             RuntimeCommand::Shutdown => {
@@ -1927,6 +2064,8 @@ impl ConversationRuntime {
                     | SessionPayload::ToolCallAccepted { .. }
                     | SessionPayload::ToolExecutionStarted { .. }
                     | SessionPayload::TurnFinished { .. }
+                    | SessionPayload::ModelResponseMetadata { .. }
+                    | SessionPayload::Goal { .. }
                     | SessionPayload::SessionClosed => return None,
                 };
                 Some(TranscriptSnapshotEntry {
@@ -2011,13 +2150,64 @@ impl ConversationRuntime {
         if request.history_revision != self.canonical_revision {
             return Err(RuntimeError::RequestRevisionMismatch);
         }
+        let new_attempt_id = self.next_attempt_id;
+        self.next_attempt_id = new_attempt_id.checked_add(1).ok_or(RuntimeError::IdExhausted)?;
+        self.phase = ConversationPhase::AwaitingModel {
+            turn_id,
+            attempt_id: new_attempt_id,
+        };
         self.compatibility_mode = true;
         self.model_started = false;
         Ok(Some(RuntimeEffect::StartModel {
             turn_id,
             attempt: Arc::new(ModelAttempt::initial(
                 request,
-                harness_model_api::ModelAttemptId(attempt_id),
+                harness_model_api::ModelAttemptId(new_attempt_id),
+            )),
+            route: self.configuration.ports.model_route.clone(),
+        }))
+    }
+
+    /// Retries the active model attempt with full input context (previous_response_id set to null/omitted).
+    pub fn retry_with_full_context(
+        &mut self,
+        turn_id: u64,
+        attempt_id: u64,
+    ) -> Result<Option<RuntimeEffect>, RuntimeError> {
+        match self.phase {
+            ConversationPhase::AwaitingModel {
+                turn_id: active_turn,
+                attempt_id: active_attempt,
+            } if active_turn == turn_id && active_attempt == attempt_id => {}
+            _ => return Err(RuntimeError::InvalidPhase),
+        }
+        // Build a request without using any previous_response_id
+        let mut request = (*self.configuration.ports.request_builder.build(
+            self.canonical_revision,
+            &self.configuration.model,
+            self.configuration.ports.model_route.generation,
+            &self.canonical_history,
+            &[],
+        )?).clone();
+        request.previous_response_id = None;
+        if request.provider_generation != self.configuration.ports.model_route.generation {
+            return Err(RuntimeError::ProviderGenerationMismatch);
+        }
+        if request.history_revision != self.canonical_revision {
+            return Err(RuntimeError::RequestRevisionMismatch);
+        }
+        let new_attempt_id = self.next_attempt_id;
+        self.next_attempt_id = new_attempt_id.checked_add(1).ok_or(RuntimeError::IdExhausted)?;
+        self.phase = ConversationPhase::AwaitingModel {
+            turn_id,
+            attempt_id: new_attempt_id,
+        };
+        self.model_started = false;
+        Ok(Some(RuntimeEffect::StartModel {
+            turn_id,
+            attempt: Arc::new(ModelAttempt::initial(
+                Arc::new(request),
+                harness_model_api::ModelAttemptId(new_attempt_id),
             )),
             route: self.configuration.ports.model_route.clone(),
         }))

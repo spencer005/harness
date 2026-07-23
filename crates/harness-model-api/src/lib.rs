@@ -71,6 +71,18 @@ impl ModelSelection {
     }
 }
 
+/// Level of support for `developer` role in place of `system`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DeveloperRoleSupport {
+    /// Disallow developer role / use standard `system` role.
+    #[default]
+    Disabled,
+    /// Support developer role (maps `system` messages to `developer`).
+    Supported,
+    /// Only allow developer role and disallow `system` role.
+    DeveloperOnly,
+}
+
 /// Capabilities exposed by a model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ModelCapabilities {
@@ -80,6 +92,12 @@ pub struct ModelCapabilities {
     pub freeform_tool_input: bool,
     /// The model supports streaming.
     pub streaming: bool,
+    /// Developer role support level.
+    pub developer_role_support: DeveloperRoleSupport,
+    /// Whether the model accepts multiple system/developer messages.
+    pub allow_multiple_system_messages: bool,
+    /// Whether responses should be stored by the provider (`store: true` vs `store: false`).
+    pub store: bool,
 }
 
 /// Context-window limits for a model.
@@ -177,12 +195,25 @@ pub enum ModelMessageRole {
     Assistant,
 }
 
+/// Locally estimated context usage for one immutable request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestContextUsage {
+    /// Tokens in the finalized provider-neutral request.
+    pub estimated_input_tokens: u64,
+    /// Maximum input accepted by the selected model.
+    pub max_input_tokens: u64,
+    /// Threshold at which compaction should run.
+    pub compact_at_tokens: u64,
+}
+
 /// Immutable semantic model request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelRequest {
     /// Semantic request identifier.
     pub request_id: ModelRequestId,
     /// Provider generation used to construct this request.
+    /// Local context estimate when the selected model has a known tokenizer.
+    pub context_usage: Option<RequestContextUsage>,
     pub provider_generation: ProviderGeneration,
     /// Exact canonical history revision used to build the request.
     pub history_revision: u64,
@@ -192,6 +223,8 @@ pub struct ModelRequest {
     pub input: Arc<[ModelInput]>,
     /// Tool definitions included in this request.
     pub tools: Arc<[ToolDefinition]>,
+    /// Optional previous response identifier for stateful response continuation.
+    pub previous_response_id: Option<String>,
 }
 
 /// Reason a model request is attempted again.

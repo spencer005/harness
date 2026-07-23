@@ -27,7 +27,8 @@ use harness_conversation_runtime::{
 };
 use harness_model_api::{
     ModelAttempt, ModelAttemptHandle, ModelFailure, ModelInput, ModelMessageRole, ModelRequest,
-    ModelRequestId, ModelSelection, ModelTransport, ProviderGeneration, ResolvedModelRoute,
+    ModelRequestId, ModelSelection, ModelTransport, ProviderGeneration, RequestContextUsage,
+    ResolvedModelRoute,
 };
 use harness_chat_completions_transport::{
     ChatStreamChunk, ChatStreamError, ChatStreamingClient, ChatTransportConfiguration,
@@ -67,7 +68,7 @@ use crate::commands::{
 };
 
 // Serializable representation of SessionPayload
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub(crate) struct SerializableRecord {
     pub(crate) sequence: u64,
     pub(crate) payload: SerializablePayload,
@@ -130,6 +131,16 @@ pub(crate) enum SerializablePayload {
     CompactionCheckpoint {
         source_revision: u64,
         summary: String,
+    },
+    ModelResponseMetadata {
+        turn_id: u64,
+        attempt_id: u64,
+        provider: String,
+        response_id: String,
+    },
+    Goal {
+        instruction: String,
+        state: String,
     },
     SessionClosed,
 }
@@ -266,6 +277,21 @@ fn to_serializable_payload(payload: &SessionPayload) -> SerializablePayload {
             source_revision: *source_revision,
             summary: summary.clone(),
         },
+        SessionPayload::ModelResponseMetadata {
+            turn_id,
+            attempt_id,
+            provider,
+            response_id,
+        } => SerializablePayload::ModelResponseMetadata {
+            turn_id: *turn_id,
+            attempt_id: *attempt_id,
+            provider: provider.clone(),
+            response_id: response_id.clone(),
+        },
+        SessionPayload::Goal { instruction, state } => SerializablePayload::Goal {
+            instruction: instruction.clone(),
+            state: state.clone(),
+        },
         SessionPayload::SessionClosed => SerializablePayload::SessionClosed,
     }
 }
@@ -372,6 +398,21 @@ fn from_serializable_payload(sp: SerializablePayload) -> SessionPayload {
         } => SessionPayload::CompactionCheckpoint {
             source_revision,
             summary,
+        },
+        SerializablePayload::ModelResponseMetadata {
+            turn_id,
+            attempt_id,
+            provider,
+            response_id,
+        } => SessionPayload::ModelResponseMetadata {
+            turn_id,
+            attempt_id,
+            provider,
+            response_id,
+        },
+        SerializablePayload::Goal { instruction, state } => SessionPayload::Goal {
+            instruction,
+            state,
         },
         SerializablePayload::SessionClosed => SessionPayload::SessionClosed,
     }
@@ -578,7 +619,97 @@ impl SessionWriter for FileSessionWriter {
 struct RealModelRequestBuilder {
     tool_registry: Arc<RwLock<ToolRegistry>>,
     tool_availability: Arc<RwLock<ToolAvailability>>,
+    provider_config: ProviderConfig,
     base_instructions: String,
+    store: bool,
+}
+
+impl RealModelRequestBuilder {
+    fn estimate_context(
+        &self,
+        selection: &ModelSelection,
+        history: &[SessionPayload],
+        steering: &[String],
+        tools: &[harness_tool_api::ToolDefinition],
+    ) -> Option<RequestContextUsage> {
+        let profile = self
+            .provider_config
+            .profile(&ProviderProfileId::new(selection.provider.as_str()))?;
+        let model = profile
+            .model_configs
+            .iter()
+            .find(|model| model.slug == selection.model)?;
+        let tokenizer = if selection.model.starts_with("gpt-5")
+            || selection.model.starts_with("gpt-4o")
+            || selection.model.starts_with("o1")
+            || selection.model.starts_with("o3")
+            || selection.model.starts_with("o4")
+        {
+            tiktoken_rs::o200k_base_singleton()
+        } else {
+            tiktoken_rs::get_bpe_from_model(selection.model.as_str()).ok()?
+        };
+        let mut tokens = 0usize;
+        let mut add = |value: &str| tokens = tokens.saturating_add(tokenizer.encode_ordinary(value).len());
+
+        if !self.base_instructions.is_empty() {
+            add(&self.base_instructions);
+        }
+        for payload in history {
+            match payload {
+                SessionPayload::InputMessage { text, .. }
+                | SessionPayload::AssistantMessage { text, .. } => add(text),
+                SessionPayload::Reasoning {
+                    content,
+                    encrypted_content,
+                    summary,
+                    ..
+                } => {
+                    for value in [content, encrypted_content, summary].into_iter().flatten() {
+                        add(value);
+                    }
+                }
+                SessionPayload::CompactionCheckpoint { summary, .. } => add(summary),
+                SessionPayload::ToolCallAccepted {
+                    call_id,
+                    name,
+                    input,
+                    ..
+                } => {
+                    add(call_id);
+                    add(name);
+                    add(input);
+                }
+                SessionPayload::ToolExecutionFinished {
+                    call_id, output, ..
+                } => {
+                    add(call_id);
+                    add(output);
+                }
+                _ => {}
+            }
+        }
+        for value in steering {
+            add(value);
+        }
+        for tool in tools {
+            add(tool.name.as_str());
+            add(&tool.description);
+            match &tool.input_schema {
+                harness_tool_api::ToolInputSchema::FreeformGrammar { definition, .. } => {
+                    add(definition)
+                }
+                harness_tool_api::ToolInputSchema::JsonSchema(schema) => add(schema.as_str()),
+            }
+        }
+
+        Some(RequestContextUsage {
+            estimated_input_tokens: u64::try_from(tokens).unwrap_or(u64::MAX),
+            max_input_tokens: model.context_window,
+            compact_at_tokens: (model.context_window * model.effective_context_window_percent)
+                / 100,
+        })
+    }
 }
 
 impl ModelRequestBuilder for RealModelRequestBuilder {
@@ -604,14 +735,53 @@ impl ModelRequestBuilder for RealModelRequestBuilder {
             })
         };
 
+        let last_response_meta = if self.store {
+            let last_compaction_pos = history
+                .iter()
+                .rposition(|payload| matches!(payload, SessionPayload::CompactionCheckpoint { .. }));
+            history.iter().enumerate().rev().find_map(|(idx, payload)| {
+                if let Some(comp_pos) = last_compaction_pos {
+                    if idx < comp_pos {
+                        return None;
+                    }
+                }
+                if let SessionPayload::ModelResponseMetadata {
+                    provider,
+                    response_id,
+                    ..
+                } = payload
+                {
+                    if provider == selection.provider.as_str() {
+                        return Some((idx, response_id.clone()));
+                    }
+                }
+                None
+            })
+        } else {
+            None
+        };
+
+        let last_compaction_pos = history
+            .iter()
+            .rposition(|payload| matches!(payload, SessionPayload::CompactionCheckpoint { .. }));
+
+        let (history_slice, previous_response_id) = match (last_response_meta, last_compaction_pos) {
+            (Some((meta_idx, response_id)), Some(comp_idx)) if meta_idx > comp_idx => {
+                (&history[meta_idx + 1..], Some(response_id))
+            }
+            (_, Some(comp_idx)) => (&history[comp_idx..], None),
+            (Some((meta_idx, response_id)), None) => (&history[meta_idx + 1..], Some(response_id)),
+            (None, None) => (history, None),
+        };
+
         let mut input = Vec::new();
-        if !self.base_instructions.is_empty() {
+        if previous_response_id.is_none() && !self.base_instructions.is_empty() {
             input.push(ModelInput::Message {
                 role: ModelMessageRole::System,
                 text: self.base_instructions.clone(),
             });
         }
-        for payload in history {
+        for payload in history_slice {
             match payload {
                 SessionPayload::InputMessage { text, .. } => {
                     input.push(ModelInput::Message {
@@ -709,14 +879,16 @@ impl ModelRequestBuilder for RealModelRequestBuilder {
             }
         }
 
-        let gen_val = provider_generation;
+        let context_usage = self.estimate_context(selection, history, steering, &tools);
         Ok(Arc::new(ModelRequest {
             request_id: ModelRequestId(0),
-            provider_generation: gen_val,
+            provider_generation,
             history_revision: revision,
             selection: selection.clone(),
             input: Arc::from(input),
             tools: Arc::from(tools),
+            previous_response_id,
+            context_usage,
         }))
     }
 
@@ -787,9 +959,11 @@ impl ModelRequestBuilder for RealModelRequestBuilder {
                 tool
             })
             .collect::<Vec<_>>();
+        let context_usage = self.estimate_context(selection, history, steering, &tools);
         Ok(Arc::new(ModelRequest {
             input: Arc::from(input),
             tools: Arc::from(tools),
+            context_usage,
             ..(*request).clone()
         }))
     }
@@ -909,6 +1083,7 @@ impl ModelTransport for SharedTransport {
 struct CodexWsClient {
     pool: Arc<ResponsesWsPool>,
     headers: CodexHeaders,
+    capabilities: harness_model_api::ModelCapabilities,
 }
 
 impl StreamingClient for CodexWsClient {
@@ -927,18 +1102,27 @@ impl StreamingClient for CodexWsClient {
     > {
         let pool = Arc::clone(&self.pool);
         let mut headers = self.headers.clone();
+        let developer_role_support = self.capabilities.developer_role_support;
+        let allow_multiple_system = self.capabilities.allow_multiple_system_messages;
+        let store = self.capabilities.store;
         headers.client_request_id = attempt.attempt_id.0.to_string();
         headers.thread_id = attempt.attempt_id.0.to_string();
         Box::pin(async move {
+            let encoded_input = encode_input(&attempt.request.input, developer_role_support, allow_multiple_system);
             let tools = encode_tools(&attempt.request.tools)
                 .map_err(|error| StreamError::Transport(error.to_string()))?;
             let mut body = sonic_rs::json!({
                 "type": "response.create",
                 "model": attempt.request.selection.model,
-                "input": encode_input(&attempt.request.input),
+                "input": encoded_input,
                 "tools": tools,
-                "store": false,
+                "store": store,
             });
+            if store {
+                if let Some(prev_id) = &attempt.request.previous_response_id {
+                    body["previous_response_id"] = sonic_rs::json!(prev_id);
+                }
+            }
             add_selection_options(&mut body, &attempt.request.selection, &headers.session_id);
             let request = ResponsesStreamRequest { headers, body };
             let (sender, receiver) = tokio::sync::mpsc::channel(128);
@@ -972,8 +1156,9 @@ impl StreamingClient for CodexWsClient {
                     })
                     .await;
                 if let Err(error) = result {
+                    let err_msg = format_input_index_error(&error.to_string(), &encoded_input);
                     let _ = sender
-                        .send(Err(StreamError::Transport(error.to_string())))
+                        .send(Err(StreamError::Transport(err_msg)))
                         .await;
                 } else {
                     let _ = sender.send(Ok(StreamChunk::End)).await;
@@ -995,6 +1180,7 @@ struct HttpClient {
     base_url: String,
     api_key: Option<String>,
     session_id: String,
+    capabilities: harness_model_api::ModelCapabilities,
     hyper_client: hyper_util::client::legacy::Client<
         hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
         http_body_util::Full<bytes::Bytes>,
@@ -1002,7 +1188,12 @@ struct HttpClient {
 }
 
 impl HttpClient {
-    fn new(base_url: String, api_key: Option<String>, session_id: impl Into<String>) -> Self {
+    fn new(
+        base_url: String,
+        api_key: Option<String>,
+        session_id: impl Into<String>,
+        capabilities: harness_model_api::ModelCapabilities,
+    ) -> Self {
         let https = hyper_rustls::HttpsConnectorBuilder::new()
             .with_webpki_roots()
             .https_or_http()
@@ -1015,6 +1206,7 @@ impl HttpClient {
             base_url,
             api_key,
             session_id: session_id.into(),
+            capabilities,
             hyper_client,
         }
     }
@@ -1073,7 +1265,12 @@ impl ChatStreamingClient for HttpClient {
                 } else if status == http::StatusCode::TOO_MANY_REQUESTS {
                     return Err(ChatStreamError::RateLimited(err_msg));
                 } else {
-                    return Err(ChatStreamError::ProviderRejected(err_msg));
+                    let formatted_err = if err_msg.trim().is_empty() {
+                        format!("HTTP status {status}")
+                    } else {
+                        format!("HTTP status {status}: {err_msg}")
+                    };
+                    return Err(ChatStreamError::ProviderRejected(formatted_err));
                 }
             }
 
@@ -1132,12 +1329,15 @@ impl StreamingClient for HttpClient {
         let base_url = self.base_url.clone();
         let api_key = self.api_key.clone();
         let session_id = self.session_id.clone();
+        let developer_role_support = self.capabilities.developer_role_support;
+        let allow_multiple_system = self.capabilities.allow_multiple_system_messages;
+        let store = self.capabilities.store;
         let hyper_client = self.hyper_client.clone();
 
         Box::pin(async move {
             let url_str = format!("{}/responses", base_url.trim_end_matches('/'));
 
-            let input = encode_input(&attempt.request.input);
+            let input = encode_input(&attempt.request.input, developer_role_support, allow_multiple_system);
             let tools = encode_tools(&attempt.request.tools)
                 .map_err(|error| StreamError::Transport(error.to_string()))?;
             let mut body = sonic_rs::json!({
@@ -1145,8 +1345,13 @@ impl StreamingClient for HttpClient {
                 "input": input,
                 "tools": tools,
                 "stream": true,
-                "store": false,
+                "store": store,
             });
+            if store {
+                if let Some(prev_id) = &attempt.request.previous_response_id {
+                    body["previous_response_id"] = sonic_rs::json!(prev_id);
+                }
+            }
             add_selection_options(&mut body, &attempt.request.selection, &session_id);
             let body_bytes =
                 sonic_rs::to_vec(&body).map_err(|e| StreamError::Transport(e.to_string()))?;
@@ -1173,9 +1378,9 @@ impl StreamingClient for HttpClient {
                     .map(|c| c.to_bytes())
                     .unwrap_or_default();
                 let err_msg = String::from_utf8_lossy(&err_bytes);
-                return Err(StreamError::Transport(format!(
-                    "HTTP status {status}: {err_msg}"
-                )));
+                let formatted_err = format!("HTTP status {status}: {err_msg}");
+                let detailed_err = format_input_index_error(&formatted_err, &input);
+                return Err(StreamError::Transport(detailed_err));
             }
 
             let content_type = resp
@@ -1243,15 +1448,11 @@ enum CliError {
         #[source]
         source: io::Error,
     },
-    #[error("channel send error: {0:?}")]
-    Channel(harness_runtime_api::RuntimeSendError),
     #[error("failed to encode experiment JSON")]
     ExperimentJson {
         #[source]
         source: sonic_rs::Error,
     },
-    #[error("model `{model}` was not returned by /models")]
-    MissingModel { model: String },
     #[error("HOME is required when {fallback_variable} is unset")]
     HomeRequired {
         fallback_variable: &'static str,
@@ -1262,14 +1463,8 @@ enum CliError {
     SessionNotFound { id: String },
     #[error("no sessions available to resume")]
     NoSessionsAvailable,
-    #[error("session id mismatch: index={index} file={file}")]
-    SessionIdMismatch { index: String, file: String },
     #[error("no session selected")]
     NoSessionSelected,
-    #[error(
-        "invalid session selection `{selected}`; enter 1-{max}, a session id, or a cwd/latest-message filter"
-    )]
-    InvalidSessionSelection { selected: String, max: usize },
     #[error("failed to read current working directory")]
     CurrentDir {
         #[source]
@@ -1281,36 +1476,11 @@ enum CliError {
         "unsupported arguments `{arguments}`; use [--norotate], resume [sessionid] [--norotate], inspect-session <sessionid>, probe-session-chunk <sessionid> <chunk-index>, repair-session <sessionid>, or ipc-uds <socket-path>"
     )]
     UnsupportedArguments { arguments: String },
-    #[error("base instructions destination has no parent directory")]
-    BaseInstructionsMissingParent,
-    #[error("failed to create base instructions directory {path}")]
-    CreateBaseInstructionsDir {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-    #[error("missing base instructions: expected {source_path} or {destination}")]
-    MissingBaseInstructions {
-        source_path: PathBuf,
-        destination: PathBuf,
-    },
     #[error("failed to read harness base instructions {path}")]
     ReadBaseInstructions {
         path: PathBuf,
         #[source]
         source: io::Error,
-    },
-    #[error("failed to read resume startup binding from {path}")]
-    ResumeStartupBinding {
-        path: PathBuf,
-        #[source]
-        source: harness_session_store::SessionStoreError,
-    },
-    #[error("failed to read resume transcript page from {path}")]
-    ResumeTranscriptPage {
-        path: PathBuf,
-        #[source]
-        source: harness_session_store::SessionStoreError,
     },
 }
 
@@ -1377,6 +1547,21 @@ fn load_chatgpt_auth() -> Result<Auth, ProviderError> {
     ))
 }
 
+fn format_input_index_error(err_msg: &str, encoded_input: &[sonic_rs::Value]) -> String {
+    if let Some(pos) = err_msg.find("input[") {
+        let rest = &err_msg[pos + 6..];
+        if let Some(end_pos) = rest.find(']') {
+            if let Ok(idx) = rest[..end_pos].parse::<usize>() {
+                if let Some(item) = encoded_input.get(idx) {
+                    let item_str = sonic_rs::to_string_pretty(item).unwrap_or_else(|_| item.to_string());
+                    return format!("{err_msg}\n\n--> Target input[{idx}] causing error:\n{item_str}");
+                }
+            }
+        }
+    }
+    err_msg.to_string()
+}
+
 async fn resolve_provider_and_transport(
     provider_config: &ProviderConfig,
     session_id: &str,
@@ -1416,6 +1601,35 @@ async fn resolve_provider_and_transport(
         }
     }
 
+    let dev_role_support = match model_config.developer_role_support {
+        Some(harness_provider::DeveloperRoleSupport::Disabled) => {
+            harness_model_api::DeveloperRoleSupport::Disabled
+        }
+        Some(harness_provider::DeveloperRoleSupport::Supported) => {
+            harness_model_api::DeveloperRoleSupport::Supported
+        }
+        Some(harness_provider::DeveloperRoleSupport::DeveloperOnly) => {
+            harness_model_api::DeveloperRoleSupport::DeveloperOnly
+        }
+        None => match profile.developer_role_support {
+            harness_provider::DeveloperRoleSupport::Disabled => {
+                harness_model_api::DeveloperRoleSupport::Disabled
+            }
+            harness_provider::DeveloperRoleSupport::Supported => {
+                harness_model_api::DeveloperRoleSupport::Supported
+            }
+            harness_provider::DeveloperRoleSupport::DeveloperOnly => {
+                harness_model_api::DeveloperRoleSupport::DeveloperOnly
+            }
+        },
+    };
+
+    let allow_multiple_system = model_config
+        .allow_multiple_system_messages
+        .unwrap_or(profile.allow_multiple_system_messages);
+
+    let store = model_config.store.unwrap_or(profile.store);
+
     let capabilities = harness_model_api::ModelCapabilities {
         tool_calls: model_config.supports_tools,
         freeform_tool_input: !matches!(
@@ -1423,6 +1637,9 @@ async fn resolve_provider_and_transport(
             ProviderDriverConfig::ChatCompletion { .. }
         ),
         streaming: true,
+        developer_role_support: dev_role_support,
+        allow_multiple_system_messages: allow_multiple_system,
+        store,
     };
 
     let context_limits = harness_model_api::ContextLimits::new(
@@ -1485,7 +1702,7 @@ async fn resolve_provider_and_transport(
             request_timeout_ms: _,
             stream_idle_timeout_ms,
         } => {
-            let client = Arc::new(HttpClient::new(base_url.clone(), api_key, session_id));
+            let client = Arc::new(HttpClient::new(base_url.clone(), api_key, session_id, capabilities));
             let config = ChatTransportConfiguration {
                 event_capacity: 128,
                 chunk_timeout: Duration::from_millis(*stream_idle_timeout_ms),
@@ -1501,7 +1718,7 @@ async fn resolve_provider_and_transport(
             request_timeout_ms: _,
             stream_idle_timeout_ms,
         } => {
-            let client = Arc::new(HttpClient::new(base_url.clone(), api_key, session_id));
+            let client = Arc::new(HttpClient::new(base_url.clone(), api_key, session_id, capabilities));
             let config = TransportConfiguration {
                 event_capacity: 128,
                 chunk_timeout: Duration::from_millis(*stream_idle_timeout_ms),
@@ -1536,6 +1753,7 @@ async fn resolve_provider_and_transport(
             let client = Arc::new(CodexWsClient {
                 pool,
                 headers: CodexHeaders::for_thread(session_id, session_id, session_id),
+                capabilities,
             });
             let config = TransportConfiguration {
                 event_capacity: 128,
@@ -1586,6 +1804,28 @@ async fn emit_runtime_failure(
     let _ = event_tx.send(envelope).await;
 }
 
+async fn emit_notification(
+    text: &str,
+    event_tx: &harness_runtime_api::RuntimeEventSender,
+    seq: &mut u64,
+) {
+    if text.is_empty() {
+        return;
+    }
+    let envelope = harness_runtime_api::RuntimeEventEnvelope::new(
+        *seq,
+        harness_runtime_api::RuntimeEvent::TranscriptAppended(TranscriptSnapshotEntry {
+            sequence: None,
+            payload: harness_runtime_api::TranscriptPayload::Message {
+                role: harness_runtime_api::MessageRole::Assistant,
+                text: text.to_string(),
+            },
+        }),
+    );
+    *seq += 1;
+    let _ = event_tx.send(envelope).await;
+}
+
 async fn emit_text_message(
     user_text: &str,
     assistant_text: &str,
@@ -1593,44 +1833,71 @@ async fn emit_text_message(
     event_tx: &harness_runtime_api::RuntimeEventSender,
     seq: &mut u64,
 ) {
-    let _ = runtime
-        .append_records(&[
-            SessionPayload::InputMessage {
-                turn_id: 0,
-                text: user_text.to_string(),
-            },
-            SessionPayload::AssistantMessage {
-                turn_id: 0,
-                text: assistant_text.to_string(),
-            },
-        ])
-        .await;
+    let mut payloads = Vec::new();
+    let has_user = !user_text.is_empty();
+    if has_user {
+        payloads.push(SessionPayload::InputMessage {
+            turn_id: 0,
+            text: user_text.to_string(),
+        });
+    }
+    let has_assistant = !assistant_text.is_empty();
+    if has_assistant {
+        payloads.push(SessionPayload::AssistantMessage {
+            turn_id: 0,
+            text: assistant_text.to_string(),
+        });
+    }
 
-    let envelope = harness_runtime_api::RuntimeEventEnvelope::new(
-        *seq,
-        harness_runtime_api::RuntimeEvent::TranscriptAppended(TranscriptSnapshotEntry {
-            sequence: Some(*seq),
-            payload: harness_runtime_api::TranscriptPayload::Message {
-                role: harness_runtime_api::MessageRole::User,
-                text: user_text.to_string(),
-            },
-        }),
-    );
-    *seq += 1;
-    let _ = event_tx.send(envelope).await;
+    if payloads.is_empty() {
+        return;
+    }
 
-    let envelope = harness_runtime_api::RuntimeEventEnvelope::new(
-        *seq,
-        harness_runtime_api::RuntimeEvent::TranscriptAppended(TranscriptSnapshotEntry {
-            sequence: Some(*seq),
-            payload: harness_runtime_api::TranscriptPayload::Message {
-                role: harness_runtime_api::MessageRole::Assistant,
-                text: assistant_text.to_string(),
-            },
-        }),
-    );
-    *seq += 1;
-    let _ = event_tx.send(envelope).await;
+    let receipt = runtime.append_records(&payloads).await;
+    let (user_seq, assistant_seq) = match &receipt {
+        Ok(rcpt) => {
+            let start = *rcpt.sequences.start();
+            let end = *rcpt.sequences.end();
+            if has_user && has_assistant {
+                (Some(start), Some(end))
+            } else if has_user {
+                (Some(start), None)
+            } else {
+                (None, Some(start))
+            }
+        }
+        Err(_) => (None, None),
+    };
+
+    if has_user {
+        let envelope = harness_runtime_api::RuntimeEventEnvelope::new(
+            *seq,
+            harness_runtime_api::RuntimeEvent::TranscriptAppended(TranscriptSnapshotEntry {
+                sequence: user_seq,
+                payload: harness_runtime_api::TranscriptPayload::Message {
+                    role: harness_runtime_api::MessageRole::User,
+                    text: user_text.to_string(),
+                },
+            }),
+        );
+        *seq += 1;
+        let _ = event_tx.send(envelope).await;
+    }
+
+    if has_assistant {
+        let envelope = harness_runtime_api::RuntimeEventEnvelope::new(
+            *seq,
+            harness_runtime_api::RuntimeEvent::TranscriptAppended(TranscriptSnapshotEntry {
+                sequence: assistant_seq,
+                payload: harness_runtime_api::TranscriptPayload::Message {
+                    role: harness_runtime_api::MessageRole::Assistant,
+                    text: assistant_text.to_string(),
+                },
+            }),
+        );
+        *seq += 1;
+        let _ = event_tx.send(envelope).await;
+    }
 }
 
 #[derive(Clone)]
@@ -1654,18 +1921,46 @@ enum AppAction {
     Retry,
     SetToolAvailability { pattern: String, enabled: bool },
     SetGoal { instruction: String },
+    PauseGoal,
+    ResumeGoal,
+    ClearGoal,
+    ShowGoal,
     Compact { instruction: String },
     RetryCompaction { instruction: Option<String> },
     CancelCompaction,
+    ResumeSession { session_id: Option<String> },
+    /// Fork current session up to an optional sequence cutpoint and switch to the fork.
+    /// `before_compaction` rewinds to just before the last CompactionCheckpoint.
+    Rewind {
+        /// Rewind to just before the last compaction checkpoint.
+        before_compaction: bool,
+        /// Rewind to before this specific sequence number, if provided.
+        before_sequence: Option<u64>,
+    },
 }
 
 type Commands = CommandRegistry<App, AppAction>;
 type Context<'a> = CommandContext<'a, App, AppAction>;
 
 fn provider(app: &mut App, mut context: Context<'_>) -> CommandResult<AppAction> {
-    let subcmd = context.args.required("subcommand")?;
+    let subcmd = context.args.next();
     match subcmd {
-        "use" => {
+        None | Some("list") => {
+            let mut list = String::from("Available provider profiles:\n");
+            for profile in &app.provider_config.profiles {
+                let is_active = profile.id.as_str() == app.active_profile.as_str();
+                let marker = if is_active { " (active)" } else { "" };
+                let _ = writeln!(
+                    list,
+                    "  • {}{} — {}",
+                    profile.id.as_str(),
+                    marker,
+                    profile.display_name
+                );
+            }
+            Ok(AppAction::ShowMessage(list))
+        }
+        Some("use") => {
             let profile_name = context.args.required("profile")?;
             context.args.finish()?;
 
@@ -1682,11 +1977,21 @@ fn provider(app: &mut App, mut context: Context<'_>) -> CommandResult<AppAction>
                 profile: profile_name.to_string(),
             })
         }
-        other => Err(CommandError::InvalidArgument {
-            name: "subcommand",
-            value: other.into(),
-            reason: "expected 'use'".into(),
-        }),
+        Some(profile_name) => {
+            context.args.finish()?;
+            let profile_id = ProviderProfileId::new(profile_name);
+            if app.provider_config.profile(&profile_id).is_none() {
+                return Err(CommandError::InvalidArgument {
+                    name: "profile",
+                    value: profile_name.into(),
+                    reason: "profile not found in config".into(),
+                });
+            }
+
+            Ok(AppAction::ProviderUse {
+                profile: profile_name.to_string(),
+            })
+        }
     }
 }
 
@@ -1752,9 +2057,48 @@ fn model(_app: &mut App, mut context: Context<'_>) -> CommandResult<AppAction> {
     })
 }
 
+fn resume(_app: &mut App, mut context: Context<'_>) -> CommandResult<AppAction> {
+    let session_id = context.args.next().map(str::to_owned);
+    context.args.finish()?;
+    Ok(AppAction::ResumeSession { session_id })
+}
+
+fn rewind(_app: &mut App, mut context: Context<'_>) -> CommandResult<AppAction> {
+    let mut before_compaction = false;
+    let mut before_sequence: Option<u64> = None;
+    for arg in &mut context.args {
+        if arg == "compact" || arg == "compaction" {
+            before_compaction = true;
+        } else if let Some(seq_str) = arg.strip_prefix("before:") {
+            before_sequence = Some(seq_str.parse().map_err(|_| {
+                CommandError::Message(
+                    format!("invalid sequence number: {seq_str}").into()
+                )
+            })?);
+        } else {
+            return Err(CommandError::Message(
+                format!("unknown rewind argument: {arg}").into()
+            ));
+        }
+    }
+    Ok(AppAction::Rewind { before_compaction, before_sequence })
+}
+
 fn goal(_app: &mut App, mut context: Context<'_>) -> CommandResult<AppAction> {
     let text = context.args.next();
     match text {
+        Some("pause") => {
+            context.args.finish()?;
+            Ok(AppAction::PauseGoal)
+        }
+        Some("resume") => {
+            context.args.finish()?;
+            Ok(AppAction::ResumeGoal)
+        }
+        Some("clear") => {
+            context.args.finish()?;
+            Ok(AppAction::ClearGoal)
+        }
         Some(first) => {
             let mut instruction = first.to_owned();
             for part in context.args {
@@ -1763,7 +2107,7 @@ fn goal(_app: &mut App, mut context: Context<'_>) -> CommandResult<AppAction> {
             }
             Ok(AppAction::SetGoal { instruction })
         }
-        None => Err(CommandError::message("usage: /goal <task>")),
+        None => Ok(AppAction::ShowGoal),
     }
 }
 
@@ -1806,9 +2150,14 @@ fn build_commands() -> Result<Commands, Box<dyn std::error::Error>> {
                 .summary("List available commands"),
         )
         .command(
+            CommandSpec::new("resume", resume)
+                .usage("[session_id|latest]")
+                .summary("Switch active session or pick a session to resume"),
+        )
+        .command(
             CommandSpec::new("provider", provider)
-                .usage("use <profile>")
-                .summary("Switch active provider profile"),
+                .usage("[use] <profile>")
+                .summary("List or switch active provider profile"),
         )
         .command(
             CommandSpec::new("model", model)
@@ -1833,6 +2182,11 @@ fn build_commands() -> Result<Commands, Box<dyn std::error::Error>> {
             CommandSpec::new("goal", goal)
                 .usage("<task>")
                 .summary("Set a persisted goal; the agent loop keeps going until the model calls goal complete"),
+        )
+        .command(
+            CommandSpec::new("rewind", rewind)
+                .usage("[compact] [before:<sequence>]")
+                .summary("Fork the current session, optionally rewinding before the last compaction"),
         )
         .build()?)
 }
@@ -1981,9 +2335,17 @@ async fn execute_app_action(
         AppAction::SetGoal { instruction } => {
             let goal_text = instruction.clone();
             runtime
-                .dispatch_command(harness_runtime_api::RuntimeCommand::SetGoal { instruction })
+                .dispatch_command(harness_runtime_api::RuntimeCommand::SetGoal {
+                    instruction: instruction.clone(),
+                })
                 .await
                 .map_err(|error| format!("Failed to set goal: {error}"))?;
+            let _ = runtime
+                .append_records(&[harness_session_store::SessionPayload::Goal {
+                    instruction: instruction.clone(),
+                    state: "active".to_string(),
+                }])
+                .await;
             // Submit the goal as a prompt to start the agent loop.
             let effects = runtime
                 .dispatch_command(harness_runtime_api::RuntimeCommand::SubmitPrompt {
@@ -1994,6 +2356,279 @@ async fn execute_app_action(
             if !drive_runtime_effects(runtime, command_rx, commands, effects, event_tx, seq).await {
                 return Err("Runtime event channel closed".to_string());
             }
+            Ok(())
+        }
+        AppAction::PauseGoal => {
+            let goal_instruction = match runtime.persist_state() {
+                harness_conversation_runtime::PersistState::Active(task)
+                | harness_conversation_runtime::PersistState::Paused(task) => task.instruction.clone(),
+                _ => String::new(),
+            };
+            runtime
+                .dispatch_command(harness_runtime_api::RuntimeCommand::PauseGoal)
+                .await
+                .map_err(|error| format!("Failed to pause goal: {error}"))?;
+            let _ = runtime
+                .append_records(&[harness_session_store::SessionPayload::Goal {
+                    instruction: goal_instruction,
+                    state: "paused".to_string(),
+                }])
+                .await;
+            emit_text_message(text, "Goal paused.", runtime, event_tx, seq).await;
+            Ok(())
+        }
+        AppAction::ResumeGoal => {
+            let goal_instruction = match runtime.persist_state() {
+                harness_conversation_runtime::PersistState::Active(task)
+                | harness_conversation_runtime::PersistState::Paused(task) => task.instruction.clone(),
+                _ => String::new(),
+            };
+            runtime
+                .dispatch_command(harness_runtime_api::RuntimeCommand::ResumeGoal)
+                .await
+                .map_err(|error| format!("Failed to resume goal: {error}"))?;
+            let _ = runtime
+                .append_records(&[harness_session_store::SessionPayload::Goal {
+                    instruction: goal_instruction,
+                    state: "active".to_string(),
+                }])
+                .await;
+            emit_text_message(text, "Goal resumed.", runtime, event_tx, seq).await;
+            Ok(())
+        }
+        AppAction::ClearGoal => {
+            let goal_instruction = match runtime.persist_state() {
+                harness_conversation_runtime::PersistState::Active(task)
+                | harness_conversation_runtime::PersistState::Paused(task) => task.instruction.clone(),
+                _ => String::new(),
+            };
+            runtime
+                .dispatch_command(harness_runtime_api::RuntimeCommand::ClearGoal)
+                .await
+                .map_err(|error| format!("Failed to clear goal: {error}"))?;
+            let _ = runtime
+                .append_records(&[harness_session_store::SessionPayload::Goal {
+                    instruction: goal_instruction,
+                    state: "cleared".to_string(),
+                }])
+                .await;
+            emit_text_message(text, "Goal cleared.", runtime, event_tx, seq).await;
+            Ok(())
+        }
+        AppAction::ShowGoal => {
+            let msg = match runtime.persist_state() {
+                harness_conversation_runtime::PersistState::Active(task) => {
+                    format!("Active goal: {}", task.instruction)
+                }
+                harness_conversation_runtime::PersistState::Paused(task) => {
+                    format!("Paused goal: {}", task.instruction)
+                }
+                harness_conversation_runtime::PersistState::Completed(task) => {
+                    format!("Completed goal: {}", task.instruction)
+                }
+                _ => "No active goal set.".to_string(),
+            };
+            emit_text_message(text, &msg, runtime, event_tx, seq).await;
+            Ok(())
+        }
+        AppAction::ResumeSession { session_id } => {
+            let target_id = match session_id.as_deref() {
+                None | Some("pick") | Some("") => {
+                    let sessions = picker::list_sessions(session_root)
+                        .map_err(|e| e.to_string())?
+                        .into_iter()
+                        .map(|s| harness_runtime_api::SessionPickerMeta {
+                            id: s.id,
+                            modified_secs: s
+                                .modified
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs(),
+                            all_text: s.all_text,
+                            model: s.model,
+                            title: s.title,
+                            initial_entries: s.initial_entries,
+                        })
+                        .collect();
+                    let envelope = harness_runtime_api::RuntimeEventEnvelope::new(
+                        *seq,
+                        harness_runtime_api::RuntimeEvent::OpenSessionPicker(sessions),
+                    );
+                    *seq += 1;
+                    if event_tx.send(envelope).await.is_err() {
+                        return Err("Event channel closed".to_string());
+                    }
+                    return Ok(());
+                }
+                Some("latest") => latest_session_id(session_root).map_err(|e| e.to_string())?,
+                Some(raw) => resolve_session_id(raw.to_string()).map_err(|e| e.to_string())?,
+            };
+            if let Err(e) = runtime.switch_session(target_id.clone()).await {
+                return Err(format!("Failed to switch session: {e}"));
+            }
+            let records =
+                read_session_records(session_root, &target_id).map_err(|e| e.to_string())?;
+            let entries: Vec<TranscriptSnapshotEntry> = records
+                .iter()
+                .filter_map(transcript_snapshot_entry)
+                .collect();
+            let page = harness_runtime_api::TranscriptPage {
+                entries,
+                next_before_sequence: None,
+                reached_start: true,
+            };
+            let envelope = harness_runtime_api::RuntimeEventEnvelope::new(
+                *seq,
+                harness_runtime_api::RuntimeEvent::TranscriptPageLoaded(page),
+            );
+            *seq += 1;
+            if event_tx.send(envelope).await.is_err() {
+                return Err("Event channel closed".to_string());
+            }
+            app_state.session_id = target_id.as_str().to_string();
+            let msg = format!("Switched to session {}", target_id.as_str());
+            emit_text_message("", &msg, runtime, event_tx, seq).await;
+            Ok(())
+        }
+        AppAction::Rewind { before_compaction, before_sequence } => {
+            // Read all records from the current session.
+            let current_session_id_str = app_state.session_id.clone();
+            let current_id = harness_session_store::SessionId::new(current_session_id_str.clone())
+                .map_err(|e| format!("Invalid current session id: {e}"))?;
+            let records = read_session_records(session_root, &current_id)
+                .map_err(|e| format!("Failed to read current session: {e}"))?;
+
+            // Determine the cutpoint.
+            let records_to_keep: Vec<&SessionRecord> = if before_compaction {
+                // Find the last CompactionCheckpoint and keep only records before it.
+                let last_compaction_pos = records
+                    .iter()
+                    .rposition(|r| matches!(r.payload, SessionPayload::CompactionCheckpoint { .. }));
+                match last_compaction_pos {
+                    Some(pos) => records[..pos].iter().collect(),
+                    None => return Err("No compaction checkpoint found in current session".to_string()),
+                }
+            } else if let Some(cutseq) = before_sequence {
+                // Keep records whose sequence is strictly less than cutseq.
+                records.iter().filter(|r| r.sequence < cutseq).collect()
+            } else {
+                let mut turn_options = Vec::new();
+                for record in &records {
+                    match &record.payload {
+                        SessionPayload::InputMessage { text, .. } => {
+                            let snippet: String = text.chars().take(60).collect();
+                            turn_options.push(harness_runtime_api::RewindOptionMeta {
+                                sequence: record.sequence,
+                                label: format!("[#{}] User: {}", record.sequence, snippet),
+                            });
+                        }
+                        SessionPayload::CompactionCheckpoint { summary, .. } => {
+                            let snippet: String = summary.chars().take(60).collect();
+                            turn_options.push(harness_runtime_api::RewindOptionMeta {
+                                sequence: record.sequence,
+                                label: format!("[#{}] ── Compaction: {} ──", record.sequence, snippet),
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+                if turn_options.is_empty() {
+                    return Err("No turn or checkpoint available to rewind".to_string());
+                }
+                let envelope = harness_runtime_api::RuntimeEventEnvelope::new(
+                    *seq,
+                    harness_runtime_api::RuntimeEvent::OpenRewindPicker(turn_options),
+                );
+                *seq += 1;
+                if event_tx.send(envelope).await.is_err() {
+                    return Err("Event channel closed".to_string());
+                }
+                return Ok(());
+            };
+
+            // Create new session file with a fresh ID, re-sequenced from 0.
+            let new_session_id_str = generate_session_id()
+                .map_err(|e| format!("Failed to generate session ID: {e}"))?;
+            let session_dir = session_root.join("sessions");
+            std::fs::create_dir_all(&session_dir)
+                .map_err(|e| format!("Failed to create sessions dir: {e}"))?;
+            let fork_path = session_dir.join(format!("{new_session_id_str}.json"));
+            let serialized: Vec<SerializableRecord> = records_to_keep
+                .iter()
+                .enumerate()
+                .map(|(new_seq, record)| SerializableRecord {
+                    sequence: new_seq as u64,
+                    payload: to_serializable_payload(&record.payload),
+                })
+                .collect();
+            let json = serde_json::to_string_pretty(&serialized)
+                .map_err(|e| format!("Failed to serialize fork: {e}"))?;
+            std::fs::write(&fork_path, json)
+                .map_err(|e| format!("Failed to write fork session: {e}"))?;
+
+            let new_id = harness_session_store::SessionId::new(new_session_id_str.clone())
+                .map_err(|e| format!("Invalid new session id: {e}"))?;
+
+            // Switch the runtime's storage writer to the new session.
+            // The old session file is NOT touched.
+            if let Err(e) = runtime.switch_session(new_id.clone()).await {
+                return Err(format!("Failed to switch to fork: {e}"));
+            }
+
+            // Rebuild the transport using the ORIGINAL session ID as the cache/prefix key,
+            // so the model server's KV cache is still addressable from the fork.
+            let active_profile_id = harness_provider::ProviderProfileId::new(
+                app_state.active_profile.as_str()
+            );
+            let (model_slug, reasoning_effort, service_tier) = {
+                let sel = runtime.active_model();
+                (sel.model.clone(), sel.reasoning_effort.clone(), sel.service_tier.clone())
+            };
+            let next_gen = active_generation.load(Ordering::Acquire) + 1;
+            let (resolved, new_transport) = resolve_provider_and_transport(
+                provider_config,
+                &current_session_id_str, // <-- original ID as cache key
+                &active_profile_id,
+                &model_slug,
+                next_gen,
+                reasoning_effort,
+                service_tier,
+            )
+            .await
+            .map_err(|e| format!("Failed to rebuild transport for fork: {e}"))?;
+
+            runtime.update_ports(new_transport, resolved.routes.root.clone());
+            runtime.update_compaction_route(resolved.routes.compaction.clone());
+            active_generation.store(next_gen, std::sync::atomic::Ordering::Release);
+
+            // Emit the forked transcript to the TUI.
+            let fork_records = read_session_records(session_root, &new_id)
+                .map_err(|e| format!("Failed to read forked session: {e}"))?;
+            let entries: Vec<TranscriptSnapshotEntry> = fork_records
+                .iter()
+                .filter_map(transcript_snapshot_entry)
+                .collect();
+            let page = harness_runtime_api::TranscriptPage {
+                entries,
+                next_before_sequence: None,
+                reached_start: true,
+            };
+            let envelope = harness_runtime_api::RuntimeEventEnvelope::new(
+                *seq,
+                harness_runtime_api::RuntimeEvent::TranscriptPageLoaded(page),
+            );
+            *seq += 1;
+            if event_tx.send(envelope).await.is_err() {
+                return Err("Event channel closed".to_string());
+            }
+
+            app_state.session_id = new_session_id_str.clone();
+            let msg = format!(
+                "Rewound session before sequence {}. Forked to new session {}",
+                records_to_keep.last().map(|r| r.sequence).unwrap_or(0),
+                new_id.as_str()
+            );
+            emit_text_message("", &msg, runtime, event_tx, seq).await;
             Ok(())
         }
         AppAction::SetToolAvailability { pattern, enabled } => {
@@ -2101,7 +2736,7 @@ async fn execute_app_action(
                 .map_err(|e| format!("Failed to persist model selection: {e}"))?;
 
             let outcome_text = format!("Switched model to {model_name}");
-            emit_text_message(text, &outcome_text, runtime, event_tx, seq).await;
+            emit_notification(&outcome_text, event_tx, seq).await;
 
             let envelope = harness_runtime_api::RuntimeEventEnvelope::new(
                 *seq,
@@ -2215,10 +2850,23 @@ async fn run_model_attempt(
                         | harness_runtime_api::RuntimeCommand::StopRequestLoop
                         | harness_runtime_api::RuntimeCommand::AbortResponse
                 );
+                if matches!(
+                    &command,
+                    harness_runtime_api::RuntimeCommand::Compact { .. }
+                ) {
+                    // Compaction requires an idle runtime. Preserve the command for
+                    // the outer loop without cancelling the active response.
+                    let _ = commands.try_send(command);
+                    continue;
+                }
                 if !is_interrupt {
                     // QueueSteering: queue text for the next attempt and let the
                     // current stream finish naturally — do NOT cancel.
-                    if let harness_runtime_api::RuntimeCommand::QueueSteering { .. } = &command {
+                    if matches!(
+                        &command,
+                        harness_runtime_api::RuntimeCommand::QueueSteering { .. }
+                            | harness_runtime_api::RuntimeCommand::SubmitPrompt { .. }
+                    ) {
                         if let Ok(effects) = runtime.dispatch_command(command).await {
                             for effect in effects {
                                 if let RuntimeEffect::Emit(event) = effect {
@@ -2267,6 +2915,14 @@ async fn run_model_attempt(
             Gate::Event(event) => event,
             Gate::Closed => break,
         };
+        let prev_not_found_failure = match &event {
+            harness_model_api::ModelEvent::Terminal(outcome)
+                if !compaction_attempt && is_previous_response_not_found_failure(outcome) =>
+            {
+                Some(outcome.clone())
+            }
+            _ => None,
+        };
         let compatibility_failure = match &event {
             harness_model_api::ModelEvent::Terminal(outcome)
                 if !compaction_attempt && is_custom_tool_compatibility_failure(outcome) =>
@@ -2276,7 +2932,29 @@ async fn run_model_attempt(
             _ => None,
         };
         let terminal = matches!(&event, harness_model_api::ModelEvent::Terminal(_));
-        let (event_effects, stop) = if let Some(outcome) = compatibility_failure {
+        let (event_effects, stop) = if let Some(outcome) = prev_not_found_failure {
+            let started = runtime.model_response_started();
+            if let Some(retry) = runtime.retry_with_full_context(turn_id, attempt_id)? {
+                let mut effects = Vec::new();
+                if started {
+                    effects.push(RuntimeEffect::Emit(
+                        harness_runtime_api::RuntimeEvent::ResponseFinished(outcome),
+                    ));
+                }
+                effects.push(RuntimeEffect::Emit(harness_runtime_api::RuntimeEvent::Failure(
+                    harness_runtime_api::RuntimeFailure {
+                        category: harness_runtime_api::RuntimeFailureCategory::Model,
+                        message: "The cached previous_response_id was not found by the provider; retrying with full context.".to_string(),
+                    },
+                )));
+                effects.push(retry);
+                (effects, true)
+            } else {
+                (runtime
+                    .finish_model_attempt(turn_id, attempt_id, outcome)
+                    .await?, true)
+            }
+        } else if let Some(outcome) = compatibility_failure {
             let started = runtime.model_response_started();
             if let Some(retry) = runtime.retry_with_compatibility(turn_id, attempt_id)? {
                 let mut effects = Vec::new();
@@ -2417,6 +3095,17 @@ fn is_custom_tool_compatibility_failure(
     )
 }
 
+fn is_previous_response_not_found_failure(
+    outcome: &harness_model_api::ModelTerminalOutcome,
+) -> bool {
+    matches!(
+        outcome,
+        harness_model_api::ModelTerminalOutcome::Failed(failure)
+            if failure.message.contains("previous_response_not_found")
+                || failure.message.contains("previous_response_id")
+    )
+}
+
 fn enqueue_runtime_effects(pending: &mut Vec<RuntimeEffect>, effects: Vec<RuntimeEffect>) {
     pending.extend(effects.into_iter().rev());
 }
@@ -2457,6 +3146,22 @@ async fn drive_runtime_effects(
                 attempt,
                 route,
             } => {
+                if let Some(usage) = attempt.request.context_usage
+                    && !emit_runtime_event(
+                        event_tx,
+                        seq,
+                        harness_runtime_api::RuntimeEvent::ContextUsage(
+                            harness_runtime_api::ContextUsage {
+                                estimated_input_tokens: usage.estimated_input_tokens,
+                                max_input_tokens: usage.max_input_tokens,
+                                compact_at_tokens: usage.compact_at_tokens,
+                            },
+                        ),
+                    )
+                    .await
+                {
+                    return false;
+                }
                 if !emit_runtime_event(
                     event_tx,
                     seq,
@@ -2538,7 +3243,6 @@ async fn drive_runtime_effects(
             RuntimeEffect::ContinueModel { turn_id: _ } => runtime
                 .start_model_request()
                 .await
-                .map(|effect| vec![effect])
                 .map_err(|error| {
                     (
                         harness_runtime_api::RuntimeFailureCategory::Model,
@@ -2948,7 +3652,9 @@ async fn run_tui(_auth_mode: AuthMode, resume: ResumeSelection) -> CliResult<()>
         request_builder: Arc::new(RealModelRequestBuilder {
             tool_registry: Arc::clone(&tool_registry),
             tool_availability: Arc::clone(&tool_availability),
+            provider_config: provider_config.clone(),
             base_instructions: load_base_instructions()?,
+            store: resolved_provider.capabilities.store,
         }),
         model_route: resolved_provider.routes.root.clone(),
         compaction_route: resolved_provider.routes.compaction.clone(),
@@ -3029,7 +3735,7 @@ fn resolve_session_startup(root: &Path, resume: ResumeSelection) -> CliResult<Se
             })?
         }
         ResumeSelection::SessionId(raw) => resolve_session_id(raw)?,
-        ResumeSelection::Pick => picker::pick_session_tui(root)?,
+        ResumeSelection::Pick => latest_session_id(root)?,
     };
 
     let records = if is_new {
@@ -3128,7 +3834,7 @@ fn read_session_records(
         .collect())
 }
 
-fn transcript_snapshot_entry(record: &SessionRecord) -> Option<TranscriptSnapshotEntry> {
+pub(crate) fn transcript_snapshot_entry(record: &SessionRecord) -> Option<TranscriptSnapshotEntry> {
     let payload = match &record.payload {
         SessionPayload::InputMessage { text, .. } => {
             harness_runtime_api::TranscriptPayload::Message {
@@ -3190,6 +3896,8 @@ fn transcript_snapshot_entry(record: &SessionRecord) -> Option<TranscriptSnapsho
         | SessionPayload::ToolCallAccepted { .. }
         | SessionPayload::ToolExecutionStarted { .. }
         | SessionPayload::TurnFinished { .. }
+        | SessionPayload::ModelResponseMetadata { .. }
+        | SessionPayload::Goal { .. }
         | SessionPayload::SessionClosed => return None,
     };
     Some(TranscriptSnapshotEntry {

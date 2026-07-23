@@ -37,9 +37,12 @@ impl ToolExecutor for Executor {
         request: ToolExecutionRequest,
     ) -> Pin<Box<dyn Future<Output = Result<ToolResult, ToolFailure>> + Send + '_>> {
         let result = if request.input.as_str().trim() == "complete" {
-            Err(ToolFailure::Execution(
-                "goal completion must be handled by the conversation runtime".into(),
-            ))
+            Ok(ToolResult {
+                model_output: "No persisted goal is active. Do not call the `goal` tool again for this task. Provide the completed response directly as your final answer."
+                    .to_owned(),
+                presentation: None,
+                artifacts: Vec::new(),
+            })
         } else {
             Err(ToolFailure::InvalidInput(
                 "goal expects exactly `complete`".into(),

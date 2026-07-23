@@ -97,6 +97,9 @@ fn render(
         .map_err(|e| format!("failed to list {}: {e}", root.display()))?;
     entries.sort_by_key(|entry| entry.file_name());
     for entry in entries {
+        if entry.file_name() == ".git" {
+            continue;
+        }
         if *remaining == 0 {
             return Ok(());
         }

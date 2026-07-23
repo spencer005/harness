@@ -175,6 +175,8 @@ pub struct ResponsesEventDecoder {
     assistant_text: String,
     usage: Option<ModelUsage>,
     terminal_seen: bool,
+    created_response_id: Option<String>,
+    confirmed_response_id: Option<String>,
     /// `item_id -> call_id` learned from `response.output_item.added` frames for
     /// function/custom tool calls. Some providers omit `call_id` on
     /// `function_call_arguments.delta` / `custom_tool_call_input.delta` frames
@@ -200,6 +202,8 @@ impl ResponsesEventDecoder {
             assistant_text: String::new(),
             usage: None,
             terminal_seen: false,
+            created_response_id: None,
+            confirmed_response_id: None,
             tool_call_ids: std::collections::HashMap::new(),
         })
     }
@@ -217,16 +221,16 @@ impl ResponsesEventDecoder {
     }
 
     fn decode_events(&mut self, events: Vec<SseEvent>) -> Result<Vec<ModelEvent>, ProtocolError> {
-        events
-            .into_iter()
-            .map(|event| self.decode_sse_event(&event.data))
-            .collect::<Result<Vec<_>, _>>()
-            .map(|events| events.into_iter().flatten().collect())
+        let mut decoded = Vec::new();
+        for event in events {
+            decoded.extend(self.decode_sse_event(&event.data)?);
+        }
+        Ok(decoded)
     }
 
-    fn decode_sse_event(&mut self, payload: &str) -> Result<Option<ModelEvent>, ProtocolError> {
+    fn decode_sse_event(&mut self, payload: &str) -> Result<Vec<ModelEvent>, ProtocolError> {
         if payload.trim() == "[DONE]" {
-            return Ok(None);
+            return Ok(Vec::new());
         }
 
         let value: Value = serde_json::from_str(payload)?;
@@ -234,6 +238,64 @@ impl ResponsesEventDecoder {
             .get("type")
             .and_then(Value::as_str)
             .ok_or(ProtocolError::MissingEventType)?;
+
+        if matches!(event_type, "response.created" | "response.in_progress") {
+            let id = value
+                .get("response")
+                .and_then(|r| r.get("id"))
+                .or_else(|| value.get("id"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if self.created_response_id.is_none() && id.is_some() {
+                self.created_response_id = id.clone();
+            }
+            let mut events = vec![ModelEvent::Started];
+            if let Some(resp_id) = &self.created_response_id {
+                events.push(ModelEvent::Metadata(harness_model_api::ModelResponseMetadata {
+                    response_id: Some(resp_id.clone()),
+                }));
+            }
+            return Ok(events);
+        }
+
+        if event_type == "response.completed" {
+            let completed_id = value
+                .get("response")
+                .and_then(|r| r.get("id"))
+                .or_else(|| value.get("id"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if let (Some(created), Some(completed)) = (&self.created_response_id, &completed_id) {
+                if created == completed {
+                    self.confirmed_response_id = Some(completed.clone());
+                } else {
+                    self.confirmed_response_id = Some(completed.clone());
+                }
+            } else if let Some(completed) = completed_id {
+                self.confirmed_response_id = Some(completed);
+            } else if let Some(created) = &self.created_response_id {
+                self.confirmed_response_id = Some(created.clone());
+            }
+
+            self.usage = extract_usage(&value);
+            let mut events = Vec::new();
+            if let Some(resp_id) = &self.confirmed_response_id {
+                events.push(ModelEvent::Metadata(harness_model_api::ModelResponseMetadata {
+                    response_id: Some(resp_id.clone()),
+                }));
+            }
+            if self.terminal_seen {
+                return Err(ProtocolError::DuplicateTerminal);
+            }
+            self.terminal_seen = true;
+            events.push(ModelEvent::Terminal(ModelTerminalOutcome::Completed(
+                harness_model_api::ModelCompletion {
+                    text: std::mem::take(&mut self.assistant_text),
+                    usage: self.usage,
+                },
+            )));
+            return Ok(events);
+        }
 
         if event_type == "response.output_item.added"
             && value
@@ -245,9 +307,9 @@ impl ResponsesEventDecoder {
             let item = value
                 .get("item")
                 .ok_or(ProtocolError::InvalidField { field: "item" })?;
-            return Ok(Some(ModelEvent::ReasoningItem(decode_reasoning_item(
+            return Ok(vec![ModelEvent::ReasoningItem(decode_reasoning_item(
                 item,
-            )?)));
+            )?)]);
         }
 
         // Remember the canonical call_id that a tool item will use on its
@@ -287,7 +349,7 @@ impl ResponsesEventDecoder {
                 .ok_or(ProtocolError::InvalidField { field: "part" })?;
             let text = part.get("text").and_then(Value::as_str).unwrap_or_default();
             if !text.is_empty() {
-                return Ok(Some(ModelEvent::ReasoningContentDelta(text.to_owned())));
+                return Ok(vec![ModelEvent::ReasoningContentDelta(text.to_owned())]);
             }
         }
 
@@ -298,6 +360,7 @@ impl ResponsesEventDecoder {
             event_type,
             "response.created"
                 | "response.in_progress"
+                | "response.metadata"
                 | "response.output_item.added"
                 | "response.content_part.added"
                 | "response.content_part.done"
@@ -308,8 +371,9 @@ impl ResponsesEventDecoder {
                 | "response.reasoning_text.done"
                 | "response.function_call_arguments.done"
                 | "response.custom_tool_call_input.done"
-        ) {
-            return Ok(None);
+                | "codex.rate_limits"
+        ) || event_type.starts_with("codex.") {
+            return Ok(Vec::new());
         }
 
         if event_type == "response.output_item.done"
@@ -321,30 +385,23 @@ impl ResponsesEventDecoder {
                 Some("function_call" | "custom_tool_call" | "reasoning")
             )
         {
-            return Ok(None);
+            return Ok(Vec::new());
         }
 
         let event = match decode_event_value(&value, &mut self.assistant_text, &mut self.usage) {
             Ok(event) => event,
-            Err(ProtocolError::UnsupportedEvent(_)) if event_type.contains(':') => return Ok(None),
+            Err(ProtocolError::UnsupportedEvent(_)) if event_type.contains(':') => return Ok(Vec::new()),
             Err(error) => return Err(error),
         };
 
         // Normalize tool-call identifiers so delta fragments and the completed
-        // `ToolCall` event share the same key. Some Responses providers emit
-        // delta frames carrying only `item_id` (no `call_id`), and the later
-        // `output_item.done` frame carries the canonical `call_id`. Without
-        // remapping, the runtime's pending-tool-input entry for the delta
-        // (keyed by `item_id`) never gets cleared by the `ToolCall` (keyed by
-        // `call_id`), leaving a dangling entry that trips `IncompleteToolInput`
-        // on the terminal event. We learned `item_id -> call_id` from the
-        // `output_item.added` frame above; here we rewrite any delta whose key
-        // is still the raw `item_id` back to the canonical `call_id`.
+        // `ToolCall` event share the same key.
+        let mut event = event;
         if let ModelEvent::ToolInputDelta(delta) = &event {
             if let Some(call_id) = self.tool_call_ids.get(&delta.call_id) {
                 let mut delta = delta.clone();
                 delta.call_id = call_id.clone();
-                return Ok(Some(ModelEvent::ToolInputDelta(delta)));
+                event = ModelEvent::ToolInputDelta(delta);
             }
         }
         if matches!(event, ModelEvent::Terminal(_)) {
@@ -353,7 +410,7 @@ impl ResponsesEventDecoder {
             }
             self.terminal_seen = true;
         }
-        Ok(Some(event))
+        Ok(vec![event])
     }
 }
 
@@ -479,26 +536,34 @@ fn decode_output_item(value: &Value) -> Result<ModelEvent, ProtocolError> {
     let item = value
         .get("item")
         .ok_or(ProtocolError::InvalidField { field: "item" })?;
-    // Mirror the delta resolver: `call_id` is canonical when present, but
-    // providers that never emit it put the identifier in `id` instead. Falling
-    // back to `id` keeps the `ToolCall` key aligned with the delta keys.
-    let call_id = item
-        .get("call_id")
-        .or_else(|| item.get("id"))
-        .and_then(Value::as_str)
-        .ok_or(ProtocolError::InvalidField { field: "call_id" })?
-        .to_owned();
+
     match item.get("type").and_then(Value::as_str) {
-        Some("function_call") => Ok(ModelEvent::ToolCall(ToolCall {
-            call_id,
-            name: string_field(item, "name")?.to_owned(),
-            input: ToolInput::FunctionJson(string_field(item, "arguments")?.to_owned()),
-        })),
-        Some("custom_tool_call") => Ok(ModelEvent::ToolCall(ToolCall {
-            call_id,
-            name: string_field(item, "name")?.to_owned(),
-            input: ToolInput::Freeform(string_field(item, "input")?.to_owned()),
-        })),
+        Some("function_call") => {
+            let call_id = item
+                .get("call_id")
+                .or_else(|| item.get("id"))
+                .and_then(Value::as_str)
+                .ok_or(ProtocolError::InvalidField { field: "call_id" })?
+                .to_owned();
+            Ok(ModelEvent::ToolCall(ToolCall {
+                call_id,
+                name: string_field(item, "name")?.to_owned(),
+                input: ToolInput::FunctionJson(string_field(item, "arguments")?.to_owned()),
+            }))
+        }
+        Some("custom_tool_call") => {
+            let call_id = item
+                .get("call_id")
+                .or_else(|| item.get("id"))
+                .and_then(Value::as_str)
+                .ok_or(ProtocolError::InvalidField { field: "call_id" })?
+                .to_owned();
+            Ok(ModelEvent::ToolCall(ToolCall {
+                call_id,
+                name: string_field(item, "name")?.to_owned(),
+                input: ToolInput::Freeform(string_field(item, "input")?.to_owned()),
+            }))
+        }
         Some("reasoning") => Ok(ModelEvent::ReasoningItem(decode_reasoning_item(item)?)),
         Some(item_type) => Err(ProtocolError::UnsupportedEvent(item_type.to_owned())),
         None => Err(ProtocolError::InvalidField { field: "item.type" }),
@@ -554,14 +619,37 @@ fn string_field<'a>(value: &'a Value, field: &'static str) -> Result<&'a str, Pr
 }
 
 /// Encodes canonical model input as Responses items.
-pub fn encode_input(input: &[ModelInput]) -> Vec<sonic_rs::Value> {
+pub fn encode_input(
+    input: &[ModelInput],
+    developer_role_support: harness_model_api::DeveloperRoleSupport,
+    allow_multiple_system_messages: bool,
+) -> Vec<sonic_rs::Value> {
+    let mut seen_system_or_developer = false;
     input
         .iter()
         .map(|item| match item {
             ModelInput::Message { role, text } => {
                 let role = match role {
-                    ModelMessageRole::System => "system",
-                    ModelMessageRole::Developer => "developer",
+                    ModelMessageRole::System => {
+                        if !allow_multiple_system_messages && seen_system_or_developer {
+                            "user"
+                        } else {
+                            seen_system_or_developer = true;
+                            match developer_role_support {
+                                harness_model_api::DeveloperRoleSupport::Disabled => "system",
+                                harness_model_api::DeveloperRoleSupport::Supported
+                                | harness_model_api::DeveloperRoleSupport::DeveloperOnly => "developer",
+                            }
+                        }
+                    }
+                    ModelMessageRole::Developer => {
+                        if !allow_multiple_system_messages && seen_system_or_developer {
+                            "user"
+                        } else {
+                            seen_system_or_developer = true;
+                            "developer"
+                        }
+                    }
                     ModelMessageRole::User => "user",
                     ModelMessageRole::Assistant => "assistant",
                 };
@@ -584,7 +672,6 @@ pub fn encode_input(input: &[ModelInput]) -> Vec<sonic_rs::Value> {
                 "call_id": call_id,
                 "name": name,
                 "arguments": arguments,
-                "status": "completed"
             }),
             ModelInput::FreeformToolCall {
                 call_id,
@@ -595,7 +682,6 @@ pub fn encode_input(input: &[ModelInput]) -> Vec<sonic_rs::Value> {
                 "call_id": call_id,
                 "name": name,
                 "input": input,
-                "status": "completed"
             }),
             ModelInput::ToolResult { call_id, output } => sonic_rs::json!({
                 "type": "function_call_output",
@@ -612,24 +698,25 @@ pub fn encode_input(input: &[ModelInput]) -> Vec<sonic_rs::Value> {
                 encrypted_content,
                 summary,
             } => {
+                let summary_val = match summary {
+                    Some(summary_text) => sonic_rs::json!([{
+                        "type": "summary_text",
+                        "text": summary_text,
+                    }]),
+                    None => sonic_rs::json!([]),
+                };
                 let mut item = sonic_rs::json!({
                     "type": "reasoning",
-                    "status": "completed",
+                    "summary": summary_val,
                 });
                 if let Some(content) = content {
                     item["content"] = sonic_rs::json!([{
-                        "type": "output_text",
+                        "type": "reasoning_text",
                         "text": content,
                     }]);
                 }
                 if let Some(encrypted_content) = encrypted_content {
                     item["encrypted_content"] = sonic_rs::json!(encrypted_content);
-                }
-                if let Some(summary) = summary {
-                    item["summary"] = sonic_rs::json!([{
-                        "type": "summary_text",
-                        "text": summary,
-                    }]);
                 }
                 item
             }
@@ -893,12 +980,54 @@ mod tests {
             },
         ];
 
-        let encoded = encode_input(&input);
+        let encoded = encode_input(
+            &input,
+            harness_model_api::DeveloperRoleSupport::Disabled,
+            true,
+        );
         assert_eq!(encoded[0]["type"], "message");
         assert_eq!(encoded[0]["content"][0]["type"], "input_text");
         assert_eq!(encoded[1]["content"][0]["type"], "output_text");
         assert_eq!(encoded[2]["type"], "function_call");
         assert_eq!(encoded[3]["type"], "function_call_output");
+    }
+
+    #[test]
+    fn reasoning_item_spec_compliance_and_roundtrip() {
+        let input = vec![ModelInput::Reasoning {
+            content: Some("raw reasoning step".to_string()),
+            encrypted_content: Some("enc_payload_xyz".to_string()),
+            summary: Some("reasoning summary".to_string()),
+        }];
+
+        let encoded = encode_input(
+            &input,
+            harness_model_api::DeveloperRoleSupport::Disabled,
+            true,
+        );
+
+        assert_eq!(encoded[0]["type"], "reasoning");
+        assert_eq!(encoded[0]["content"][0]["type"], "reasoning_text");
+        assert_eq!(encoded[0]["content"][0]["text"], "raw reasoning step");
+        assert_eq!(encoded[0]["encrypted_content"], "enc_payload_xyz");
+        assert_eq!(encoded[0]["summary"][0]["type"], "summary_text");
+        assert_eq!(encoded[0]["summary"][0]["text"], "reasoning summary");
+
+        // Verify decoding
+        let item_wrapper = sonic_rs::json!({
+            "type": "response.output_item.done",
+            "item": encoded[0]
+        });
+        let mut text = String::new();
+        let mut usage = None;
+        let event = decode_event(&item_wrapper.to_string(), &mut text, &mut usage).unwrap();
+        if let ModelEvent::ReasoningItem(reasoning) = event {
+            assert_eq!(reasoning.content.as_deref(), Some("raw reasoning step"));
+            assert_eq!(reasoning.encrypted_content.as_deref(), Some("enc_payload_xyz"));
+            assert_eq!(reasoning.summary.as_deref(), Some("reasoning summary"));
+        } else {
+            panic!("Expected ReasoningItem event");
+        }
     }
 
     #[test]
@@ -916,5 +1045,41 @@ mod tests {
             encode_tools(&[tool]),
             Err(ProtocolError::InvalidToolSchema { .. })
         ));
+    }
+
+    #[test]
+    fn test_captures_and_confirms_response_id() {
+        let mut decoder = ResponsesEventDecoder::new();
+        let events = decoder
+            .push(b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_abc123\"}}\n\n")
+            .unwrap();
+        assert_eq!(
+            events,
+            vec![
+                ModelEvent::Started,
+                ModelEvent::Metadata(harness_model_api::ModelResponseMetadata {
+                    response_id: Some("resp_abc123".to_owned()),
+                })
+            ]
+        );
+
+        let events = decoder
+            .push(b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_abc123\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n\n")
+            .unwrap();
+        assert_eq!(
+            events,
+            vec![
+                ModelEvent::Metadata(harness_model_api::ModelResponseMetadata {
+                    response_id: Some("resp_abc123".to_owned()),
+                }),
+                ModelEvent::Terminal(ModelTerminalOutcome::Completed(ModelCompletion {
+                    text: "".to_owned(),
+                    usage: Some(ModelUsage {
+                        input_tokens: Some(10),
+                        output_tokens: Some(5),
+                    }),
+                }))
+            ]
+        );
     }
 }

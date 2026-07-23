@@ -406,6 +406,10 @@ pub(crate) enum DomainEvent {
     ActivityChanged(ActivityState),
     /// A runtime failure surfaced to the frontend.
     Failure(String),
+    /// Open session picker modal.
+    OpenSessionPicker(Vec<crate::picker::SessionMeta>),
+    /// Open rewind picker modal.
+    OpenRewindPicker(Vec<crate::picker::RewindOptionMeta>),
     /// Runtime shutdown completed.
     ShutdownCompleted,
 }
@@ -431,8 +435,8 @@ pub(crate) enum RuntimeRequest {
     StopRequestLoop,
     /// Abort the active model response immediately.
     AbortResponse,
-    /// Apply steering immediately.
-    ApplySteering { text: String },
+    /// Interrupt and optional steering.
+    Interrupt { text: String },
     /// Load the next older persisted transcript page.
     LoadTranscriptPage {
         /// Load entries with sequence numbers below this cursor.

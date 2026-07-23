@@ -1,199 +1,230 @@
 use std::{fmt::Write, path::Path};
 
-use fff_search::{
-    FFFMode, FilePicker, FilePickerOptions, GrepMode, GrepSearchOptions, QueryParser,
-};
+use fff_search::{FFFMode, FilePicker, FilePickerOptions};
+use globset::{Glob, GlobSet, GlobSetBuilder};
+use regex::bytes::{Regex, RegexBuilder};
 
 use super::{ShellWord, resolve};
+
+#[derive(Debug)]
+struct SearchOptions {
+    pattern: String,
+    roots: Vec<String>,
+    max: usize,
+    literal: bool,
+    ignore_case: bool,
+    files_only: bool,
+    includes: Vec<String>,
+    excludes: Vec<String>,
+}
 
 pub(crate) fn execute(
     workspace: &super::WorkspaceRoot,
     args: &[ShellWord],
 ) -> Result<String, String> {
-    if args.is_empty() {
-        return Err("failed to parse `inspect` search input: pattern is required".into());
+    let options = parse_options(args)?;
+    let matcher = build_matcher(&options)?;
+    let includes = build_globs(&options.includes, "--glob")?;
+    let excludes = build_globs(&options.excludes, "--exclude")?;
+    let roots = if options.roots.is_empty() {
+        vec![None]
+    } else {
+        options.roots.iter().map(Some).collect()
+    };
+    let mut paths = Vec::new();
+
+    for root in roots {
+        let (_, base) = match root {
+            Some(root) => resolve(workspace, root)?,
+            None => (String::new(), workspace.path().to_owned()),
+        };
+        if base.is_file() {
+            paths.push((base.clone(), base.display().to_string()));
+            continue;
+        }
+
+        let base_str = base.to_string_lossy().to_string();
+        let mut picker = FilePicker::new(FilePickerOptions {
+            base_path: base_str,
+            enable_content_indexing: false,
+            mode: FFFMode::Ai,
+            watch: false,
+            ..Default::default()
+        })
+        .map_err(|error| format!("failed to initialize search file index: {error}"))?;
+        picker
+            .collect_files()
+            .map_err(|error| format!("failed to collect search files: {error}"))?;
+        paths.extend(
+            picker
+                .get_files()
+                .iter()
+                .filter(|file| !file.is_deleted() && !file.is_binary() && file.size > 0)
+                .map(|file| {
+                    (
+                        file.absolute_path(&picker, &base),
+                        file.relative_path(&picker),
+                    )
+                }),
+        );
     }
+
+    search_paths(
+        paths
+            .iter()
+            .map(|(absolute, relative)| (absolute.as_path(), relative.clone())),
+        &matcher,
+        &includes,
+        &excludes,
+        &options,
+    )
+}
+
+fn parse_options(args: &[ShellWord]) -> Result<SearchOptions, String> {
     let mut pattern = None;
-    let mut root_arg = None;
+    let mut roots = Vec::new();
     let mut max = 100usize;
+    let mut literal = false;
+    let mut ignore_case = false;
+    let mut files_only = false;
+    let mut includes = Vec::new();
+    let mut excludes = Vec::new();
     let mut index = 0;
+
     while index < args.len() {
-        match args[index].value.as_str() {
-            "--max" => {
+        let value = args[index].value.as_str();
+        match value {
+            "-F" => literal = true,
+            "-i" => ignore_case = true,
+            "--files" => files_only = true,
+            "--max" | "-g" | "--glob" | "--exclude" => {
                 index += 1;
-                let value = args.get(index).ok_or(
-                    "failed to parse `inspect` search input: `--max` needs a value",
-                )?;
-                max = super::positive(&value.value, "search --max")?;
-                index += 1;
+                let argument = args.get(index).ok_or_else(|| {
+                    format!("failed to parse `inspect` search input: `{value}` requires a value")
+                })?;
+                match value {
+                    "--max" => max = super::positive(&argument.value, "search --max")?,
+                    "-g" | "--glob" => includes.push(argument.value.clone()),
+                    "--exclude" => excludes.push(argument.value.clone()),
+                    _ => unreachable!(),
+                }
             }
             value if value.starts_with('-') => {
-                index += 1;
+                return Err(format!(
+                    "failed to parse `inspect` search input: unsupported option `{value}`"
+                ));
             }
-            value => {
-                if pattern.is_none() {
-                    pattern = Some(value.to_owned());
-                } else if root_arg.is_none() {
-                    root_arg = Some(value.to_owned());
-                }
-                index += 1;
-            }
+            value if pattern.is_none() => pattern = Some(value.to_owned()),
+            value => roots.push(value.to_owned()),
         }
-    }
-    let pattern = pattern.ok_or("failed to parse `inspect` search input: pattern is required")?;
-    let (root_is_file, base) = if let Some(root_arg) = root_arg {
-        let (_, path) = resolve(workspace, &root_arg)?;
-        (path.is_file(), path)
-    } else {
-        (false, workspace.path().to_owned())
-    };
-
-    // When a specific file is given, read and search it directly — fff's
-    // FilePicker can't handle a file as base_path (it walks directories).
-    if root_is_file {
-        return file_search(&pattern, &base, max);
+        index += 1;
     }
 
-    let base_str = base.to_string_lossy().to_string();
-    let mut picker = FilePicker::new(FilePickerOptions {
-        base_path: base_str,
-        enable_content_indexing: true,
-        mode: FFFMode::Ai,
-        watch: false,
-        ..Default::default()
+    Ok(SearchOptions {
+        pattern: pattern
+            .ok_or("failed to parse `inspect` search input: pattern is required")?,
+        roots,
+        max,
+        literal,
+        ignore_case,
+        files_only,
+        includes,
+        excludes,
     })
-    .map_err(|e| format!("failed to initialize fff: {e}"))?;
-    picker
-        .collect_files()
-        .map_err(|e| format!("failed to index files for fff: {e}"))?;
-
-    // Single-byte patterns bypass fff's bigram index (it returns None for
-    // patterns shorter than 2 bytes), which can cause the grep pipeline to
-    // produce zero matches.  Search those directly with memchr.
-    if pattern.len() == 1 {
-        return single_byte_search(&picker, pattern.as_bytes()[0], max, &base);
-    }
-
-    let parser = QueryParser::new(fff_search::GrepConfig);
-    let query = parser.parse(&pattern);
-    let options = GrepSearchOptions {
-        max_matches_per_file: 50,
-        smart_case: true,
-        page_limit: 10_000,
-        mode: GrepMode::PlainText,
-        classify_definitions: false,
-        ..Default::default()
-    };
-    let result = picker.grep(&query, &options);
-    let total_matches = result.matches.len();
-
-    let mut output = String::new();
-    let mut current_path = String::new();
-    let mut displayed = 0usize;
-    for grep_match in &result.matches {
-        if displayed >= max {
-            continue;
-        }
-        let Some(file) = result.files.get(grep_match.file_index) else {
-            continue;
-        };
-        let path = file.relative_path(&picker);
-        if path != current_path {
-            if !current_path.is_empty() {
-                output.push('\n');
-            }
-            let _ = writeln!(output, "{path}");
-            current_path = path;
-        }
-        let _ = writeln!(output, "{} {}", grep_match.line_number, grep_match.line_content);
-        displayed += 1;
-    }
-    if total_matches > displayed {
-        let _ = writeln!(
-            output,
-            "\n[fff output truncated: showing first {displayed} of {total_matches} matches; refine the query or path constraint]"
-        );
-    }
-    if total_matches == 0 {
-        output.push_str("no results\n");
-    }
-    Ok(output)
 }
 
-/// Search a single file directly — bypasses fff entirely.
-/// Uses memchr's SIMD `Finder` for O(n) substring search.
-fn file_search(pattern: &str, path: &Path, max: usize) -> Result<String, String> {
-    let content = std::fs::read(path)
-        .map_err(|e| format!("failed to read `{}`: {e}", path.display()))?;
-
-    let case_insensitive = !pattern.bytes().any(|b| b.is_ascii_uppercase());
-
-    // Owned needle storage that lives long enough for the Finder to borrow.
-    // memchr's Finder does not require 'static, but the borrowed data must
-    // outlive the if-else block — hence the outer binding.
-    let owned_needle;
-    let (finder, haystack): (memchr::memmem::Finder<'_>, Vec<u8>) = if case_insensitive {
-        owned_needle = pattern.to_ascii_lowercase().into_bytes();
-        let haystack = content.to_ascii_lowercase();
-        (memchr::memmem::Finder::new(&owned_needle), haystack)
+fn build_matcher(options: &SearchOptions) -> Result<Regex, String> {
+    let pattern = if options.literal {
+        regex::escape(&options.pattern)
     } else {
-        (memchr::memmem::Finder::new(pattern.as_bytes()), content.clone())
+        options.pattern.clone()
     };
+    let case_insensitive =
+        options.ignore_case || !options.pattern.bytes().any(|byte| byte.is_ascii_uppercase());
+    RegexBuilder::new(&pattern)
+        .case_insensitive(case_insensitive)
+        .build()
+        .map_err(|error| {
+            format!(
+                "failed to parse `inspect` search input: invalid regular expression `{}`: {error}",
+                options.pattern
+            )
+        })
+}
 
-    // Line-start offsets (from original content, for correct display).
-    let mut line_starts: Vec<usize> = vec![0];
-    for (offset, &b) in content.iter().enumerate() {
-        if b == b'\n' {
-            line_starts.push(offset + 1);
-        }
+fn build_globs(patterns: &[String], option: &str) -> Result<Option<GlobSet>, String> {
+    if patterns.is_empty() {
+        return Ok(None);
     }
+    let mut builder = GlobSetBuilder::new();
+    for pattern in patterns {
+        let glob = Glob::new(pattern).map_err(|error| {
+            format!(
+                "failed to parse `inspect` search input: invalid {option} pattern `{pattern}`: {error}"
+            )
+        })?;
+        builder.add(glob);
+    }
+    builder.build().map(Some).map_err(|error| {
+        format!("failed to parse `inspect` search input: invalid {option} patterns: {error}")
+    })
+}
 
-    let path_str = path.to_string_lossy();
+fn search_paths<'a>(
+    paths: impl Iterator<Item = (&'a Path, String)>,
+    matcher: &Regex,
+    includes: &Option<GlobSet>,
+    excludes: &Option<GlobSet>,
+    options: &SearchOptions,
+) -> Result<String, String> {
     let mut output = String::new();
-    let mut total_matches: usize = 0;
-    let mut displayed: usize = 0;
-    let mut file_matched = false;
+    let mut total_matches = 0usize;
+    let mut displayed = 0usize;
 
-    let mut pos = 0;
-    while let Some(abs_pos) = finder.find(&haystack[pos..]).map(|p| pos + p) {
-        total_matches += 1;
+    for (absolute, relative) in paths {
+        if includes
+            .as_ref()
+            .is_some_and(|patterns| !patterns.is_match(&relative))
+            || excludes
+                .as_ref()
+                .is_some_and(|patterns| patterns.is_match(&relative))
+        {
+            continue;
+        }
+        let content = std::fs::read(absolute)
+            .map_err(|error| format!("failed to read `{}`: {error}", absolute.display()))?;
+        let mut file_heading_written = false;
 
-        if displayed < max {
-            if !file_matched {
+        for (line_index, line) in content.split(|byte| *byte == b'\n').enumerate() {
+            if !matcher.is_match(line) {
+                continue;
+            }
+            total_matches += 1;
+            if displayed >= options.max {
+                continue;
+            }
+            if options.files_only {
+                let _ = writeln!(output, "{relative}");
+                displayed += 1;
+                break;
+            }
+            if !file_heading_written {
                 if !output.is_empty() {
                     output.push('\n');
                 }
-                let _ = writeln!(output, "{path_str}");
-                file_matched = true;
+                let _ = writeln!(output, "{relative}");
+                file_heading_written = true;
             }
-
-            // Find line number via the line-starts index.
-            let line_idx = match line_starts.binary_search(&abs_pos) {
-                Ok(i) => i + 1,
-                Err(i) => i,
-            };
-
-            // Extract the full line from ORIGINAL content for display.
-            let line_start = line_starts[line_idx - 1];
-            let line_end = content[line_start..]
-                .iter()
-                .position(|&b| b == b'\n')
-                .map(|p| line_start + p)
-                .unwrap_or(content.len());
-            let line_bytes = &content[line_start..line_end];
-            let line_text = String::from_utf8_lossy(line_bytes);
-
-            let _ = writeln!(output, "{line_idx} {line_text}");
+            let text = String::from_utf8_lossy(line);
+            let _ = writeln!(output, "{} {text}", line_index + 1);
             displayed += 1;
         }
-
-        pos = abs_pos + 1;
     }
 
     if total_matches > displayed {
         let _ = writeln!(
             output,
-            "\n[output truncated: showing first {displayed} of {total_matches} matches; refine the query or path constraint]"
+            "\n[search output truncated: showing first {displayed} of {total_matches} matches; refine the query or path constraint]"
         );
     }
     if total_matches == 0 {
@@ -202,85 +233,73 @@ fn file_search(pattern: &str, path: &Path, max: usize) -> Result<String, String>
     Ok(output)
 }
 
-/// Search for a single-byte pattern across all collected files using memchr.
-/// Bypasses fff's bigram index which breaks for 1-byte patterns.
-fn single_byte_search(
-    picker: &FilePicker,
-    byte: u8,
-    max: usize,
-    base: &Path,
-) -> Result<String, String> {
-    let files = picker.get_files();
-    let mut output = String::new();
-    let mut total_matches: usize = 0;
-    let mut displayed: usize = 0;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    for file in files {
-        if file.is_deleted() || file.is_binary() || file.size == 0 {
-            continue;
-        }
-
-        let abs_path = file.absolute_path(picker, base);
-        let content = match std::fs::read(&abs_path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-
-        // Find every occurrence of the byte, computing line numbers as we go.
-        // Emit matches grouped by file path, matching the fff grep output format.
-        let path = file.relative_path(picker);
-        let mut line: usize = 1;
-        let mut line_start: usize = 0;
-        let mut file_matched = false;
-
-        for (offset, &ch) in content.iter().enumerate() {
-            if ch == b'\n' {
-                line += 1;
-                line_start = offset + 1;
-                continue;
-            }
-
-            if ch != byte {
-                continue;
-            }
-
-            total_matches += 1;
-
-            // Once display budget is exhausted just count.
-            if displayed >= max {
-                continue;
-            }
-
-            if !file_matched {
-                if !output.is_empty() {
-                    output.push('\n');
-                }
-                let _ = writeln!(output, "{path}");
-                file_matched = true;
-            }
-
-            // Extract the line content (everything up to the next \n).
-            let line_end = content[offset..]
-                .iter()
-                .position(|&b| b == b'\n')
-                .map(|pos| offset + pos)
-                .unwrap_or(content.len());
-            let line_bytes = &content[line_start..line_end];
-            let line_text = String::from_utf8_lossy(line_bytes);
-
-            let _ = writeln!(output, "{line} {line_text}");
-            displayed += 1;
+    fn word(value: &str) -> ShellWord {
+        ShellWord {
+            value: value.to_string(),
+            quoted: false,
         }
     }
 
-    if total_matches > displayed {
-        let _ = writeln!(
-            output,
-            "\n[output truncated: showing first {displayed} of {total_matches} matches; refine the query or path constraint]"
-        );
+    #[test]
+    fn options_reject_unknown_flags_instead_of_silently_ignoring_them() {
+        let error = parse_options(&[word("needle"), word("--unknown")]).unwrap_err();
+        assert!(error.contains("unsupported option `--unknown`"));
     }
-    if total_matches == 0 {
-        output.push_str("no results\n");
+
+    #[test]
+    fn regex_and_literal_modes_have_distinct_matching_contracts() {
+        let regex = build_matcher(&parse_options(&[word("take|pin")]).unwrap()).unwrap();
+        assert!(regex.is_match(b"take_body"));
+        let literal =
+            build_matcher(&parse_options(&[word("take|pin"), word("-F")]).unwrap()).unwrap();
+        assert!(!literal.is_match(b"take_body"));
+        assert!(literal.is_match(b"take|pin"));
     }
-    Ok(output)
+    #[test]
+    fn execute_applies_regex_and_path_filters_through_workspace_boundary() {
+        let root_path = std::env::temp_dir().join(format!(
+            "inspect-search-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root_path.join("src")).unwrap();
+        std::fs::write(
+            root_path.join("src/main.rs"),
+            "fn take_body() {}\nfn parse_anchor() {}\n",
+        )
+        .unwrap();
+        std::fs::write(root_path.join("src/generated.rs"), "fn take_generated() {}\n").unwrap();
+        std::fs::create_dir_all(root_path.join("tests")).unwrap();
+        std::fs::write(root_path.join("tests/search.rs"), "fn parse_test() {}\n").unwrap();
+        let workspace = super::super::WorkspaceRoot::open(&root_path).unwrap();
+
+        let output = execute(
+            &workspace,
+            &[
+                word("fn (take|parse)"),
+                word("src"),
+                word("tests"),
+                word("--glob"),
+                word("*.rs"),
+                word("--exclude"),
+                word("*generated.rs"),
+            ],
+        )
+        .unwrap();
+
+        assert!(output.contains("main.rs"));
+        assert!(output.contains("take_body"));
+        assert!(output.contains("parse_anchor"));
+        assert!(output.contains("search.rs"));
+        assert!(output.contains("parse_test"));
+        assert!(!output.contains("generated.rs"));
+        std::fs::remove_dir_all(root_path).unwrap();
+    }
 }

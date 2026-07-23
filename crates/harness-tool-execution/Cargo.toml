@@ -9,10 +9,12 @@ version.workspace = true
 harness-tool-api.workspace = true
 inventory.workspace = true
 fff_search.workspace = true
+globset.workspace = true
 libc.workspace = true
 memchr.workspace = true
 object.workspace = true
 portable-pty.workspace = true
+regex.workspace = true
 serde = { workspace = true, features = ["derive"] }
 sonic-rs.workspace = true
 thiserror.workspace = true

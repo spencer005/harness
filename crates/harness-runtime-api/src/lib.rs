@@ -57,8 +57,14 @@ pub enum RuntimeCommand {
     SetModel { selection: ModelSelection },
     /// Requests older persisted transcript entries.
     LoadOlderTranscript { before_sequence: Option<u64> },
-    /// Sets or clears a persisted goal that keeps the agent loop running.
+    /// Sets a persisted goal that keeps the agent loop running.
     SetGoal { instruction: String },
+    /// Pauses the active goal.
+    PauseGoal,
+    /// Resumes the paused goal.
+    ResumeGoal,
+    /// Clears the active goal.
+    ClearGoal,
     /// Requests joined runtime shutdown.
     Shutdown,
 }
@@ -117,8 +123,38 @@ pub enum RuntimeEvent {
     SteeringChanged(Option<String>),
     /// Runtime reports a typed failure.
     Failure(RuntimeFailure),
+    /// Open the session picker overlay in the frontend.
+    OpenSessionPicker(Vec<SessionPickerMeta>),
+    /// Open the rewind picker overlay in the frontend.
+    OpenRewindPicker(Vec<RewindOptionMeta>),
     /// Runtime acknowledges joined shutdown.
     ShutdownComplete,
+}
+
+/// Turn/checkpoint metadata payload for the rewind picker modal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RewindOptionMeta {
+    /// Monotonic sequence identity.
+    pub sequence: u64,
+    /// Display label for turn/checkpoint option.
+    pub label: String,
+}
+
+/// Session metadata payload for the session picker modal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionPickerMeta {
+    /// Session identifier.
+    pub id: String,
+    /// System time timestamp string/epoch string.
+    pub modified_secs: u64,
+    /// Searchable text payload.
+    pub all_text: String,
+    /// Provider/model name.
+    pub model: String,
+    /// Session title.
+    pub title: String,
+    /// Initial snapshot entries for previewing.
+    pub initial_entries: Vec<TranscriptSnapshotEntry>,
 }
 
 /// Frontend-facing context-window token usage.

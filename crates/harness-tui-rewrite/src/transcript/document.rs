@@ -178,7 +178,7 @@ impl TranscriptDocument {
                 continue;
             }
             if self.sequence_index.contains_key(&entry.sequence) {
-                return Err(crate::transcript::TranscriptError::ConflictingSequence(entry.sequence));
+                continue;
             }
             novel.push(entry);
         }

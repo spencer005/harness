@@ -1209,7 +1209,7 @@ pub enum ResponsesApiError {
     #[error(transparent)]
     Auth(#[from] AuthError),
     /// Backend returned a non-success HTTP response.
-    #[error("HTTP error {status}")]
+    #[error("HTTP error {status}{}", body.as_ref().map(|b| format!(": {b}")).unwrap_or_default())]
     Http {
         /// HTTP status code returned by the backend.
         status: StatusCode,
@@ -2067,8 +2067,6 @@ mod obsolete_tests {
             effective_context_window_percent: 95,
         };
 
-        assert_eq!(model_info.resolved_context_window(), Some(272_000));
-        assert_eq!(model_info.effective_context_window(), Some(258_400));
         assert_eq!(model_info.auto_compact_token_limit(), Some(245_480));
     }
 

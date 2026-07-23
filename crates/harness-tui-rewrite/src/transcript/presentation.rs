@@ -15,19 +15,19 @@ pub(super) fn project(payload: &TranscriptPayload) -> DisplayDocument<ControlFre
                 MessageRole::User => ("» ", StyleId::User),
                 MessageRole::Developer => ("» ", StyleId::Developer),
                 MessageRole::Assistant => ("• ", StyleId::Assistant),
-                MessageRole::Tool => ("⚙ ", StyleId::Assistant),
+                MessageRole::Tool => ("⚙ ", StyleId::Tool),
             };
             builder.plain(marker, style, false);
-            builder.plain(text.as_str(), style, true);
+            project_markdown(&mut builder, text.as_str(), style);
         }
         TranscriptPayload::PlainText(text) => project_plain_text(&mut builder, text.as_str()),
         TranscriptPayload::Thinking(text) => {
-            builder.plain("∴ ", StyleId::Muted, false);
-            builder.plain(text.as_str(), StyleId::Muted, true);
+            builder.plain("∴ ", StyleId::Thinking, false);
+            project_markdown(&mut builder, text.as_str(), StyleId::Thinking);
         }
         TranscriptPayload::Error { message, .. } => {
             builder.plain("× ", StyleId::Error, false);
-            builder.plain(message.as_str(), StyleId::Error, true);
+            project_markdown(&mut builder, message.as_str(), StyleId::Error);
         }
         TranscriptPayload::ToolCall {
             name, input, kind, ..
@@ -89,7 +89,7 @@ fn project_plain_text(builder: &mut RawDocumentBuilder, text: &str) {
     ] {
         if let Some(body) = text.strip_prefix(prefix) {
             builder.plain(marker, style, false);
-            builder.plain(body, style, true);
+            project_markdown(builder, body, style);
             return;
         }
     }
@@ -99,7 +99,86 @@ fn project_plain_text(builder: &mut RawDocumentBuilder, text: &str) {
         StyleId::Muted
     };
     builder.plain("· ", style, false);
-    builder.plain(text, style, true);
+    project_markdown(builder, text, style);
+}
+
+fn project_markdown(builder: &mut RawDocumentBuilder, text: &str, base_style: StyleId) {
+    for (line_index, line) in text.split_inclusive('\n').enumerate() {
+        if line_index > 0 {
+            builder.line_break();
+        }
+
+        let line = line.trim_end_matches(['\r', '\n']);
+        let line_style = if line.starts_with('#') {
+            StyleId::Heading
+        } else {
+            base_style
+        };
+        project_markdown_line(builder, line, line_style);
+    }
+}
+
+fn project_markdown_line(builder: &mut RawDocumentBuilder, line: &str, base_style: StyleId) {
+    let bytes = line.as_bytes();
+    let mut cursor = 0usize;
+    let mut plain_start = 0usize;
+
+    while cursor < bytes.len() {
+        let delimiter_len = match bytes[cursor] {
+            b'`' => 1,
+            b'*' if bytes.get(cursor + 1) == Some(&b'*') => 2,
+            b'*' => 1,
+            _ => {
+                cursor += 1;
+                continue;
+            }
+        };
+        let delimiter = &line[cursor..cursor + delimiter_len];
+        let content_start = cursor + delimiter_len;
+        let Some(close_offset) = line[content_start..].find(delimiter) else {
+            cursor = content_start;
+            continue;
+        };
+        let close_start = content_start + close_offset;
+        if close_start == content_start {
+            cursor = close_start + delimiter_len;
+            continue;
+        }
+
+        if plain_start < cursor {
+            builder.plain(&line[plain_start..cursor], base_style, true);
+        }
+        builder.plain(delimiter, base_style, true);
+        let nested_style = match delimiter {
+            "`" if base_style == StyleId::Heading => StyleId::HeadingCode,
+            "`" => StyleId::Code,
+            "**" => bold_style(base_style),
+            "*" => StyleId::Italic,
+            _ => unreachable!("delimiter is selected above"),
+        };
+        builder.plain(&line[content_start..close_start], nested_style, true);
+        builder.plain(delimiter, base_style, true);
+
+        cursor = close_start + delimiter_len;
+        plain_start = cursor;
+    }
+
+    if plain_start < line.len() {
+        builder.plain(&line[plain_start..], base_style, true);
+    }
+}
+
+fn bold_style(base_style: StyleId) -> StyleId {
+    match base_style {
+        StyleId::Assistant => StyleId::AssistantBold,
+        StyleId::User => StyleId::UserBold,
+        StyleId::Developer => StyleId::DeveloperBold,
+        StyleId::Tool => StyleId::ToolBold,
+        StyleId::Thinking | StyleId::Muted => StyleId::ThinkingBold,
+        StyleId::Error => StyleId::ErrorBold,
+        StyleId::Heading => StyleId::Heading,
+        _ => StyleId::Bold,
+    }
 }
 
 fn project_inspect_reads(builder: &mut RawDocumentBuilder, reads: &[InspectReadDisplay]) {
@@ -192,5 +271,17 @@ mod tests {
             kind: crate::domain::ToolOutputKind::Freeform { display: None },
         });
         assert_eq!(document.selectable_text(), "ared");
+    }
+
+    #[test]
+    fn markdown_wysiwyg_formatting() {
+        let document = project(&TranscriptPayload::Message {
+            role: MessageRole::Assistant,
+            text: ExternalText::new("# Heading `code`\n**bold text** *italic* `code`"),
+        });
+        assert_eq!(
+            document.selectable_text(),
+            "# Heading `code`\n**bold text** *italic* `code`"
+        );
     }
 }

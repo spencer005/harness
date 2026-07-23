@@ -372,8 +372,31 @@ impl Transcript {
         next_before_sequence: Option<u64>,
         reached_start: bool,
     ) -> Result<(), TranscriptError> {
-        let PageRequestState::Loading { before_sequence } = self.page_request else {
+        if (matches!(self.page_request, PageRequestState::Idle) || matches!(self.page_request, PageRequestState::ReachedStart))
+            && reached_start
+            && next_before_sequence.is_none()
+        {
+            let snapshot_entries: Vec<_> = entries
+                .into_iter()
+                .map(|e| crate::domain::TranscriptSnapshotEntry {
+                    sequence: Some(e.sequence),
+                    payload: e.payload,
+                })
+                .collect();
+            self.document = TranscriptDocument::from_snapshot(snapshot_entries)?;
+            self.layout = TranscriptLayoutCache::default();
+            self.viewport = ViewportState::FollowingTail;
+            self.selection = None;
+            self.stream = AssistantStream::Idle;
+            self.thinking = ThinkingStream::Idle;
+            self.page_request = PageRequestState::ReachedStart;
+            self.before_sequence = None;
             return Ok(());
+        }
+
+        let before_sequence = match self.page_request {
+            PageRequestState::Loading { before_sequence } => before_sequence,
+            _ => None,
         };
 
         if let (Some(before), Some(next)) = (before_sequence, next_before_sequence) {
@@ -390,7 +413,7 @@ impl Transcript {
         if novel.is_empty() {
             if reached_start {
                 self.page_request = PageRequestState::ReachedStart;
-            } else {
+            } else if matches!(self.page_request, PageRequestState::Loading { .. }) {
                 self.page_request = PageRequestState::Rejected;
                 return Err(TranscriptError::PageContainsNoNewEntries);
             }

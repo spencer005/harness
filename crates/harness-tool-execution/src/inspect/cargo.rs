@@ -40,13 +40,18 @@ pub(crate) fn test(workspace: &WorkspaceRoot, args: &[ShellWord]) -> Result<Stri
         if let Some(filter) = filter {
             cmd_args.push(filter.clone());
         }
-        if !parsed.libtest_args.is_empty() {
-            cmd_args.push("--".to_string());
-            cmd_args.extend(parsed.libtest_args.iter().cloned());
-        }
+        cmd_args.push("--".to_string());
+        cmd_args.extend(parsed.libtest_args.iter().cloned());
+        cmd_args.extend([
+            "-Z".to_string(),
+            "unstable-options".to_string(),
+            "--format".to_string(),
+            "json".to_string(),
+        ]);
 
         let output = Command::new("cargo")
             .args(&cmd_args)
+            .env("RUSTC_BOOTSTRAP", "1")
             .current_dir(workspace.path())
             .output()
             .map_err(|error| {
@@ -83,10 +88,25 @@ pub(crate) fn test(workspace: &WorkspaceRoot, args: &[ShellWord]) -> Result<Stri
 
 fn parse_cargo_check_command(args: &[ShellWord]) -> Result<Vec<String>, String> {
     let mut command_args = vec!["check".to_string(), "--locked".to_string()];
-    for word in args {
+    let mut index = 0;
+    while index < args.len() {
+        let word = &args[index];
         let value = word.value.as_str();
         match value {
-            "--lib" | "--all-targets" => command_args.push(word.value.clone()),
+            "--lib" | "--all-targets" | "--workspace" | "--all" | "--all-features" => {
+                command_args.push(word.value.clone());
+            }
+            "-p" | "--package" => {
+                command_args.push(word.value.clone());
+                index += 1;
+                let pkg = args.get(index).ok_or_else(|| {
+                    format!("failed to parse `inspect` check input: {value} requires a package name")
+                })?;
+                command_args.push(pkg.value.clone());
+            }
+            value if value.starts_with("--package=") && value.len() > 10 => {
+                command_args.push(value.to_string());
+            }
             package if !package.starts_with('-') && !package.contains('=') => {
                 if package.ends_with(".rs")
                     || package.contains('/')
@@ -101,12 +121,12 @@ fn parse_cargo_check_command(args: &[ShellWord]) -> Result<Vec<String>, String> 
                 command_args.push(package.to_string());
             }
             _ => {
-                return Err(
-                    "failed to parse `inspect` check input: expected package names, --lib, or --all-targets"
-                        .to_string(),
-                );
+                return Err(format!(
+                    "failed to parse `inspect` check input: unsupported option `{value}`"
+                ));
             }
         }
+        index += 1;
     }
     Ok(command_args)
 }
@@ -372,14 +392,15 @@ fn format_cargo_test_output(status: ExitStatus, stdout: &str, stderr: &str) -> S
         return format_rust_diagnostics(&diagnostics);
     }
 
-    let summary = cargo_test_summary(stdout);
+    let report = parse_libtest_json(stdout);
     if status.success() {
-        return summary
-            .map(|summary| format_cargo_test_summary("ok", summary))
+        return report
+            .summary
+            .map(format_cargo_test_success)
             .unwrap_or_else(|| "ok\n".to_string());
     }
 
-    let failures = rust_test_failure_sections(stdout);
+    let failures = report.failures;
     let runtime_failures = rust_test_runtime_failure_sections(stderr);
     if failures.is_empty() && runtime_failures.is_empty() {
         return format!("cargo test failed {}\n", output_status_text(status));
@@ -391,8 +412,8 @@ fn format_cargo_test_output(status: ExitStatus, stdout: &str, stderr: &str) -> S
         output.push('\n');
     }
     output.push_str(&runtime_failures);
-    if let Some(summary) = summary {
-        output.push_str(&format_cargo_test_summary("FAILED", summary));
+    if let Some(summary) = report.summary {
+        output.push_str(&format_cargo_test_failure(summary));
     } else {
         let _ = writeln!(output, "cargo test failed {}", output_status_text(status));
     }
@@ -404,97 +425,84 @@ struct CargoTestSummary {
     passed: usize,
     failed: usize,
     ignored: usize,
-    measured: usize,
-    filtered_out: usize,
 }
 
-fn cargo_test_summary(stdout: &str) -> Option<CargoTestSummary> {
-    let mut total = CargoTestSummary::default();
-    let mut found = false;
+#[derive(Debug, Default, PartialEq, Eq)]
+struct LibtestReport {
+    summary: Option<CargoTestSummary>,
+    failures: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct LibtestEvent {
+    #[serde(rename = "type")]
+    kind: String,
+    event: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    stdout: Option<String>,
+    #[serde(default)]
+    passed: usize,
+    #[serde(default)]
+    failed: usize,
+    #[serde(default)]
+    ignored: usize,
+}
+
+fn parse_libtest_json(stdout: &str) -> LibtestReport {
+    let mut report = LibtestReport::default();
+    let mut summary = CargoTestSummary::default();
+    let mut found_suite = false;
+
     for line in stdout.lines() {
-        let Some(result) = line.trim().strip_prefix("test result: ") else {
+        let Ok(event) = sonic_rs::from_str::<LibtestEvent>(line) else {
             continue;
         };
-        let Some((_, counts)) = result.split_once(". ") else {
-            continue;
-        };
-        let mut parsed = CargoTestSummary::default();
-        for count in counts.split(';') {
-            let count = count.trim();
-            if let Some(value) = test_summary_count(count, " passed") {
-                parsed.passed = value;
-            } else if let Some(value) = test_summary_count(count, " failed") {
-                parsed.failed = value;
-            } else if let Some(value) = test_summary_count(count, " ignored") {
-                parsed.ignored = value;
-            } else if let Some(value) = test_summary_count(count, " measured") {
-                parsed.measured = value;
-            } else if let Some(value) = test_summary_count(count, " filtered out") {
-                parsed.filtered_out = value;
+        if event.kind == "suite" && matches!(event.event.as_str(), "ok" | "failed") {
+            summary.passed += event.passed;
+            summary.failed += event.failed;
+            summary.ignored += event.ignored;
+            found_suite = true;
+        } else if event.kind == "test" && event.event == "failed" {
+            if let Some(name) = event.name {
+                let _ = writeln!(report.failures, "{name}");
             }
-        }
-        total.passed += parsed.passed;
-        total.failed += parsed.failed;
-        total.ignored += parsed.ignored;
-        total.measured += parsed.measured;
-        total.filtered_out += parsed.filtered_out;
-        found = true;
-    }
-    found.then_some(total)
-}
-
-fn test_summary_count(value: &str, suffix: &str) -> Option<usize> {
-    value.strip_suffix(suffix)?.parse().ok()
-}
-
-fn format_cargo_test_summary(status: &str, summary: CargoTestSummary) -> String {
-    format!(
-        "{status}: {} passed; {} failed; {} ignored; {} measured; {} filtered out\n",
-        summary.passed, summary.failed, summary.ignored, summary.measured, summary.filtered_out
-    )
-}
-
-fn rust_test_failure_sections(stdout: &str) -> String {
-    let lines = stdout.lines().collect::<Vec<_>>();
-    let mut output = String::new();
-    let mut index = 0;
-    while index < lines.len() {
-        let line = lines[index].trim();
-        let Some(name) = line
-            .strip_prefix("---- ")
-            .and_then(|line| line.strip_suffix(" stdout ----"))
-        else {
-            index += 1;
-            continue;
-        };
-
-        if !output.is_empty() {
-            output.push('\n');
-        }
-        let _ = writeln!(output, "{name}");
-        index += 1;
-        while index < lines.len() {
-            let body_line = lines[index];
-            let trimmed = body_line.trim();
-            if (trimmed.starts_with("---- ") && trimmed.ends_with(" stdout ----"))
-                || trimmed == "failures:"
-            {
-                break;
+            if let Some(stdout) = event.stdout {
+                let stdout = stdout.trim();
+                if !stdout.is_empty() {
+                    let _ = writeln!(report.failures, "{stdout}");
+                }
             }
-            if !trimmed.starts_with("note: run with `RUST_BACKTRACE=") {
-                let _ = writeln!(output, "{body_line}");
-            }
-            index += 1;
-        }
-        while output.ends_with("\n\n") {
-            output.pop();
-        }
-        if !output.ends_with('\n') {
-            output.push('\n');
         }
     }
-    output
+
+    while report.failures.ends_with("\n\n") {
+        report.failures.pop();
+    }
+    report.summary = found_suite.then_some(summary);
+    report
 }
+
+fn format_cargo_test_success(summary: CargoTestSummary) -> String {
+    if summary.ignored == 0 {
+        format!("ok: {} passed\n", summary.passed)
+    } else {
+        format!("ok: {} passed; {} ignored\n", summary.passed, summary.ignored)
+    }
+}
+
+fn format_cargo_test_failure(summary: CargoTestSummary) -> String {
+    if summary.ignored == 0 {
+        format!("FAILED: {} failed; {} passed\n", summary.failed, summary.passed)
+    } else {
+        format!(
+            "FAILED: {} failed; {} passed; {} ignored\n",
+            summary.failed, summary.passed, summary.ignored
+        )
+    }
+}
+
 
 fn rust_test_runtime_failure_sections(stderr: &str) -> String {
     let mut output = String::new();
@@ -673,10 +681,33 @@ mod tests {
             vec!["check".to_string(), "--locked".to_string()]
         );
 
+        assert_eq!(
+            parse_cargo_check_command(&[word("-p"), word("pkg1"), word("-p"), word("pkg2")]).unwrap(),
+            vec![
+                "check".to_string(),
+                "--locked".to_string(),
+                "-p".to_string(),
+                "pkg1".to_string(),
+                "-p".to_string(),
+                "pkg2".to_string(),
+            ]
+        );
+        assert_eq!(
+            parse_cargo_check_command(&[word("pkg1"), word("pkg2")]).unwrap(),
+            vec![
+                "check".to_string(),
+                "--locked".to_string(),
+                "-p".to_string(),
+                "pkg1".to_string(),
+                "-p".to_string(),
+                "pkg2".to_string(),
+            ]
+        );
+
         let error = parse_cargo_check_command(&[word("--message-format=short")]).unwrap_err();
         assert_eq!(
             error,
-            "failed to parse `inspect` check input: expected package names, --lib, or --all-targets"
+            "failed to parse `inspect` check input: unsupported option `--message-format=short`"
         );
 
         let file_error = parse_cargo_check_command(&[word("crates/tool-grammar/src/lib.rs")]).unwrap_err();
@@ -773,13 +804,15 @@ mod tests {
             .unwrap();
         let output = format_cargo_test_output(
             success,
-            "test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 4 filtered out; finished in 0.01s\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n",
+            concat!(
+                r#"{"type":"suite","event":"ok","passed":2,"failed":0,"ignored":1,"measured":0,"filtered_out":4}"#,
+                "\n",
+                r#"{"type":"suite","event":"ok","passed":1,"failed":0,"ignored":0,"measured":0,"filtered_out":0}"#,
+                "\n"
+            ),
             "",
         );
-        assert_eq!(
-            output,
-            "ok: 3 passed; 0 failed; 1 ignored; 0 measured; 4 filtered out\n"
-        );
+        assert_eq!(output, "ok: 3 passed; 1 ignored\n");
 
         let failure = std::process::Command::new("sh")
             .arg("-c")
@@ -788,12 +821,17 @@ mod tests {
             .unwrap();
         let output = format_cargo_test_output(
             failure,
-            "running 1 test\ntest module::fails ... FAILED\n\nfailures:\n\n---- module::fails stdout ----\nthread 'module::fails' panicked at src/lib.rs:12:5:\nassertion failed: false\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\nfailures:\n    module::fails\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s\n",
+            concat!(
+                r#"{"type":"test","event":"failed","name":"module::fails","stdout":"thread 'module::fails' panicked at src/lib.rs:12:5:\nassertion failed: false\n"}"#,
+                "\n",
+                r#"{"type":"suite","event":"failed","passed":0,"failed":1,"ignored":0,"measured":0,"filtered_out":3}"#,
+                "\n"
+            ),
             "",
         );
         assert_eq!(
             output,
-            "Test failures\nmodule::fails\nthread 'module::fails' panicked at src/lib.rs:12:5:\nassertion failed: false\nFAILED: 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out\n"
+            "Test failures\nmodule::fails\nthread 'module::fails' panicked at src/lib.rs:12:5:\nassertion failed: false\nFAILED: 1 failed; 0 passed\n"
         );
     }
 
@@ -806,7 +844,7 @@ mod tests {
             .unwrap();
         let output = format_cargo_test_output(
             failure,
-            "running 1 test\n",
+            "",
             "thread 'executes_workload' (176968) has overflowed its stack\nfatal runtime error: stack overflow, aborting\nerror: test failed, to rerun pass `-p interp --test workload_tests`\n\nCaused by:\n  process didn't exit successfully (signal: 6, SIGABRT: process abort signal)\n",
         );
 

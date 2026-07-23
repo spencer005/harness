@@ -42,7 +42,7 @@ strings <path> [literal] — Index printable UTF-8 runs of at least four charact
 
 elf <path> [summary|sections|segments|symbols [literal]|relocations [literal]|dynamic [literal]|address <virtual>|offset <file>] — Inspect ELF structure without disassembling. The default summary reports class, architecture, endianness, kind, entry mapping, and interpreter. Other queries report exact file/virtual ranges, symbols, relocations, dynamic tags/imports, or translate between virtual addresses and file offsets. Symbol, relocation, and dynamic literals filter output.
 
-search <pattern> [path] — Regex search; returns matches with file names grouped once and line numbers. Patterns with regex metacharacters are treated as regex; plain identifiers are literal. Example: `search fn .*(needle|pin) src` or `search TODO src --exclude *.generated.rs`. Options: `-F` literal, `-i` ignore-case, `-g/--glob <glob>` include filter, `--exclude <glob>` exclude filter (repeatable), `--files` list paths.
+search <pattern> [path ...] — Regex search; returns matches with file names grouped once and line numbers. Patterns with regex metacharacters are treated as regex; plain identifiers are literal. Example: `search fn .*(needle|pin) src tests` or `search TODO src --exclude *.generated.rs`. Options: `-F` literal, `-i` ignore-case, `-g/--glob <glob>` include filter, `--exclude <glob>` exclude filter (repeatable), `--files` list paths.
 
 which <query> — Fuzzy-search executable commands in PATH and print command names with resolved paths.
 

@@ -6,7 +6,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use super::{
-    DocumentLimits, DocumentLine, DocumentRun, LayoutStorage, StyleId,
+    DocumentLimits, DocumentLine, DocumentRun, LaidOut, StyleId,
     is_permitted_display_character,
 };
 
@@ -111,17 +111,14 @@ pub(super) fn bound_lines(lines: Vec<DocumentLine>, limits: DocumentLimits) -> V
     let source_metrics = document_metrics(&lines);
     if source_metrics.bytes <= limits.max_bytes
         && source_metrics.lines <= limits.max_lines
-        && source_metrics.cells <= limits.max_cells
     {
         return ensure_nonempty(lines);
     }
 
-    let source_byte_limit = limits.max_bytes - OMISSION_MARKER_BYTES;
-    let source_line_limit = limits.max_lines - 1;
-    let source_cell_limit = limits.max_cells - OMISSION_MARKER_CELLS;
-    let mut output = Vec::with_capacity(limits.max_lines);
+    let source_byte_limit = limits.max_bytes.saturating_sub(OMISSION_MARKER_BYTES);
+    let source_line_limit = limits.max_lines.saturating_sub(1);
+    let mut output = Vec::new();
     let mut bytes = 0usize;
-    let mut cells = 0usize;
 
     'lines: for line in lines.into_iter().take(source_line_limit) {
         let mut bounded = DocumentLine { runs: Vec::new() };
@@ -129,8 +126,7 @@ pub(super) fn bound_lines(lines: Vec<DocumentLine>, limits: DocumentLimits) -> V
             let mut text = String::new();
             for grapheme in run.text.graphemes(true) {
                 let next_bytes = bytes.saturating_add(grapheme.len());
-                let next_cells = cells.saturating_add(grapheme.width());
-                if next_bytes > source_byte_limit || next_cells > source_cell_limit {
+                if next_bytes > source_byte_limit {
                     if !text.is_empty() {
                         bounded.runs.push(DocumentRun {
                             text,
@@ -143,7 +139,6 @@ pub(super) fn bound_lines(lines: Vec<DocumentLine>, limits: DocumentLimits) -> V
                 }
                 text.push_str(grapheme);
                 bytes = next_bytes;
-                cells = next_cells;
             }
             if !text.is_empty() {
                 bounded.runs.push(DocumentRun {
@@ -167,7 +162,6 @@ pub(super) fn bound_lines(lines: Vec<DocumentLine>, limits: DocumentLimits) -> V
     let bounded_metrics = document_metrics(&output);
     debug_assert!(bounded_metrics.bytes <= limits.max_bytes);
     debug_assert!(bounded_metrics.lines <= limits.max_lines);
-    debug_assert!(bounded_metrics.cells <= limits.max_cells);
     debug_assert!(output.iter().all(|line| {
         line.runs
             .iter()
@@ -184,7 +178,6 @@ pub(super) fn bound_one_line(
     let source_metrics = document_metrics(&lines);
     if lines.len() == 1
         && source_metrics.bytes <= limits.max_bytes
-        && source_metrics.cells <= limits.max_cells
         && source_metrics.cells <= width
     {
         return lines;
@@ -196,10 +189,7 @@ pub(super) fn bound_one_line(
     let source_byte_limit = limits
         .max_bytes
         .saturating_sub(ONE_LINE_OMISSION_MARKER_BYTES);
-    let source_cell_limit = limits
-        .max_cells
-        .min(width)
-        .saturating_sub(ONE_LINE_OMISSION_MARKER_CELLS);
+    let source_cell_limit = width.saturating_sub(ONE_LINE_OMISSION_MARKER_CELLS);
     let mut output = DocumentLine { runs: Vec::new() };
     let mut bytes = 0usize;
     let mut cells = 0usize;
@@ -242,7 +232,6 @@ pub(super) fn bound_one_line(
     let bounded_metrics = document_metrics(&output);
     debug_assert!(bounded_metrics.bytes <= limits.max_bytes);
     debug_assert!(bounded_metrics.lines == 1);
-    debug_assert!(bounded_metrics.cells <= limits.max_cells);
     debug_assert!(bounded_metrics.cells <= width);
     output
 }
@@ -276,7 +265,7 @@ fn ensure_nonempty(mut lines: Vec<DocumentLine>) -> Vec<DocumentLine> {
     lines
 }
 
-pub(super) fn layout_lines(lines: Vec<DocumentLine>, width: usize) -> LayoutStorage {
+pub(super) fn layout_lines(lines: Vec<DocumentLine>, width: usize) -> LaidOut {
     let source_line_count = lines.len();
     let mut laid_out = Vec::new();
     let mut selection_cursor = 0usize;
@@ -322,7 +311,7 @@ pub(super) fn layout_lines(lines: Vec<DocumentLine>, width: usize) -> LayoutStor
         laid_out.push(LineBuilder::new(projection_cursor).finish(projection_cursor));
     }
 
-    LayoutStorage { lines: laid_out }
+    LaidOut { lines: laid_out }
 }
 
 #[derive(Debug)]
@@ -447,7 +436,7 @@ mod tests {
 
     #[test]
     fn truncation_marker_stays_inside_every_bound() {
-        let limits = DocumentLimits::new(OMISSION_MARKER_BYTES + 3, 2, OMISSION_MARKER_CELLS + 3);
+        let limits = DocumentLimits::new(OMISSION_MARKER_BYTES + 3, 2);
         let lines = vec![
             DocumentLine {
                 runs: vec![DocumentRun {
@@ -469,7 +458,6 @@ mod tests {
         let metrics = document_metrics(&bounded);
         assert_eq!(metrics.lines, 2);
         assert!(metrics.bytes <= limits.max_bytes);
-        assert!(metrics.cells <= limits.max_cells);
         assert_eq!(bounded[0].runs[0].text, "abc");
         assert_eq!(bounded[1].runs[0].text, OMISSION_MARKER);
     }

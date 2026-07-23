@@ -227,10 +227,6 @@ impl TranscriptLayoutCache {
             .entry(id)
             .expect("layout entry belongs to transcript");
         let revision = entry.revision();
-        let limits = match entry.payload() {
-            crate::domain::TranscriptPayload::ToolOutput { .. } => DocumentLimits::TOOL_OUTPUT,
-            _ => DocumentLimits::TRANSCRIPT_ENTRY,
-        };
         let current = self
             .entry_layouts
             .get(&id)
@@ -244,7 +240,12 @@ impl TranscriptLayoutCache {
             .expect("entry projection is prepared")
             .document
             .clone();
-        let laid_out = projection.bound(limits).layout(width);
+        let laid_out = match entry.payload() {
+            crate::domain::TranscriptPayload::ToolOutput { .. } => {
+                projection.bound(DocumentLimits::TOOL_OUTPUT).layout(width)
+            }
+            _ => projection.layout(width),
+        };
         self.entry_layouts.insert(
             id,
             CachedEntryLayout {

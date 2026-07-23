@@ -4,7 +4,7 @@ use std::{
     cmp::Ordering,
     time::{Duration, Instant},
 };
-
+use crate::picker::{RewindPickerState, SessionMeta, SessionPickerState};
 use crate::{
     display::ClipboardText,
     domain::{
@@ -13,7 +13,7 @@ use crate::{
     },
     input::{
         BoundedInput, HorizontalUnit, InputFragment, PromptCapacityError, PromptEditor,
-        PromptImportError, PromptPosition, VerticalDirection,
+        PromptImportError, PromptPosition, RawInput, VerticalDirection,
     },
     transcript::{Transcript, TranscriptPosition, TranscriptScrollDirection},
 };
@@ -45,24 +45,87 @@ pub(crate) enum MouseCapture {
     },
 }
 
-/// Notice severity used by presentation.
+
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum NoticeSeverity {
-    /// Informational state.
-    Information,
-    /// Recoverable warning.
-    Warning,
-    /// Protocol or runtime failure.
-    Error,
+pub(crate) struct SlashCommandSpec {
+    pub(crate) name: &'static str,
+    pub(crate) aliases: &'static [&'static str],
+    pub(crate) usage: &'static str,
+    pub(crate) summary: &'static str,
 }
 
-/// Visible application notice.
+pub(crate) static KNOWN_SLASH_COMMANDS: &[SlashCommandSpec] = &[
+    SlashCommandSpec {
+        name: "goal",
+        aliases: &["g"],
+        usage: "[task|pause|resume|clear]",
+        summary: "Set, pause, resume, clear, or view session goal",
+    },
+    SlashCommandSpec {
+        name: "model",
+        aliases: &[],
+        usage: "<name> [reasoning] [tier]",
+        summary: "Switch active model settings",
+    },
+    SlashCommandSpec {
+        name: "provider",
+        aliases: &[],
+        usage: "[use] <profile>",
+        summary: "List or switch active provider profile",
+    },
+    SlashCommandSpec {
+        name: "compact",
+        aliases: &[],
+        usage: "[instruction|redo [instruction]|cancel]",
+        summary: "Compact, redo, or cancel session compaction",
+    },
+    SlashCommandSpec {
+        name: "tool",
+        aliases: &[],
+        usage: "<pattern> <enabled|disable>",
+        summary: "Enable or disable tools matching a glob",
+    },
+    SlashCommandSpec {
+        name: "retry",
+        aliases: &[],
+        usage: "",
+        summary: "Retry the current user/tool turn",
+    },
+    SlashCommandSpec {
+        name: "resume",
+        aliases: &[],
+        usage: "[session_id|latest]",
+        summary: "Switch active session or pick a session to resume",
+    },
+    SlashCommandSpec {
+        name: "commands",
+        aliases: &["help"],
+        usage: "",
+        summary: "List available commands",
+    },
+    SlashCommandSpec {
+        name: "rewind",
+        aliases: &[],
+        usage: "[compact] [before:<sequence>]",
+        summary: "Fork the current session, optionally rewinding before the last compaction",
+    },
+];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Notice {
-    /// Untrusted notice text validated during presentation.
-    pub(crate) text: ExternalText,
-    /// Semantic severity.
-    pub(crate) severity: NoticeSeverity,
+pub(crate) enum SlashCommandStatus {
+    None,
+    Autocompleting {
+        prefix: String,
+        matches: Vec<&'static SlashCommandSpec>,
+        selected_index: usize,
+    },
+    Matched {
+        spec: &'static SlashCommandSpec,
+        invoked_as: String,
+        args_text: String,
+        syntax_valid: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -192,10 +255,26 @@ pub(crate) enum UserCommand {
     CancelMouseCapture,
     /// Submit prompt input according to current streaming state.
     Submit,
-    /// Apply queued or current steering immediately.
-    Interrupt,
-    /// Handle the terminal interrupt key.
-    InterruptKey,
+    /// Accept active autocompletion suggestion.
+    CompletionAccept,
+    /// Apply queued or current steering immediately or stop active request.
+    Esc,
+    /// Handle the terminal cancel/interrupt key (Ctrl-C).
+    CtrlC,
+    /// Move the session picker selection up.
+    PickerUp,
+    /// Move the session picker selection down.
+    PickerDown,
+    /// Confirm the current picker selection.
+    PickerConfirm,
+    /// Cancel/dismiss the session picker.
+    PickerCancel,
+    /// Insert a character into the picker search query.
+    PickerChar(char),
+    /// Delete last character from the picker search query.
+    PickerBackspace,
+    /// Populate the session picker with a fresh list.
+    OpenPicker(Vec<SessionMeta>),
     /// Scroll transcript by visual lines; positive values move toward older
     /// content.
     ScrollTranscript {
@@ -226,6 +305,8 @@ pub(crate) enum AppEffect {
     },
     /// Write validated text to the terminal clipboard channel.
     Clipboard(ClipboardText),
+    /// Open the in-TUI session picker overlay with the given sessions.
+    OpenSessionPicker(Vec<SessionMeta>),
 }
 
 /// State transition associated with one runtime delivery.
@@ -281,9 +362,13 @@ pub(crate) struct Application {
     prompt: PromptEditor,
     transcript: Transcript,
     interaction: InteractionState,
-    notice: Option<Notice>,
     agentic_started_at: Option<Instant>,
+    completion_selected_index: usize,
     should_exit: bool,
+    /// Active session picker state, present while the overlay is open.
+    pub(crate) session_picker: Option<SessionPickerState>,
+    /// Active rewind picker state, present while the overlay is open.
+    pub(crate) rewind_picker: Option<RewindPickerState>,
 }
 
 impl Application {
@@ -308,9 +393,11 @@ impl Application {
                 shutdown_requested: false,
                 prompt_delivery_pending: false,
             },
-            notice: None,
             agentic_started_at: None,
+            completion_selected_index: 0,
             should_exit: false,
+            session_picker: None,
+            rewind_picker: None,
         })
     }
 
@@ -330,6 +417,70 @@ impl Application {
         &self.prompt
     }
 
+    /// Evaluates the active slash command autocompletion / syntax matching status.
+    pub(crate) fn slash_command_status(&self) -> SlashCommandStatus {
+        let text = self.prompt.text();
+        if !text.starts_with('/') || text.starts_with("//") {
+            return SlashCommandStatus::None;
+        }
+
+        let trimmed_start = text.trim_start();
+        if !trimmed_start.starts_with('/') || trimmed_start.starts_with("//") {
+            return SlashCommandStatus::None;
+        }
+
+        let after_slash = &trimmed_start[1..];
+        let mut parts = after_slash.splitn(2, char::is_whitespace);
+        let invoked = parts.next().unwrap_or("");
+        let has_space_after = after_slash.chars().any(char::is_whitespace);
+        let args_text = parts.next().unwrap_or("").to_string();
+
+        if let Some(spec) = KNOWN_SLASH_COMMANDS
+            .iter()
+            .find(|s| s.name == invoked || s.aliases.contains(&invoked))
+        {
+            if has_space_after || after_slash == spec.name {
+                let syntax_valid = match spec.name {
+                    "goal" => true,
+                    "model" => !args_text.trim().is_empty(),
+                    "provider" => true,
+                    "tool" => args_text.split_whitespace().count() >= 2,
+                    _ => true,
+                };
+                return SlashCommandStatus::Matched {
+                    spec,
+                    invoked_as: invoked.to_string(),
+                    args_text,
+                    syntax_valid,
+                };
+            }
+        }
+
+        let matches: Vec<&'static SlashCommandSpec> = KNOWN_SLASH_COMMANDS
+            .iter()
+            .filter(|spec| {
+                spec.name.starts_with(invoked)
+                    || spec.aliases.iter().any(|alias| alias.starts_with(invoked))
+            })
+            .collect();
+
+        if matches.is_empty() {
+            return SlashCommandStatus::None;
+        }
+
+        let selected_index = if matches.is_empty() {
+            0
+        } else {
+            self.completion_selected_index % matches.len()
+        };
+
+        SlashCommandStatus::Autocompleting {
+            prefix: invoked.to_string(),
+            matches,
+            selected_index,
+        }
+    }
+
     /// Returns mutable transcript state for cached frame preparation.
     pub(crate) fn transcript_mut(&mut self) -> &mut Transcript {
         &mut self.transcript
@@ -340,9 +491,11 @@ impl Application {
         self.interaction.mouse_capture
     }
 
-    /// Returns the current notice.
-    pub(crate) fn notice(&self) -> Option<&Notice> {
-        self.notice.as_ref()
+
+
+    /// Returns whether the session picker overlay is currently open.
+    pub(crate) fn picker_active(&self) -> bool {
+        self.session_picker.is_some()
     }
 
     /// Returns whether exit confirmation is armed.
@@ -414,9 +567,112 @@ impl Application {
 
     /// Reduces one user command to zero or more effects.
     pub(crate) fn handle_user_command(&mut self, command: UserCommand) -> Vec<AppEffect> {
+        // When a modal picker is open, most normal commands are suppressed —
+        // only picker-specific commands pass through.
+        if self.session_picker.is_some() || self.rewind_picker.is_some() {
+            match command {
+                UserCommand::PickerUp => {
+                    if let Some(picker) = &mut self.session_picker {
+                        let filtered_len = picker.filtered_sessions().len();
+                        if filtered_len > 0 {
+                            let i = match picker.list_state.selected() {
+                                Some(i) => if i == 0 { filtered_len - 1 } else { i - 1 },
+                                None => 0,
+                            };
+                            picker.list_state.select(Some(i));
+                        }
+                    } else if let Some(picker) = &mut self.rewind_picker {
+                        let options_len = picker.options.len();
+                        if options_len > 0 {
+                            let i = match picker.list_state.selected() {
+                                Some(i) => if i == 0 { options_len - 1 } else { i - 1 },
+                                None => 0,
+                            };
+                            picker.list_state.select(Some(i));
+                        }
+                    }
+                }
+                UserCommand::PickerDown => {
+                    if let Some(picker) = &mut self.session_picker {
+                        let filtered_len = picker.filtered_sessions().len();
+                        if filtered_len > 0 {
+                            let i = match picker.list_state.selected() {
+                                Some(i) => if i >= filtered_len - 1 { 0 } else { i + 1 },
+                                None => 0,
+                            };
+                            picker.list_state.select(Some(i));
+                        }
+                    } else if let Some(picker) = &mut self.rewind_picker {
+                        let options_len = picker.options.len();
+                        if options_len > 0 {
+                            let i = match picker.list_state.selected() {
+                                Some(i) => if i >= options_len - 1 { 0 } else { i + 1 },
+                                None => 0,
+                            };
+                            picker.list_state.select(Some(i));
+                        }
+                    }
+                }
+                UserCommand::PickerBackspace => {
+                    if let Some(picker) = &mut self.session_picker {
+                        picker.query.pop();
+                        // Reset selection when query changes.
+                        if !picker.filtered_sessions().is_empty() {
+                            picker.list_state.select(Some(0));
+                        }
+                    }
+                }
+                UserCommand::PickerChar(c) => {
+                    if let Some(picker) = &mut self.session_picker {
+                        picker.query.push(c);
+                        if !picker.filtered_sessions().is_empty() {
+                            picker.list_state.select(Some(0));
+                        }
+                    }
+                }
+                UserCommand::PickerConfirm => {
+                    if let Some(mut picker) = self.session_picker.take() {
+                        let filtered = picker.filtered_sessions();
+                        let selected_id = picker.list_state.selected().and_then(|i| {
+                            filtered.get(i).map(|(s, _)| s.id.clone())
+                        });
+                        if let Some(id) = selected_id {
+                            return vec![AppEffect::Runtime {
+                                request: RuntimeRequest::SubmitInput {
+                                    text: format!("/resume {}", id),
+                                },
+                                completion: DeliveryCompletion::None,
+                            }];
+                        }
+                    } else if let Some(mut picker) = self.rewind_picker.take() {
+                        let selected_seq = picker.list_state.selected().and_then(|i| {
+                            picker.options.get(i).map(|o| o.sequence)
+                        });
+                        if let Some(seq) = selected_seq {
+                            return vec![AppEffect::Runtime {
+                                request: RuntimeRequest::SubmitInput {
+                                    text: format!("/rewind {}", seq),
+                                },
+                                completion: DeliveryCompletion::None,
+                            }];
+                        }
+                    }
+                }
+                UserCommand::PickerCancel => {
+                    self.session_picker = None;
+                    self.rewind_picker = None;
+                }
+                UserCommand::OpenPicker(sessions) => {
+                    self.session_picker = Some(SessionPickerState::new(sessions));
+                }
+                _ => {}
+            }
+            return Vec::new();
+        }
+
         if !matches!(
             command,
-            UserCommand::InterruptKey
+            UserCommand::CtrlC
                 | UserCommand::CopyTranscriptSelection
                 | UserCommand::ScrollTranscript { .. }
                 | UserCommand::ScrollTranscriptTop { .. }
@@ -439,12 +695,12 @@ impl Application {
                     self.interaction.focus = Focus::Prompt;
                     self.transcript.clear_selection();
                     if let Err(error) = self.prompt.insert(fragment) {
-                        self.set_notice(error.to_string(), NoticeSeverity::Warning);
+                        self.set_notice(error.to_string());
                     }
                 }
             }
             UserCommand::InputRejected(error) => {
-                self.set_notice(error.to_string(), NoticeSeverity::Warning);
+                self.set_notice(error.to_string());
             }
             UserCommand::DeleteBackward => {
                 if self.prompt_edit_available() {
@@ -486,6 +742,27 @@ impl Application {
                 selecting,
             } => {
                 if self.prompt_edit_available() {
+                    if let SlashCommandStatus::Autocompleting {
+                        matches,
+                        selected_index,
+                        ..
+                    } = self.slash_command_status()
+                    {
+                        if !matches.is_empty() {
+                            match direction {
+                                VerticalDirection::Up => {
+                                    self.completion_selected_index = selected_index
+                                        .checked_sub(1)
+                                        .unwrap_or(matches.len() - 1);
+                                }
+                                VerticalDirection::Down => {
+                                    self.completion_selected_index =
+                                        (selected_index + 1) % matches.len();
+                                }
+                            }
+                            return Vec::new();
+                        }
+                    }
                     self.prompt.move_vertical(width, direction, selecting);
                 }
             }
@@ -646,9 +923,61 @@ impl Application {
                 self.interaction.mouse_capture = MouseCapture::None;
                 self.interaction.transcript_selection_scroll = None;
             }
-            UserCommand::Submit => return self.submit_prompt(),
-            UserCommand::Interrupt => return self.interrupt_response(),
-            UserCommand::InterruptKey => return self.handle_interrupt_key(),
+            UserCommand::CompletionAccept => {
+                match self.slash_command_status() {
+                    SlashCommandStatus::Autocompleting {
+                        matches,
+                        selected_index,
+                        ..
+                    } => {
+                        if let Some(spec) = matches.get(selected_index) {
+                            self.prompt.clear();
+                            let text = format!("/{} ", spec.name);
+                            let fragment = InputFragment::<RawInput>::new(&text).bound().unwrap();
+                            let _ = self.prompt.insert(fragment);
+                            self.completion_selected_index = 0;
+                            return Vec::new();
+                        }
+                    }
+                    SlashCommandStatus::Matched {
+                        spec,
+                        invoked_as,
+                        args_text,
+                        ..
+                    } => {
+                        if args_text.is_empty() && invoked_as != spec.name {
+                            self.prompt.clear();
+                            let text = format!("/{} ", spec.name);
+                            let fragment = InputFragment::<RawInput>::new(&text).bound().unwrap();
+                            let _ = self.prompt.insert(fragment);
+                            self.completion_selected_index = 0;
+                            return Vec::new();
+                        }
+                    }
+                    SlashCommandStatus::None => {}
+                }
+                return Vec::new();
+            }
+            UserCommand::Submit => {
+                if let SlashCommandStatus::Autocompleting {
+                    matches,
+                    selected_index,
+                    ..
+                } = self.slash_command_status()
+                {
+                    if let Some(spec) = matches.get(selected_index) {
+                        self.prompt.clear();
+                        let text = format!("/{} ", spec.name);
+                        let fragment = InputFragment::<RawInput>::new(&text).bound().unwrap();
+                        let _ = self.prompt.insert(fragment);
+                        self.completion_selected_index = 0;
+                        return Vec::new();
+                    }
+                }
+                return self.submit_prompt();
+            }
+            UserCommand::Esc => return self.esc_pressed(),
+            UserCommand::CtrlC => return self.ctrl_c_pressed(),
             UserCommand::ScrollTranscript {
                 width,
                 height,
@@ -674,6 +1003,15 @@ impl Application {
                     return vec![AppEffect::Clipboard(text)];
                 }
             }
+            UserCommand::OpenPicker(sessions) => {
+                self.session_picker = Some(SessionPickerState::new(sessions));
+            }
+            UserCommand::PickerUp
+            | UserCommand::PickerDown
+            | UserCommand::PickerConfirm
+            | UserCommand::PickerCancel
+            | UserCommand::PickerChar(_)
+            | UserCommand::PickerBackspace => {}
         }
         Vec::new()
     }
@@ -685,7 +1023,6 @@ impl Application {
                 if let Err(error) = self.transcript.append_snapshot(entry) {
                     self.set_notice(
                         format!("runtime transcript protocol violation: {}", error),
-                        NoticeSeverity::Error,
                     );
                 }
             }
@@ -699,7 +1036,6 @@ impl Application {
                 {
                     self.set_notice(
                         format!("runtime transcript protocol violation: {}", error),
-                        NoticeSeverity::Error,
                     );
                 }
             }
@@ -712,7 +1048,6 @@ impl Application {
                 {
                     self.set_notice(
                         format!("runtime transcript protocol violation: {}", error),
-                        NoticeSeverity::Error,
                     );
                 }
             }
@@ -745,7 +1080,6 @@ impl Application {
                 if let Err(error) = self.transcript.begin_response_stream() {
                     self.set_notice(
                         format!("runtime transcript protocol violation: {}", error),
-                        NoticeSeverity::Error,
                     );
                 }
                 self.session.response_streaming = true;
@@ -759,7 +1093,6 @@ impl Application {
                 if let Err(error) = self.transcript.append_assistant_delta(delta) {
                     self.set_notice(
                         format!("runtime transcript protocol violation: {}", error),
-                        NoticeSeverity::Error,
                     );
                 }
             }
@@ -767,7 +1100,6 @@ impl Application {
                 if let Err(error) = self.transcript.append_thinking_delta(delta) {
                     self.set_notice(
                         format!("runtime transcript protocol violation: {}", error),
-                        NoticeSeverity::Error,
                     );
                 }
             }
@@ -775,7 +1107,6 @@ impl Application {
                 if let Err(error) = self.transcript.complete_response_stream() {
                     self.set_notice(
                         format!("runtime transcript protocol violation: {}", error),
-                        NoticeSeverity::Error,
                     );
                 }
                 self.session.response_streaming = false;
@@ -785,7 +1116,6 @@ impl Application {
                 if let Err(error) = self.transcript.complete_response_stream() {
                     self.set_notice(
                         format!("runtime transcript protocol violation: {}", error),
-                        NoticeSeverity::Error,
                     );
                 }
                 self.session.response_streaming = false;
@@ -846,9 +1176,15 @@ impl Application {
                 }
             }
             DomainEvent::Failure(message) => {
-                self.set_notice(message, NoticeSeverity::Error);
+                self.set_notice(message);
             }
 
+            DomainEvent::OpenSessionPicker(sessions) => {
+                self.session_picker = Some(crate::picker::SessionPickerState::new(sessions));
+            }
+            DomainEvent::OpenRewindPicker(options) => {
+                self.rewind_picker = Some(crate::picker::RewindPickerState::new(options));
+            }
             DomainEvent::ShutdownCompleted => {
                 self.should_exit = true;
             }
@@ -888,12 +1224,12 @@ impl Application {
                 self.interaction.shutdown_requested = false;
             }
         }
-        self.set_notice(message, NoticeSeverity::Error);
+        self.set_notice(message);
     }
 
     /// Handles closure of the runtime event channel.
     pub(crate) fn runtime_disconnected(&mut self) {
-        self.set_notice("runtime event channel closed", NoticeSeverity::Error);
+        self.set_notice("runtime event channel closed");
         self.should_exit = true;
     }
 
@@ -944,96 +1280,53 @@ impl Application {
             return Vec::new();
         };
         let text = submission.text().to_string();
-        let request = if (self.session.response_streaming || self.session.model_awaiting)
-            && !text.trim_start().starts_with('/')
-        {
-            self.transcript.append(crate::domain::TranscriptPayload::Message {
-                role: crate::domain::MessageRole::User,
-                text: crate::domain::ExternalText::new(text.clone()),
-            });
-            RuntimeRequest::QueueSteering { text }
-        } else {
-            RuntimeRequest::SubmitInput { text }
-        };
         self.interaction.prompt_delivery_pending = true;
         vec![AppEffect::Runtime {
-            request,
+            request: RuntimeRequest::SubmitInput { text },
             completion: DeliveryCompletion::Prompt(submission.token()),
         }]
     }
 
-    fn interrupt_response(&mut self) -> Vec<AppEffect> {
-        let model_busy = self.session.response_streaming || self.session.model_awaiting;
-        if !model_busy || self.interaction.prompt_delivery_pending {
+    fn esc_pressed(&mut self) -> Vec<AppEffect> {
+        if self.interaction.prompt_delivery_pending {
             return Vec::new();
         }
 
         if let Some(submission) = self.prompt.prepare_submission() {
-            // Typed text present: apply it as steering and interrupt.
-            self.transcript.append(crate::domain::TranscriptPayload::Event(
-                crate::domain::ExternalText::new("Steering...".to_string()),
-            ));
             self.interaction.prompt_delivery_pending = true;
-            let text = submission.text().to_string();
-            self.transcript.append(crate::domain::TranscriptPayload::Message {
-                role: crate::domain::MessageRole::User,
-                text: crate::domain::ExternalText::new(text.clone()),
-            });
-            vec![AppEffect::Runtime {
-                request: RuntimeRequest::ApplySteering { text },
+            return vec![AppEffect::Runtime {
+                request: RuntimeRequest::Interrupt {
+                    text: submission.text().to_string(),
+                },
                 completion: DeliveryCompletion::Prompt(submission.token()),
-            }]
-        } else if self.session.queued_steering.is_some() {
-            // No new text but queued steering exists — flush it immediately.
-            vec![AppEffect::Runtime {
-                request: RuntimeRequest::ApplySteering {
-                    text: String::new(),
+            }];
+        }
+
+        if let Some(queued) = self.session.queued_steering.as_ref() {
+            return vec![AppEffect::Runtime {
+                request: RuntimeRequest::Interrupt {
+                    text: queued.as_str().to_owned(),
                 },
                 completion: DeliveryCompletion::None,
-            }]
-        } else {
-            // No text at all. Esc means: stop the response immediately.
-            // Unlike Ctrl-C this does NOT use the exit_armed state machine.
-            self.transcript.append(crate::domain::TranscriptPayload::Event(
-                crate::domain::ExternalText::new("Stopping...".to_string()),
-            ));
-            if self.session.response_streaming {
-                vec![AppEffect::Runtime {
-                    request: RuntimeRequest::AbortResponse,
-                    completion: DeliveryCompletion::None,
-                }]
-            } else {
-                vec![AppEffect::Runtime {
-                    request: RuntimeRequest::StopRequestLoop,
-                    completion: DeliveryCompletion::None,
-                }]
-            }
+            }];
         }
+
+        vec![AppEffect::Runtime {
+            request: RuntimeRequest::Interrupt {
+                text: String::new(),
+            },
+            completion: DeliveryCompletion::None,
+        }]
     }
 
-    fn handle_interrupt_key(&mut self) -> Vec<AppEffect> {
+    fn ctrl_c_pressed(&mut self) -> Vec<AppEffect> {
         if !self.prompt.is_empty() && self.prompt_edit_available() {
             self.prompt.clear();
             self.interaction.exit_armed = false;
             return Vec::new();
         }
-        if self.session.response_streaming && !self.interaction.prompt_delivery_pending {
-            self.transcript.append(crate::domain::TranscriptPayload::Event(
-                crate::domain::ExternalText::new("Cancelling...".to_string()),
-            ));
-            
-            if self.interaction.exit_armed {
-                self.interaction.exit_armed = false;
-                return vec![AppEffect::Runtime {
-                    request: RuntimeRequest::AbortResponse,
-                    completion: DeliveryCompletion::None,
-                }];
-            }
-            self.interaction.exit_armed = true;
-            return vec![AppEffect::Runtime {
-                request: RuntimeRequest::StopRequestLoop,
-                completion: DeliveryCompletion::None,
-            }];
+        if self.interaction.prompt_delivery_pending {
+            return Vec::new();
         }
         if self.interaction.exit_armed && !self.interaction.shutdown_requested {
             self.interaction.shutdown_requested = true;
@@ -1044,27 +1337,23 @@ impl Application {
             }];
         }
         self.interaction.exit_armed = true;
-        Vec::new()
+        vec![AppEffect::Runtime {
+            request: RuntimeRequest::StopRequestLoop,
+            completion: DeliveryCompletion::None,
+        }]
     }
 
     fn prompt_edit_available(&mut self) -> bool {
-        if self.interaction.prompt_delivery_pending {
-            self.set_notice(
-                "prompt is awaiting runtime delivery",
-                NoticeSeverity::Information,
-            );
-            false
-        } else {
-            true
-        }
+        !self.interaction.prompt_delivery_pending
     }
 
 
 
-    fn set_notice(&mut self, text: impl Into<String>, severity: NoticeSeverity) {
-        self.notice = Some(Notice {
-            text: ExternalText::new(text),
-            severity,
+    fn set_notice(&mut self, text: impl Into<String>) {
+        let msg = text.into();
+        self.transcript.append(crate::domain::TranscriptPayload::Error {
+            category: crate::domain::RuntimeFailureCategory::Command,
+            message: ExternalText::new(msg),
         });
     }
 }
@@ -1129,12 +1418,11 @@ mod tests {
     fn invalid_stream_order_is_handled_gracefully() {
         let mut app = Application::import(initial()).unwrap();
         app.apply_domain_event(DomainEvent::AssistantTextDelta(ExternalText::new("orphan")));
-        assert!(app.notice().is_some());
-        assert_eq!(app.transcript.entries().count(), 0);
+        assert_eq!(app.transcript.entries().count(), 1);
     }
 
     #[test]
-    fn streaming_enter_queues_non_command_input() {
+    fn streaming_enter_submits_input_for_backend_routing() {
         let mut state = initial();
         state.response_streaming = true;
         let mut app = Application::import(state).unwrap();
@@ -1143,13 +1431,48 @@ mod tests {
         assert!(matches!(
             &effects[0],
             AppEffect::Runtime {
-                request: RuntimeRequest::QueueSteering { text },
+                request: RuntimeRequest::SubmitInput { text },
                 ..
             } if text == "steer"
         ));
     }
+
     #[test]
-    fn streaming_submission_preserves_exact_steering_text() {
+    fn test_slash_command_autocompleting_status() {
+        let mut app = Application::import(initial()).unwrap();
+        app.handle_user_command(insert("/go"));
+        let status = app.slash_command_status();
+        assert!(matches!(status, SlashCommandStatus::Autocompleting { ref prefix, ref matches, .. } if prefix == "go" && matches.iter().any(|m| m.name == "goal")));
+    }
+
+    #[test]
+    fn test_slash_command_non_command_bypass() {
+        let mut app = Application::import(initial()).unwrap();
+        app.handle_user_command(insert("// comment"));
+        assert_eq!(app.slash_command_status(), SlashCommandStatus::None);
+
+        app.handle_user_command(UserCommand::CtrlC);
+        app.handle_user_command(insert("/unknown_prefix"));
+        assert_eq!(app.slash_command_status(), SlashCommandStatus::None);
+    }
+
+    #[test]
+    fn test_slash_command_completion_acceptance() {
+        let mut app = Application::import(initial()).unwrap();
+        app.handle_user_command(insert("/go"));
+        app.handle_user_command(UserCommand::CompletionAccept);
+        assert_eq!(app.prompt().text(), "/goal ");
+    }
+
+    #[test]
+    fn test_alias_completion_acceptance() {
+        let mut app = Application::import(initial()).unwrap();
+        app.handle_user_command(insert("/g"));
+        app.handle_user_command(UserCommand::CompletionAccept);
+        assert_eq!(app.prompt().text(), "/goal ");
+    }
+    #[test]
+    fn streaming_submission_preserves_exact_text() {
         let mut state = initial();
         state.response_streaming = true;
         let mut app = Application::import(state).unwrap();
@@ -1161,7 +1484,7 @@ mod tests {
         assert!(matches!(
             &effects[0],
             AppEffect::Runtime {
-                request: RuntimeRequest::QueueSteering { text: actual },
+                request: RuntimeRequest::SubmitInput { text: actual },
                 ..
             } if actual == text
         ));
@@ -1175,12 +1498,12 @@ mod tests {
         let text = "  interrupt\u{1b}[31m  ";
         app.handle_user_command(insert(text));
 
-        let effects = app.handle_user_command(UserCommand::Interrupt);
+        let effects = app.handle_user_command(UserCommand::Esc);
 
         assert!(matches!(
             &effects[0],
             AppEffect::Runtime {
-                request: RuntimeRequest::ApplySteering { text: actual },
+                request: RuntimeRequest::Interrupt { text: actual },
                 completion: DeliveryCompletion::Prompt(_),
             } if actual == text
         ));
@@ -1194,33 +1517,34 @@ mod tests {
         let mut app = Application::import(state).unwrap();
         app.handle_user_command(insert("new steering"));
 
-        let effects = app.handle_user_command(UserCommand::Interrupt);
+        let effects = app.handle_user_command(UserCommand::Esc);
 
         assert!(matches!(
             &effects[0],
             AppEffect::Runtime {
-                request: RuntimeRequest::ApplySteering { text },
+                request: RuntimeRequest::Interrupt { text },
                 completion: DeliveryCompletion::Prompt(_),
             } if text == "new steering"
         ));
     }
 
     #[test]
-    fn empty_interrupt_leaves_queued_text_for_runtime_consumption() {
+    fn empty_prompt_promotes_queued_steering_on_escape() {
         let mut state = initial();
         state.response_streaming = true;
         state.queued_steering = Some(ExternalText::new("already queued"));
         let mut app = Application::import(state).unwrap();
 
-        let effects = app.handle_user_command(UserCommand::Interrupt);
+        let effects = app.handle_user_command(UserCommand::Esc);
 
         assert!(matches!(
             &effects[0],
             AppEffect::Runtime {
-                request: RuntimeRequest::ApplySteering { text },
+                request: RuntimeRequest::Interrupt { text },
                 completion: DeliveryCompletion::None,
-            } if text.is_empty()
+            } if text == "already queued"
         ));
+        assert_eq!(app.transcript.entries().count(), 0);
     }
     #[test]
     fn transcript_selection_drag_scrolls_at_both_viewport_edges_until_release() {

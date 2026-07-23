@@ -10,6 +10,7 @@ use crossterm::event::{
 };
 use futures_util::StreamExt;
 use harness_runtime_api::{RuntimeClosed, RuntimeCommandSender, RuntimeEventReceiver};
+use ratatui::layout::Position;
 
 use crate::{
     app::{AppEffect, Application, MouseCapture, UserCommand},
@@ -46,14 +47,12 @@ pub async fn run_with_runtime(
             let effects = tokio::select! {
                 terminal_event = terminal_events.next() => {
                     match terminal_event {
-                        Some(Ok(event)) => route_terminal_event(
+                        Some(Ok(event)) => handle_terminal_event(
                             event,
                             &frame,
-                            application.has_transcript_selection(),
-                            application.mouse_capture(),
-                        )
-                        .map(|command| application.handle_user_command(command))
-                        .unwrap_or_default(),
+                            &mut application,
+                            &mut events,
+                        ),
                         Some(Err(error)) => return Err(error),
                         None => break,
                     }
@@ -77,6 +76,11 @@ pub async fn run_with_runtime(
             if !execute_effects(&mut application, &mut terminal, &commands, effects).await? {
                 break;
             }
+
+            // Immediately render updated state if runtime events altered the application
+            let post_now = std::time::Instant::now();
+            let post_frame = prepare(&mut application, terminal.area()?, post_now);
+            terminal.draw(&post_frame)?;
         }
     }
 
@@ -89,22 +93,81 @@ async fn wait_for_visual_change(delay: Option<Duration>) {
         None => std::future::pending().await,
     }
 }
+fn handle_terminal_event(
+    event: Event,
+    frame: &PreparedFrame,
+    application: &mut Application,
+    events: &mut RuntimeEventReceiver,
+) -> Vec<AppEffect> {
+    let Some(command) = route_terminal_event(
+        event,
+        frame,
+        application.has_transcript_selection(),
+        application.mouse_capture(),
+        application.picker_active(),
+    ) else {
+        return Vec::new();
+    };
+
+    if command_requires_current_runtime_state(&command) {
+        drain_pending_runtime_events(application, events);
+    }
+    application.handle_user_command(command)
+}
+
+fn command_requires_current_runtime_state(command: &UserCommand) -> bool {
+    matches!(
+        command,
+        UserCommand::Submit | UserCommand::Esc | UserCommand::CtrlC
+    )
+}
 
 fn route_terminal_event(
     event: Event,
     frame: &PreparedFrame,
     transcript_selection: bool,
     mouse_capture: MouseCapture,
+    picker_active: bool,
 ) -> Option<UserCommand> {
     match event {
-        Event::Key(key) => route_key_event(key, frame, transcript_selection),
-        Event::Paste(text) => Some(match InputFragment::<RawInput>::new(text).bound() {
-            Ok(fragment) => UserCommand::Insert(fragment),
-            Err(error) => UserCommand::InputRejected(error),
-        }),
+        Event::Key(key) => {
+            if picker_active {
+                route_picker_key(key)
+            } else {
+                route_key_event(key, frame, transcript_selection)
+            }
+        }
+        Event::Paste(text) => {
+            if picker_active {
+                None
+            } else {
+                Some(match InputFragment::<RawInput>::new(text).bound() {
+                    Ok(fragment) => UserCommand::Insert(fragment),
+                    Err(error) => UserCommand::InputRejected(error),
+                })
+            }
+        }
         Event::Mouse(mouse) => route_mouse_event(mouse, frame, mouse_capture),
         Event::FocusLost => Some(UserCommand::CancelMouseCapture),
         Event::FocusGained | Event::Resize(_, _) => None,
+    }
+}
+
+/// Routes a key event when the session picker overlay is active.
+fn route_picker_key(key: KeyEvent) -> Option<UserCommand> {
+    if key.kind == KeyEventKind::Release {
+        return None;
+    }
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Esc => Some(UserCommand::PickerCancel),
+        KeyCode::Char('c') if control => Some(UserCommand::PickerCancel),
+        KeyCode::Enter => Some(UserCommand::PickerConfirm),
+        KeyCode::Up => Some(UserCommand::PickerUp),
+        KeyCode::Down => Some(UserCommand::PickerDown),
+        KeyCode::Backspace => Some(UserCommand::PickerBackspace),
+        KeyCode::Char(c) if !control => Some(UserCommand::PickerChar(c)),
+        _ => None,
     }
 }
 
@@ -140,10 +203,10 @@ fn route_key(
         return Some(UserCommand::CopyTranscriptSelection);
     }
     if control && character == Some('c') {
-        return Some(UserCommand::InterruptKey);
+        return Some(UserCommand::CtrlC);
     }
     if key.code == KeyCode::Esc {
-        return Some(UserCommand::Interrupt);
+        return Some(UserCommand::Esc);
     }
     if control && character == Some('z') {
         return Some(UserCommand::Undo);
@@ -175,7 +238,7 @@ fn route_key(
     match key.code {
         KeyCode::Enter if key.modifiers.is_empty() => Some(UserCommand::Submit),
         KeyCode::Enter => Some(insert_fragment("\n")),
-        KeyCode::Tab => Some(insert_fragment("\t")),
+        KeyCode::Tab => Some(UserCommand::CompletionAccept),
         KeyCode::Backspace if control || alt => Some(UserCommand::DeleteWordBackward),
         KeyCode::Backspace => Some(UserCommand::DeleteBackward),
         KeyCode::Delete => Some(UserCommand::DeleteForward),
@@ -264,20 +327,21 @@ fn route_mouse_event(
     capture: MouseCapture,
 ) -> Option<UserCommand> {
     let (width, height) = frame.transcript_dimensions();
+    let pos = Position::new(mouse.column, mouse.row);
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            if let Some((top_line, thumb_offset)) = frame.transcript_scrollbar_press(mouse) {
+            if let Some((top_line, thumb_offset)) = frame.transcript_scrollbar_press(pos) {
                 Some(UserCommand::BeginTranscriptScrollbarDrag {
                     width,
                     height,
                     top_line,
                     thumb_offset,
                 })
-            } else if let Some(position) = frame.prompt_position(mouse) {
+            } else if let Some(position) = frame.prompt_position(pos) {
                 Some(UserCommand::BeginPromptSelection { position })
-            } else if frame.transcript_contains(mouse) {
+            } else if frame.transcript_contains(pos) {
                 Some(UserCommand::BeginTranscriptSelection {
-                    position: frame.transcript_position(mouse),
+                    position: frame.transcript_position(pos),
                 })
             } else {
                 None
@@ -285,11 +349,11 @@ fn route_mouse_event(
         }
         MouseEventKind::Drag(MouseButton::Left) => match capture {
             MouseCapture::Prompt => Some(UserCommand::DragSelection {
-                prompt_position: frame.prompt_position_clamped(mouse),
+                prompt_position: frame.prompt_position_clamped(pos),
                 transcript_position: None,
             }),
             MouseCapture::Transcript => {
-                if let Some((direction, cell)) = frame.transcript_selection_scroll(mouse) {
+                if let Some((direction, cell)) = frame.transcript_selection_scroll(pos) {
                     Some(UserCommand::DragTranscriptSelectionEdge {
                         width,
                         height,
@@ -299,12 +363,12 @@ fn route_mouse_event(
                 } else {
                     Some(UserCommand::DragSelection {
                         prompt_position: None,
-                        transcript_position: frame.transcript_position_clamped(mouse),
+                        transcript_position: frame.transcript_position_clamped(pos),
                     })
                 }
             }
             MouseCapture::TranscriptScrollbar { thumb_offset } => frame
-                .transcript_scrollbar_top_line_clamped(mouse, thumb_offset)
+                .transcript_scrollbar_top_line_clamped(pos, thumb_offset)
                 .map(|top_line| UserCommand::DragTranscriptScrollbar {
                     width,
                     height,
@@ -314,30 +378,30 @@ fn route_mouse_event(
         },
         MouseEventKind::Up(MouseButton::Left) => match capture {
             MouseCapture::Prompt => Some(UserCommand::FinishSelection {
-                prompt_position: frame.prompt_position_clamped(mouse),
+                prompt_position: frame.prompt_position_clamped(pos),
                 transcript_position: None,
             }),
             MouseCapture::Transcript => Some(UserCommand::FinishSelection {
                 prompt_position: None,
-                transcript_position: frame.transcript_position_clamped(mouse),
+                transcript_position: frame.transcript_position_clamped(pos),
             }),
             MouseCapture::TranscriptScrollbar { thumb_offset } => {
                 Some(UserCommand::FinishTranscriptScrollbar {
                     width,
                     height,
-                    top_line: frame.transcript_scrollbar_top_line_clamped(mouse, thumb_offset),
+                    top_line: frame.transcript_scrollbar_top_line_clamped(pos, thumb_offset),
                 })
             }
             MouseCapture::None => None,
         },
-        MouseEventKind::ScrollUp if frame.transcript_contains(mouse) => {
+        MouseEventKind::ScrollUp if frame.transcript_contains(pos) => {
             Some(UserCommand::ScrollTranscript {
                 width,
                 height,
                 lines: MOUSE_WHEEL_ROWS,
             })
         }
-        MouseEventKind::ScrollDown if frame.transcript_contains(mouse) => {
+        MouseEventKind::ScrollDown if frame.transcript_contains(pos) => {
             Some(UserCommand::ScrollTranscript {
                 width,
                 height,
@@ -353,6 +417,28 @@ fn route_mouse_event(
         | MouseEventKind::ScrollLeft
         | MouseEventKind::ScrollRight => None,
     }
+}
+
+/// Drains pending runtime events before a lifecycle-sensitive terminal command.
+///
+/// Submit, interrupt, and shutdown decisions require current runtime state.
+fn drain_pending_runtime_events(
+    application: &mut Application,
+    events: &mut RuntimeEventReceiver,
+) {
+    let mut pending_delta = None;
+    loop {
+        match events.try_recv() {
+            Ok(Some(envelope)) => {
+                reduce_runtime_event(application, envelope.event, &mut pending_delta);
+                if application.should_exit() {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    flush_assistant_delta(application, &mut pending_delta);
 }
 
 fn reduce_runtime_event_batch(
@@ -427,6 +513,11 @@ async fn execute_effects(
                 }
             },
             AppEffect::Clipboard(text) => terminal.copy_to_clipboard(&text)?,
+            AppEffect::OpenSessionPicker(sessions) => {
+                application.handle_user_command(
+                    crate::app::UserCommand::OpenPicker(sessions)
+                );
+            }
         }
     }
     Ok(true)
@@ -444,6 +535,7 @@ mod tests {
             &prepared_frame(),
             false,
             MouseCapture::None,
+            false,
         ) else {
             panic!("bounded paste routes to editor insertion");
         };
@@ -589,5 +681,39 @@ mod tests {
             .expect("scrollbar release routes");
         application.handle_user_command(command);
         assert_eq!(application.mouse_capture(), MouseCapture::None);
+    }
+    #[test]
+    fn transcript_scroll_does_not_wait_for_runtime_mailbox_drain() {
+        let area = ratatui::layout::Rect::new(0, 0, 30, 12);
+        let mut application = application_with_transcript();
+        let frame = prepare(&mut application, area, std::time::Instant::now());
+        let (width, height) = frame.transcript_dimensions();
+        let initial_top = application
+            .transcript_mut()
+            .viewport(width, height)
+            .top_line;
+        let (_, mut events, event_sender, _) = harness_runtime_api::channel_pair(128);
+        for sequence in 0..128 {
+            event_sender
+                .try_send(harness_runtime_api::RuntimeEventEnvelope::new(
+                    sequence,
+                    harness_runtime_api::RuntimeEvent::ShutdownComplete,
+                ))
+                .unwrap();
+        }
+
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)),
+            &frame,
+            &mut application,
+            &mut events,
+        );
+
+        let scrolled_top = application
+            .transcript_mut()
+            .viewport(width, height)
+            .top_line;
+        assert!(scrolled_top < initial_top);
+        assert!(events.try_recv().unwrap().is_some());
     }
 }

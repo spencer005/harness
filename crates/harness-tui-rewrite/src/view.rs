@@ -2,16 +2,16 @@
 
 use std::time::Instant;
 
-use crossterm::event::MouseEvent;
+use crate::picker::SessionPickerState;
 use ratatui::{
     Frame,
-    layout::{Position, Rect},
+    layout::{Constraint, Direction, Layout, Position, Rect},
     text::{Line, Span},
-    widgets::{Clear, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, StatefulWidget, Wrap},
 };
 
 use crate::{
-    app::{Application, NoticeSeverity},
+    app::{Application, SlashCommandStatus},
     display::{
         DisplayDocument, DocumentLimits, LaidOut, RawDocumentBuilder, StyleId, backend_style,
         prepare_document, prepare_one_line_document,
@@ -44,6 +44,8 @@ pub(crate) struct FrameAreas {
     pub(crate) prompt_content: Rect,
     /// Status row.
     pub(crate) status: Rect,
+    /// Left session list column when session picker is open.
+    pub(crate) session_picker_list: Option<Rect>,
 }
 
 /// Scrollbar geometry shared by rendering and mouse hit testing.
@@ -105,7 +107,12 @@ pub(crate) struct PreparedFrame {
     activity_document: Option<DisplayDocument<LaidOut>>,
     status_document: DisplayDocument<LaidOut>,
     notice_document: Option<DisplayDocument<LaidOut>>,
+    slash_status: SlashCommandStatus,
     prompt_cursor: Option<Position>,
+    /// Cloned picker state when the overlay is open, None otherwise.
+    pub(crate) picker_state: Option<SessionPickerState>,
+    /// Cloned rewind picker state when the overlay is open, None otherwise.
+    pub(crate) rewind_picker_state: Option<crate::picker::RewindPickerState>,
 }
 
 impl PreparedFrame {
@@ -116,63 +123,58 @@ impl PreparedFrame {
     }
 
     /// Resolves an in-prompt mouse point to a prompt grapheme boundary.
-    pub(crate) fn prompt_position(&self, mouse: MouseEvent) -> Option<PromptPosition> {
-        contains(self.areas.prompt_content, mouse).then(|| {
-            let row = usize::from(mouse.row.saturating_sub(self.areas.prompt_content.y));
-            let cell = usize::from(mouse.column.saturating_sub(self.areas.prompt_content.x));
-            self.prompt_viewport.position_at(row, cell)
+    /// Resolves an in-prompt mouse point to a prompt grapheme boundary.
+    /// Resolves an in-prompt mouse point to a prompt grapheme boundary.
+    pub(crate) fn prompt_position(&self, point: Position) -> Option<PromptPosition> {
+        contains(self.areas.prompt_content, point).then(|| {
+            let r = usize::from(point.y.saturating_sub(self.areas.prompt_content.y));
+            let c = usize::from(point.x.saturating_sub(self.areas.prompt_content.x));
+            self.prompt_viewport.position_at(r, c)
         })
     }
 
     /// Resolves any mouse point to a prompt boundary clamped to the prompt.
-    pub(crate) fn prompt_position_clamped(&self, mouse: MouseEvent) -> Option<PromptPosition> {
+    pub(crate) fn prompt_position_clamped(&self, point: Position) -> Option<PromptPosition> {
         let area = self.areas.prompt_content;
         if area.width == 0 || area.height == 0 {
             return None;
         }
-        let column = mouse
-            .column
-            .clamp(area.x, area.x.saturating_add(area.width.saturating_sub(1)));
-        let row = mouse
-            .row
-            .clamp(area.y, area.y.saturating_add(area.height.saturating_sub(1)));
+        let column = point.x.clamp(area.x, area.x.saturating_add(area.width.saturating_sub(1)));
+        let r = point.y.clamp(area.y, area.y.saturating_add(area.height.saturating_sub(1)));
         Some(self.prompt_viewport.position_at(
-            usize::from(row.saturating_sub(area.y)),
+            usize::from(r.saturating_sub(area.y)),
             usize::from(column.saturating_sub(area.x)),
         ))
     }
 
     /// Resolves a transcript mouse point to a stable selectable position.
-    pub(crate) fn transcript_position(&self, mouse: MouseEvent) -> Option<TranscriptPosition> {
-        if !contains(self.areas.transcript_content, mouse) {
+    pub(crate) fn transcript_position(&self, point: Position) -> Option<TranscriptPosition> {
+        if !contains(self.areas.transcript_content, point) {
             return None;
         }
-        let row = usize::from(mouse.row.saturating_sub(self.areas.transcript_content.y));
-        let cell = usize::from(mouse.column.saturating_sub(self.areas.transcript_content.x));
-        self.transcript.position_at(row, cell)
+        let r = usize::from(point.y.saturating_sub(self.areas.transcript_content.y));
+        let c = usize::from(point.x.saturating_sub(self.areas.transcript_content.x));
+        self.transcript.position_at(r, c)
     }
+
     /// Returns whether a mouse event is inside the transcript text area.
-    pub(crate) fn transcript_contains(&self, mouse: MouseEvent) -> bool {
-        contains(self.areas.transcript_content, mouse)
+    pub(crate) fn transcript_contains(&self, point: Position) -> bool {
+        contains(self.areas.transcript_content, point)
     }
 
     /// Resolves a mouse point clamped to the transcript viewport.
     pub(crate) fn transcript_position_clamped(
         &self,
-        mouse: MouseEvent,
+        point: Position,
     ) -> Option<TranscriptPosition> {
         let area = self.areas.transcript_content;
         if area.width == 0 || area.height == 0 {
             return None;
         }
-        let column = mouse
-            .column
-            .clamp(area.x, area.x.saturating_add(area.width.saturating_sub(1)));
-        let row = mouse
-            .row
-            .clamp(area.y, area.y.saturating_add(area.height.saturating_sub(1)));
+        let column = point.x.clamp(area.x, area.x.saturating_add(area.width.saturating_sub(1)));
+        let r = point.y.clamp(area.y, area.y.saturating_add(area.height.saturating_sub(1)));
         self.transcript.position_at(
-            usize::from(row.saturating_sub(area.y)),
+            usize::from(r.saturating_sub(area.y)),
             usize::from(column.saturating_sub(area.x)),
         )
     }
@@ -183,22 +185,20 @@ impl PreparedFrame {
     /// zone because Crossterm cannot report a negative pointer row.
     pub(crate) fn transcript_selection_scroll(
         &self,
-        mouse: MouseEvent,
+        point: Position,
     ) -> Option<(TranscriptScrollDirection, usize)> {
         let area = self.areas.transcript_content;
         if area.width == 0 || area.height == 0 {
             return None;
         }
         let cell = usize::from(
-            mouse
-                .column
-                .clamp(area.x, area.x.saturating_add(area.width.saturating_sub(1)))
+            point.x.clamp(area.x, area.x.saturating_add(area.width.saturating_sub(1)))
                 .saturating_sub(area.x),
         );
         let after_final_row = area.y.saturating_add(area.height);
-        if mouse.row < area.y || (area.y == 0 && mouse.row == 0) {
+        if point.y < area.y || (area.y == 0 && point.y == 0) {
             Some((TranscriptScrollDirection::Older, cell))
-        } else if mouse.row >= after_final_row {
+        } else if point.y >= after_final_row {
             Some((TranscriptScrollDirection::Newer, cell))
         } else {
             None
@@ -206,20 +206,20 @@ impl PreparedFrame {
     }
 
     /// Maps a scrollbar press to an absolute top line and stable thumb offset.
-    pub(crate) fn transcript_scrollbar_press(&self, mouse: MouseEvent) -> Option<(usize, u16)> {
+    pub(crate) fn transcript_scrollbar_press(&self, point: Position) -> Option<(usize, u16)> {
         let scrollbar = self.transcript_scrollbar?;
-        contains(scrollbar.area, mouse)
-            .then(|| scrollbar.press(mouse.row, self.transcript.top_line))
+        contains(scrollbar.area, point)
+            .then(|| scrollbar.press(point.y, self.transcript.top_line))
     }
 
     /// Maps any captured drag point to the nearest scrollbar track row.
     pub(crate) fn transcript_scrollbar_top_line_clamped(
         &self,
-        mouse: MouseEvent,
+        point: Position,
         thumb_offset: u16,
     ) -> Option<usize> {
         self.transcript_scrollbar
-            .map(|scrollbar| scrollbar.top_line_for_pointer(mouse.row, thumb_offset))
+            .map(|scrollbar| scrollbar.top_line_for_pointer(point.y, thumb_offset))
     }
 
     /// Returns prompt content width for visual movement.
@@ -251,7 +251,8 @@ pub(crate) fn prepare(application: &mut Application, area: Rect, now: Instant) -
         .as_ref()
         .map(|document| document.lines().len())
         .unwrap_or(0);
-    let areas = allocate_areas(area, prompt_metrics.line_count, activity_line_count);
+    let session_picker_open = application.session_picker.is_some();
+    let areas = allocate_areas(area, prompt_metrics.line_count, activity_line_count, session_picker_open);
     let prompt_metrics = if areas.prompt_content.width == provisional_prompt_width {
         prompt_metrics
     } else {
@@ -268,14 +269,64 @@ pub(crate) fn prepare(application: &mut Application, area: Rect, now: Instant) -
         prompt_scroll,
         usize::from(areas.prompt_content.height),
     );
+    let slash_status = application.slash_command_status();
     let prompt_cursor = prompt_cursor_position(&prompt_viewport, areas.prompt_content);
-    let prompt_document = prepare_prompt(&prompt_viewport, areas.prompt_content.width);
+    let prompt_document = prepare_prompt(&prompt_viewport, areas.prompt_content.width, &slash_status);
     let status_document = prepare_status(application.session(), areas.status.width);
     let notice_document = prepare_notice(application, area.width);
-    let transcript = application.transcript_mut().viewport(
-        areas.transcript_content.width,
-        usize::from(areas.transcript_content.height),
-    );
+    let transcript = if let Some(picker) = &application.session_picker {
+        let filtered = picker.filtered_sessions();
+        let selected = picker.list_state.selected().and_then(|i| filtered.get(i));
+        if let Some((session_meta, _)) = selected {
+            let preview_initial = crate::domain::InitialState {
+                session_id: crate::domain::ExternalText::new(session_meta.id.clone()),
+                thread_title: crate::domain::ExternalText::new(session_meta.title.clone()),
+                provider: None,
+                model: crate::domain::ModelState {
+                    model: crate::domain::ExternalText::new(session_meta.model.clone()),
+                    reasoning_effort: None,
+                    service_tier: None,
+                },
+                developer_mode: false,
+                response_streaming: false,
+                last_ttft_ms: None,
+                transcript: session_meta
+                    .initial_entries
+                    .iter()
+                    .map(|e| crate::domain::TranscriptSnapshotEntry {
+                        sequence: e.sequence,
+                        payload: crate::runtime::adapter::convert_payload(e.payload.clone()),
+                    })
+                    .collect(),
+                prompt: String::new(),
+                prompt_cursor: 0,
+                queued_steering: None,
+                agents: Vec::new(),
+                active_activity_ids: Vec::new(),
+            };
+            if let Ok(mut preview_app) = Application::import(preview_initial) {
+                preview_app.transcript_mut().viewport(
+                    areas.transcript_content.width,
+                    usize::from(areas.transcript_content.height),
+                )
+            } else {
+                application.transcript_mut().viewport(
+                    areas.transcript_content.width,
+                    usize::from(areas.transcript_content.height),
+                )
+            }
+        } else {
+            application.transcript_mut().viewport(
+                areas.transcript_content.width,
+                usize::from(areas.transcript_content.height),
+            )
+        }
+    } else {
+        application.transcript_mut().viewport(
+            areas.transcript_content.width,
+            usize::from(areas.transcript_content.height),
+        )
+    };
     let transcript_scrollbar = prepare_transcript_scrollbar(areas, &transcript);
 
     PreparedFrame {
@@ -287,7 +338,10 @@ pub(crate) fn prepare(application: &mut Application, area: Rect, now: Instant) -
         activity_document,
         status_document,
         notice_document,
+        slash_status,
         prompt_cursor,
+        picker_state: application.session_picker.clone(),
+        rewind_picker_state: application.rewind_picker.clone(),
     }
 }
 
@@ -298,13 +352,39 @@ pub(crate) fn render(frame: &mut Frame<'_>, prepared: &PreparedFrame) {
     render_prompt(frame, prepared);
     render_status(frame, prepared);
     render_notice(frame, prepared);
-    if let Some(cursor) = prepared.prompt_cursor {
-        frame.set_cursor_position(cursor);
+    if prepared.picker_state.is_some() {
+        render_session_picker_overlay(frame, prepared);
+    } else if prepared.rewind_picker_state.is_some() {
+        render_rewind_picker_overlay(frame, prepared);
+    } else {
+        render_slash_command_overlay(frame, prepared);
+        if let Some(cursor) = prepared.prompt_cursor {
+            frame.set_cursor_position(cursor);
+        }
     }
 }
 
-fn allocate_areas(area: Rect, prompt_line_count: usize, activity_line_count: usize) -> FrameAreas {
-    let total_height = usize::from(area.height);
+fn allocate_areas(area: Rect, prompt_line_count: usize, activity_line_count: usize, session_picker_open: bool) -> FrameAreas {
+    let (picker_rect, main_rect) = if session_picker_open && area.width >= 40 {
+        let picker_width = (area.width * 30 / 100).max(25);
+        let left = Rect {
+            x: area.x,
+            y: area.y,
+            width: picker_width,
+            height: area.height,
+        };
+        let right = Rect {
+            x: area.x.saturating_add(picker_width),
+            y: area.y,
+            width: area.width.saturating_sub(picker_width),
+            height: area.height,
+        };
+        (Some(left), right)
+    } else {
+        (None, area)
+    };
+
+    let total_height = usize::from(main_rect.height);
     let status_height = usize::from(total_height > 0);
     let available = total_height.saturating_sub(status_height);
     let transcript_reserve = usize::from(available > 0);
@@ -333,27 +413,27 @@ fn allocate_areas(area: Rect, prompt_line_count: usize, activity_line_count: usi
         .saturating_sub(activity_height);
 
     let transcript = Rect {
-        x: area.x,
-        y: area.y,
-        width: area.width,
+        x: main_rect.x,
+        y: main_rect.y,
+        width: main_rect.width,
         height: to_u16(transcript_height),
     };
     let activity = Rect {
-        x: area.x,
+        x: main_rect.x,
         y: transcript.y.saturating_add(transcript.height),
-        width: area.width,
+        width: main_rect.width,
         height: to_u16(activity_height),
     };
     let prompt = Rect {
-        x: area.x,
+        x: main_rect.x,
         y: activity.y.saturating_add(activity.height),
-        width: area.width,
+        width: main_rect.width,
         height: to_u16(prompt_height),
     };
     let status = Rect {
-        x: area.x,
+        x: main_rect.x,
         y: prompt.y.saturating_add(prompt.height),
-        width: area.width,
+        width: main_rect.width,
         height: to_u16(status_height),
     };
     let prompt_margin = prompt.width.min(PROMPT_MARGIN_WIDTH);
@@ -380,6 +460,7 @@ fn allocate_areas(area: Rect, prompt_line_count: usize, activity_line_count: usi
         prompt,
         prompt_content,
         status,
+        session_picker_list: picker_rect,
     }
 }
 
@@ -426,22 +507,48 @@ fn prepare_transcript_scrollbar(
     })
 }
 
-fn prepare_prompt(prompt_viewport: &PromptViewport, width: u16) -> DisplayDocument<LaidOut> {
+fn prepare_prompt(
+    prompt_viewport: &PromptViewport,
+    width: u16,
+    slash_status: &SlashCommandStatus,
+) -> DisplayDocument<LaidOut> {
     let mut builder = RawDocumentBuilder::new();
     for (line_index, line) in prompt_viewport.lines().iter().enumerate() {
         if line_index > 0 {
             builder.line_break();
         }
         for run in line.runs() {
-            builder.plain(
-                run.text(),
-                if run.selected() {
-                    StyleId::Selection
+            let run_text = run.text();
+            let style = if run.selected() {
+                StyleId::Selection
+            } else if let SlashCommandStatus::Matched {
+                invoked_as,
+                syntax_valid,
+                ..
+            } = slash_status
+            {
+                let cmd_token = format!("/{}", invoked_as);
+                if run_text == cmd_token
+                    || (run_text.starts_with(&cmd_token)
+                        && (run_text.len() == cmd_token.len()
+                            || run_text[cmd_token.len()..].starts_with(' ')))
+                {
+                    StyleId::Command
+                } else if !syntax_valid {
+                    StyleId::SyntaxError
                 } else {
                     StyleId::Prompt
-                },
-                true,
-            );
+                }
+            } else {
+                StyleId::Prompt
+            };
+
+            if style == StyleId::Prompt {
+                // Apply WYSIWYG markdown parsing for prompt input runs
+                append_prompt_markdown(&mut builder, run_text);
+            } else {
+                builder.plain(run_text, style, true);
+            }
         }
     }
     let (bytes, lines, cells) = prompt_viewport.projection_metrics();
@@ -450,6 +557,71 @@ fn prepare_prompt(prompt_viewport: &PromptViewport, width: u16) -> DisplayDocume
         DocumentLimits::prompt_viewport(bytes, lines, cells),
         width,
     )
+}
+
+fn append_prompt_markdown(builder: &mut RawDocumentBuilder, text: &str) {
+    let trimmed = text.trim_end_matches(['\r', '\n']);
+    let is_heading = trimmed.starts_with('#');
+    let base_style = if is_heading {
+        StyleId::Heading
+    } else {
+        StyleId::Prompt
+    };
+
+    let bytes = trimmed.as_bytes();
+    let mut i = 0usize;
+    let mut text_start = 0usize;
+
+    while i < bytes.len() {
+        if bytes[i] == b'`' {
+            if text_start < i {
+                builder.plain(&trimmed[text_start..i], base_style, true);
+            }
+            let code_start = i;
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'`' {
+                i += 1;
+            }
+            if i < bytes.len() && bytes[i] == b'`' {
+                i += 1;
+            }
+            builder.plain(&trimmed[code_start..i], StyleId::Code, true);
+            text_start = i;
+        } else if bytes[i] == b'*' {
+            let count_start = i;
+            while i < bytes.len() && bytes[i] == b'*' {
+                i += 1;
+            }
+            let count = i - count_start;
+
+            if text_start < count_start {
+                builder.plain(&trimmed[text_start..count_start], base_style, true);
+            }
+
+            if count >= 4 {
+                builder.plain(&trimmed[count_start..i], StyleId::Bold, true);
+            } else if count == 2 {
+                builder.plain("**", StyleId::Italic, true);
+            } else if count == 1 {
+                if let Some(close_rel) = trimmed[i..].find('*') {
+                    let close_idx = i + close_rel;
+                    builder.plain(&trimmed[count_start..=close_idx], StyleId::Bold, true);
+                    i = close_idx + 1;
+                } else {
+                    builder.plain("*", base_style, true);
+                }
+            } else {
+                builder.plain(&trimmed[count_start..i], base_style, true);
+            }
+            text_start = i;
+        } else {
+            i += 1;
+        }
+    }
+
+    if text_start < trimmed.len() {
+        builder.plain(&trimmed[text_start..], base_style, true);
+    }
 }
 
 fn prepare_activity(
@@ -471,6 +643,7 @@ fn prepare_activity(
         append_panel_line_break(&mut builder, line_count);
         builder.plain("queued ", StyleId::Muted, false);
         builder.plain(queued.as_str(), StyleId::Queued, true);
+        builder.plain("  ·  Esc send now", StyleId::Muted, false);
         line_count += 1;
     }
     for activity in session.activities.values() {
@@ -577,22 +750,7 @@ fn prepare_status(session: &SessionState, width: u16) -> DisplayDocument<LaidOut
 fn prepare_notice(application: &Application, width: u16) -> Option<DisplayDocument<LaidOut>> {
     let mut builder = RawDocumentBuilder::new();
     let mut has_notice = false;
-    if let Some(notice) = application.notice() {
-        builder.plain(
-            notice.text.as_str(),
-            match notice.severity {
-                NoticeSeverity::Information => StyleId::Active,
-                NoticeSeverity::Warning => StyleId::Queued,
-                NoticeSeverity::Error => StyleId::Error,
-            },
-            true,
-        );
-        has_notice = true;
-    }
     if application.exit_armed() {
-        if has_notice {
-            builder.plain(" · ", StyleId::Muted, false);
-        }
         builder.plain("press Ctrl-C again to exit", StyleId::Queued, false);
         has_notice = true;
     }
@@ -711,6 +869,229 @@ fn render_notice(frame: &mut Frame<'_>, prepared: &PreparedFrame) {
     frame.render_widget(Paragraph::new(document.ratatui_lines()), area);
 }
 
+fn render_slash_command_overlay(frame: &mut Frame<'_>, prepared: &PreparedFrame) {
+    match &prepared.slash_status {
+        SlashCommandStatus::Autocompleting {
+            matches,
+            selected_index,
+            ..
+        } => {
+            if matches.is_empty() {
+                return;
+            }
+            let max_visible = matches.len().min(6);
+            let height = to_u16(max_visible);
+            let prompt_area = prepared.areas.prompt;
+            if prompt_area.y < height {
+                return;
+            }
+            let popup_area = Rect {
+                x: prompt_area.x,
+                y: prompt_area.y.saturating_sub(height),
+                width: prompt_area.width,
+                height,
+            };
+
+            frame.render_widget(Clear, popup_area);
+
+            let mut lines = Vec::new();
+            for (index, spec) in matches.iter().take(max_visible).enumerate() {
+                let is_selected = index == *selected_index;
+
+                let cmd_style = if is_selected {
+                    backend_style(StyleId::Active)
+                } else {
+                    backend_style(StyleId::Command)
+                };
+                let usage_style = if is_selected {
+                    backend_style(StyleId::Active)
+                } else {
+                    backend_style(StyleId::Muted)
+                };
+                let summary_style = if is_selected {
+                    backend_style(StyleId::Active)
+                } else {
+                    backend_style(StyleId::Plain)
+                };
+
+                let mut spans = vec![
+                    Span::styled(format!("/{}", spec.name), cmd_style),
+                    Span::styled(format!(" {}", spec.usage), usage_style),
+                ];
+                if !spec.summary.is_empty() {
+                    spans.push(Span::styled(
+                        format!(" — {}", spec.summary),
+                        summary_style,
+                    ));
+                }
+
+                lines.push(Line::from(spans));
+            }
+            frame.render_widget(
+                Paragraph::new(lines).wrap(Wrap { trim: false }),
+                popup_area,
+            );
+        }
+        SlashCommandStatus::Matched {
+            spec, syntax_valid, ..
+        } => {
+            let prompt_area = prepared.areas.prompt;
+            if prompt_area.y < 1 {
+                return;
+            }
+            let banner_area = Rect {
+                x: prompt_area.x,
+                y: prompt_area.y.saturating_sub(1),
+                width: prompt_area.width,
+                height: 1,
+            };
+
+            frame.render_widget(Clear, banner_area);
+
+            let mut spans = vec![
+                Span::styled("💡 Usage: ", backend_style(StyleId::Active)),
+                Span::styled(format!("/{}", spec.name), backend_style(StyleId::Command)),
+                Span::styled(format!(" {}", spec.usage), backend_style(StyleId::Plain)),
+            ];
+            if !spec.summary.is_empty() {
+                spans.push(Span::styled(
+                    format!(" — {}", spec.summary),
+                    backend_style(StyleId::Muted),
+                ));
+            }
+            if !syntax_valid {
+                spans.push(Span::styled(
+                    "  ✖ Syntax Error: missing or invalid arguments",
+                    backend_style(StyleId::SyntaxError),
+                ));
+            }
+
+            frame.render_widget(
+                Paragraph::new(Line::from(spans)).wrap(Wrap { trim: false }),
+                banner_area,
+            );
+        }
+        SlashCommandStatus::None => {}
+    }
+}
+
+/// Renders the session picker as a full-screen modal overlay.
+/// Renders the left-hand session picker pane directly into the allocated layout area.
+fn render_session_picker_overlay(frame: &mut Frame<'_>, prepared: &PreparedFrame) {
+    let Some(picker_state) = prepared.picker_state.as_ref() else {
+        return;
+    };
+    let Some(area) = prepared.areas.session_picker_list else {
+        return;
+    };
+
+    frame.render_widget(Clear, area);
+
+    // Split left pane: search bar on top (1 row), session list fills the rest.
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(area);
+
+    // Search bar.
+    let search_text = format!("> {}", picker_state.query);
+    frame.render_widget(
+        Paragraph::new(search_text).style(backend_style(StyleId::Active)),
+        chunks[0],
+    );
+
+    // Session list.
+    let filtered = picker_state.filtered_sessions();
+    let items: Vec<ListItem> = filtered
+        .iter()
+        .map(|(s, _)| {
+            let display_title = if s.title.is_empty() { &s.id } else { &s.title };
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("{:10} ", &s.id[..s.id.len().min(10)]),
+                    backend_style(StyleId::Muted),
+                ),
+                Span::styled(display_title.to_string(), backend_style(StyleId::Plain)),
+            ]))
+        })
+        .collect();
+
+    let mut list_state = ListState::default();
+    let selected_index = picker_state.list_state.selected();
+    list_state.select(selected_index);
+
+    frame.render_stateful_widget(
+        List::new(items)
+            .highlight_style(backend_style(StyleId::Selection))
+            .highlight_symbol("> ")
+            .block(
+                Block::default()
+                    .borders(Borders::RIGHT)
+                    .border_style(backend_style(StyleId::Muted))
+                    .title(" Sessions "),
+            ),
+        chunks[1],
+        &mut list_state,
+    );
+}
+
+/// Renders the rewind picker as a full-screen modal overlay.
+fn render_rewind_picker_overlay(frame: &mut Frame<'_>, prepared: &PreparedFrame) {
+    let Some(picker_state) = prepared.rewind_picker_state.as_ref() else {
+        return;
+    };
+
+    let area = frame.area();
+    if area.width < 10 || area.height < 4 {
+        return;
+    }
+
+    let modal_width = (area.width * 8 / 10).max(40).min(area.width);
+    let modal_height = (area.height * 3 / 4).max(6).min(area.height);
+    let modal = Rect {
+        x: area.x + (area.width.saturating_sub(modal_width)) / 2,
+        y: area.y + (area.height.saturating_sub(modal_height)) / 2,
+        width: modal_width,
+        height: modal_height,
+    };
+
+    frame.render_widget(Clear, modal);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(backend_style(StyleId::Active))
+            .title(" Rewind Session — ↑↓ navigate turn/checkpoint, Enter confirm, Esc cancel "),
+        modal,
+    );
+
+    let inner = Rect {
+        x: modal.x + 1,
+        y: modal.y + 1,
+        width: modal.width.saturating_sub(2),
+        height: modal.height.saturating_sub(2),
+    };
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let items: Vec<ListItem> = picker_state
+        .options
+        .iter()
+        .map(|opt| ListItem::new(Line::from(Span::styled(opt.label.clone(), backend_style(StyleId::Plain)))))
+        .collect();
+
+    let mut list_state = ListState::default();
+    list_state.select(picker_state.list_state.selected());
+
+    frame.render_stateful_widget(
+        List::new(items)
+            .highlight_style(backend_style(StyleId::Selection))
+            .highlight_symbol("> "),
+        inner,
+        &mut list_state,
+    );
+}
+
 fn context_label(usage: ContextUsage) -> String {
     format!(
         "{}/{}",
@@ -729,11 +1110,11 @@ fn compact_count(value: u64) -> String {
     }
 }
 
-fn contains(area: Rect, mouse: MouseEvent) -> bool {
-    mouse.column >= area.x
-        && mouse.column < area.x.saturating_add(area.width)
-        && mouse.row >= area.y
-        && mouse.row < area.y.saturating_add(area.height)
+fn contains(area: Rect, point: Position) -> bool {
+    point.x >= area.x
+        && point.x < area.x.saturating_add(area.width)
+        && point.y >= area.y
+        && point.y < area.y.saturating_add(area.height)
 }
 
 fn to_u16(value: usize) -> u16 {
@@ -792,13 +1173,8 @@ mod tests {
             Instant::now(),
         );
         let area = prepared.areas().prompt_content;
-        let mouse = MouseEvent {
-            kind: crossterm::event::MouseEventKind::Moved,
-            column: area.x.saturating_add(2),
-            row: area.y,
-            modifiers: crossterm::event::KeyModifiers::NONE,
-        };
-        let position = prepared.prompt_position(mouse).unwrap();
+        let point = Position::new(area.x.saturating_add(2), area.y);
+        let position = prepared.prompt_position(point).unwrap();
         application.handle_user_command(crate::app::UserCommand::BeginPromptSelection { position });
         assert_eq!(application.prompt().cursor(), 1);
     }
@@ -847,7 +1223,7 @@ mod tests {
             .prompt_cursor
             .expect("large prompt cursor remains visible");
         let position = prepared
-            .prompt_position(mouse_at(cursor.x, cursor.y))
+            .prompt_position(Position::new(cursor.x, cursor.y))
             .expect("visible cursor hit tests through the same viewport");
         drop(prepared);
 
@@ -891,26 +1267,14 @@ mod tests {
 
     #[test]
     fn notice_uses_sanitized_cell_width_for_right_aligned_overlay() {
-        let mut application = application("");
-        application.apply_domain_event(DomainEvent::Failure(
-            "好好\nsecond\u{1b}[31m\u{202e}".to_string(),
+        let mut app = application("");
+        app.apply_domain_event(DomainEvent::Failure(
+            "error message".to_string(),
         ));
-        let document = prepare_notice(&application, 5).expect("notice is prepared");
-        let line = &document.lines()[0];
-        let text = line.runs().iter().map(|run| run.text()).collect::<String>();
-
-        assert_eq!(document.lines().len(), 1);
-        assert_eq!(text, "好好…");
-        assert_eq!(line.width(), 5);
-        assert_eq!(
-            notice_area(&document, Rect::new(7, 9, 5, 1)),
-            Some(Rect::new(7, 9, 5, 1))
-        );
-        assert_eq!(
-            notice_area(&document, Rect::new(7, 9, 3, 1)),
-            Some(Rect::new(7, 9, 3, 1))
-        );
-        assert_eq!(notice_area(&document, Rect::new(7, 9, 5, 0)), None);
+        // Failure is now routed directly into the transcript as a chat error entry.
+        assert_eq!(app.into_final_state().transcript.len(), 1);
+        let fresh_app = application("");
+        assert!(prepare_notice(&fresh_app, 5).is_none());
     }
 
     #[test]
@@ -943,13 +1307,13 @@ mod tests {
         let zero = prepare(&mut application, Rect::new(0, 0, 0, 6), Instant::now());
         assert_eq!(zero.transcript_dimensions().0, 0);
         assert!(zero.transcript_scrollbar.is_none());
-        assert_eq!(zero.transcript_position(mouse_at(0, 0)), None);
+        assert_eq!(zero.transcript_position(Position::new(0, 0)), None);
         drop(zero);
 
         let one = prepare(&mut application, Rect::new(0, 0, 1, 6), Instant::now());
         assert_eq!(one.transcript_dimensions().0, 1);
         assert!(one.transcript_scrollbar.is_none());
-        assert_eq!(one.transcript_position(mouse_at(1, 0)), None);
+        assert_eq!(one.transcript_position(Position::new(1, 0)), None);
         drop(one);
 
         let wider = prepare(&mut application, Rect::new(0, 0, 8, 6), Instant::now());
@@ -1042,15 +1406,6 @@ mod tests {
                             && !is_directional_formatting(character))
                 );
             }
-        }
-    }
-
-    fn mouse_at(column: u16, row: u16) -> MouseEvent {
-        MouseEvent {
-            kind: crossterm::event::MouseEventKind::Moved,
-            column,
-            row,
-            modifiers: crossterm::event::KeyModifiers::NONE,
         }
     }
 }

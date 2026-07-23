@@ -133,6 +133,11 @@ impl TerminalSession {
             .map(|_| ())
     }
 
+    /// Clears the physical terminal screen and invalidates Ratatui's frame buffer.
+    pub(crate) fn clear(&mut self) -> io::Result<()> {
+        self.terminal.clear()
+    }
+
     /// Writes a validated clipboard payload using OSC-52.
     pub(crate) fn copy_to_clipboard(&mut self, text: &ClipboardText) -> io::Result<()> {
         write_osc52(self.terminal.backend_mut(), text)

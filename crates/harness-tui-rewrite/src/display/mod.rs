@@ -30,8 +30,10 @@ pub(crate) enum StyleId {
     User,
     /// Developer message marker and text.
     Developer,
-    /// Tool call or output text.
+    /// Harness and tool message marker and text.
     Tool,
+    /// Thinking text.
+    Thinking,
     /// Error text.
     Error,
     /// Active status text.
@@ -44,6 +46,32 @@ pub(crate) enum StyleId {
     Status,
     /// Prompt background.
     Prompt,
+    /// Valid command token (Blue).
+    Command,
+    /// Syntax error in command input (Red).
+    SyntaxError,
+    /// Bold assistant markdown text.
+    AssistantBold,
+    /// Bold user markdown text.
+    UserBold,
+    /// Bold developer markdown text.
+    DeveloperBold,
+    /// Bold harness and tool markdown text.
+    ToolBold,
+    /// Bold thinking markdown text.
+    ThinkingBold,
+    /// Bold error markdown text.
+    ErrorBold,
+    /// Bold plain markdown text.
+    Bold,
+    /// Italic markdown text.
+    Italic,
+    /// Heading markdown text.
+    Heading,
+    /// Inline code markdown.
+    Code,
+    /// Inline code nested in a heading.
+    HeadingCode,
     /// ANSI-defined foreground and background colors.
     Ansi(AnsiStyle),
 }
@@ -67,25 +95,26 @@ pub(crate) enum AnsiColor {
 }
 
 /// Untrusted fragments have not passed terminal-control parsing.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct Raw;
+#[derive(Debug, Clone)]
+pub(crate) struct Raw(Vec<RawFragment>);
 
-/// Parsed fragments contain visible text and structural lines, but Unicode
-/// control validation has not completed.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct Parsed;
+/// Parsed fragments contain visible text and structural lines.
+#[derive(Debug, Clone)]
+pub(crate) struct Parsed(Vec<DocumentLine>);
 
 /// Control-free fragments contain only permitted visible Unicode text.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct ControlFree;
+#[derive(Debug, Clone)]
+pub(crate) struct ControlFree(Vec<DocumentLine>);
 
 /// Bounded fragments satisfy configured byte, line, and cell limits.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct Bounded;
+#[derive(Debug, Clone)]
+pub(crate) struct Bounded(Vec<DocumentLine>);
 
 /// Laid-out fragments have terminal-cell wrapping and source mappings.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct LaidOut;
+#[derive(Debug, Clone)]
+pub(crate) struct LaidOut {
+    lines: Vec<LaidOutLine>,
+}
 
 /// Parsing policy for one untrusted fragment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,23 +145,10 @@ struct DocumentRun {
     selectable: bool,
 }
 
-#[derive(Debug, Clone)]
-enum DocumentStorage {
-    Raw(Vec<RawFragment>),
-    Lines(Vec<DocumentLine>),
-    Layout(LayoutStorage),
-}
-
-#[derive(Debug, Clone)]
-struct LayoutStorage {
-    lines: Vec<LaidOutLine>,
-}
-
 /// Display document parameterized by its validation stage.
 #[derive(Debug, Clone)]
 pub(crate) struct DisplayDocument<State> {
-    storage: DocumentStorage,
-    _state: PhantomData<State>,
+    storage: State,
 }
 
 /// Builder for an untrusted display document.
@@ -193,8 +209,7 @@ impl RawDocumentBuilder {
     /// Finishes construction of the raw document.
     pub(crate) fn build(self) -> DisplayDocument<Raw> {
         DisplayDocument {
-            storage: DocumentStorage::Raw(self.fragments),
-            _state: PhantomData,
+            storage: Raw(self.fragments),
         }
     }
 }
@@ -207,35 +222,28 @@ impl RawDocumentBuilder {
 pub(crate) struct DocumentLimits {
     max_bytes: usize,
     max_lines: usize,
-    max_cells: usize,
 }
 
 impl DocumentLimits {
-    /// Limits a normal transcript entry.
-    pub(crate) const TRANSCRIPT_ENTRY: Self = Self::new(64 * 1024, 256, 128 * 1024);
-
     /// Limits compact status and activity documents.
-    pub(crate) const UI_LABEL: Self = Self::new(8 * 1024, 8, 16 * 1024);
+    pub(crate) const UI_LABEL: Self = Self::new(8 * 1024, 8);
 
     /// Limits terminal tool output before viewport wrapping.
-    pub(crate) const TOOL_OUTPUT: Self = Self::new(64 * 1024, 96, 128 * 1024);
+    pub(crate) const TOOL_OUTPUT: Self = Self::new(64 * 1024, 96);
 
-    const fn new(max_bytes: usize, max_lines: usize, max_cells: usize) -> Self {
+    const fn new(max_bytes: usize, max_lines: usize) -> Self {
         assert!(max_bytes >= layout::OMISSION_MARKER_BYTES);
         assert!(max_lines > 0);
-        assert!(max_cells >= layout::OMISSION_MARKER_CELLS);
         Self {
             max_bytes,
             max_lines,
-            max_cells,
         }
     }
     /// Covers one already viewport-bounded prompt projection without truncation.
-    pub(crate) fn prompt_viewport(bytes: usize, lines: usize, cells: usize) -> Self {
+    pub(crate) fn prompt_viewport(bytes: usize, lines: usize, _cells: usize) -> Self {
         Self::new(
             bytes.max(layout::OMISSION_MARKER_BYTES),
             lines.max(1),
-            cells.max(layout::OMISSION_MARKER_CELLS),
         )
     }
 }
@@ -243,53 +251,49 @@ impl DocumentLimits {
 impl DisplayDocument<Raw> {
     /// Parses escape sequences and structural controls.
     pub(crate) fn parse(self) -> DisplayDocument<Parsed> {
-        let DocumentStorage::Raw(fragments) = self.storage else {
-            unreachable!("raw document stores raw fragments");
-        };
         DisplayDocument {
-            storage: DocumentStorage::Lines(ansi::parse_fragments(fragments)),
-            _state: PhantomData,
+            storage: Parsed(ansi::parse_fragments(self.storage.0)),
         }
     }
 }
 
 impl DisplayDocument<Parsed> {
     /// Removes forbidden Unicode controls and proves the control-free stage.
-    pub(crate) fn sanitize(self) -> DisplayDocument<ControlFree> {
-        let DocumentStorage::Lines(mut lines) = self.storage else {
-            unreachable!("parsed document stores lines");
-        };
-        for line in &mut lines {
+    pub(crate) fn sanitize(mut self) -> DisplayDocument<ControlFree> {
+        for line in &mut self.storage.0 {
             for run in &mut line.runs {
                 run.text.retain(is_permitted_display_character);
             }
             line.runs.retain(|run| !run.text.is_empty());
         }
-        if lines.is_empty() {
-            lines.push(DocumentLine { runs: Vec::new() });
+        if self.storage.0.is_empty() {
+            self.storage.0.push(DocumentLine { runs: Vec::new() });
         }
-        debug_assert!(lines.iter().all(|line| {
+        debug_assert!(self.storage.0.iter().all(|line| {
             line.runs
                 .iter()
                 .all(|run| run.text.chars().all(is_permitted_display_character))
         }));
         DisplayDocument {
-            storage: DocumentStorage::Lines(lines),
-            _state: PhantomData,
+            storage: ControlFree(self.storage.0),
         }
     }
 }
 
 impl DisplayDocument<ControlFree> {
+    /// Wraps document directly to `width` terminal cells without pre-bounding limits.
+    pub(crate) fn layout(self, width: u16) -> DisplayDocument<LaidOut> {
+        let layout = layout::layout_lines(self.storage.0, usize::from(width.max(1)));
+        DisplayDocument {
+            storage: layout,
+        }
+    }
+
     /// Applies deterministic resource limits and proves the bounded stage.
     pub(crate) fn bound(self, limits: DocumentLimits) -> DisplayDocument<Bounded> {
-        let DocumentStorage::Lines(lines) = self.storage else {
-            unreachable!("control-free document stores lines");
-        };
-        let lines = layout::bound_lines(lines, limits);
+        let lines = layout::bound_lines(self.storage.0, limits);
         DisplayDocument {
-            storage: DocumentStorage::Lines(lines),
-            _state: PhantomData,
+            storage: Bounded(lines),
         }
     }
 
@@ -299,35 +303,24 @@ impl DisplayDocument<ControlFree> {
         limits: DocumentLimits,
         width: u16,
     ) -> DisplayDocument<Bounded> {
-        let DocumentStorage::Lines(lines) = self.storage else {
-            unreachable!("control-free document stores lines");
-        };
-        let lines = layout::bound_one_line(lines, limits, usize::from(width));
+        let lines = layout::bound_one_line(self.storage.0, limits, usize::from(width));
         DisplayDocument {
-            storage: DocumentStorage::Lines(lines),
-            _state: PhantomData,
+            storage: Bounded(lines),
         }
     }
 
     /// Returns control-free selectable text for clipboard construction.
     pub(crate) fn selectable_text(&self) -> String {
-        let DocumentStorage::Lines(lines) = &self.storage else {
-            unreachable!("control-free document stores lines");
-        };
-        selectable_text(lines)
+        selectable_text(&self.storage.0)
     }
 }
 
 impl DisplayDocument<Bounded> {
     /// Wraps the document to `width` terminal cells.
     pub(crate) fn layout(self, width: u16) -> DisplayDocument<LaidOut> {
-        let DocumentStorage::Lines(lines) = self.storage else {
-            unreachable!("bounded document stores lines");
-        };
-        let layout = layout::layout_lines(lines, usize::from(width.max(1)));
+        let layout = layout::layout_lines(self.storage.0, usize::from(width.max(1)));
         DisplayDocument {
-            storage: DocumentStorage::Layout(layout),
-            _state: PhantomData,
+            storage: layout,
         }
     }
 }
@@ -335,10 +328,7 @@ impl DisplayDocument<Bounded> {
 impl DisplayDocument<LaidOut> {
     /// Returns terminal-safe laid-out lines.
     pub(crate) fn lines(&self) -> &[LaidOutLine] {
-        let DocumentStorage::Layout(layout) = &self.storage else {
-            unreachable!("laid-out document stores layout");
-        };
-        &layout.lines
+        &self.storage.lines
     }
 
     /// Converts validated lines to Ratatui lines at the terminal backend.
@@ -453,22 +443,51 @@ pub(crate) fn backend_style(style: StyleId) -> Style {
 
 fn ratatui_style(style: StyleId) -> Style {
     match style {
-        StyleId::Plain => Style::default().fg(Color::Rgb(220, 220, 224)),
-        StyleId::Muted => Style::default().fg(Color::DarkGray),
-        StyleId::Assistant => Style::default().fg(Color::Rgb(198, 190, 232)),
-        StyleId::User => Style::default().fg(Color::Rgb(150, 200, 218)),
-        StyleId::Developer => Style::default().fg(Color::Rgb(218, 184, 116)),
-        StyleId::Tool => Style::default().fg(Color::Rgb(188, 154, 208)),
-        StyleId::Error => Style::default().fg(Color::LightRed),
-        StyleId::Active => Style::default().fg(Color::LightCyan),
-        StyleId::Queued => Style::default().fg(Color::LightYellow),
+        StyleId::Plain => Style::default().fg(Color::Rgb(220, 224, 232)),
+        StyleId::Muted => Style::default().fg(Color::Rgb(132, 140, 153)),
+        StyleId::Assistant => Style::default().fg(Color::Rgb(220, 224, 232)),
+        StyleId::User => Style::default().fg(Color::Rgb(126, 162, 208)),
+        StyleId::Developer => Style::default().fg(Color::Rgb(198, 164, 112)),
+        StyleId::Tool => Style::default().fg(Color::Rgb(108, 178, 160)),
+        StyleId::Thinking => Style::default()
+            .fg(Color::Rgb(118, 126, 140))
+            .add_modifier(Modifier::DIM),
+        StyleId::Error => Style::default().fg(Color::Rgb(218, 112, 112)),
+        StyleId::Active => Style::default().fg(Color::Rgb(126, 162, 208)),
+        StyleId::Queued => Style::default().fg(Color::Rgb(198, 164, 112)),
+        StyleId::AssistantBold | StyleId::Bold => Style::default()
+            .fg(Color::Rgb(220, 224, 232))
+            .add_modifier(Modifier::BOLD),
+        StyleId::UserBold => Style::default()
+            .fg(Color::Rgb(126, 162, 208))
+            .add_modifier(Modifier::BOLD),
+        StyleId::DeveloperBold => Style::default()
+            .fg(Color::Rgb(198, 164, 112))
+            .add_modifier(Modifier::BOLD),
+        StyleId::ToolBold => Style::default()
+            .fg(Color::Rgb(108, 178, 160))
+            .add_modifier(Modifier::BOLD),
+        StyleId::ThinkingBold => Style::default()
+            .fg(Color::Rgb(148, 156, 170))
+            .add_modifier(Modifier::BOLD | Modifier::DIM),
+        StyleId::ErrorBold => Style::default()
+            .fg(Color::Rgb(218, 112, 112))
+            .add_modifier(Modifier::BOLD),
+        StyleId::Italic => Style::default().add_modifier(Modifier::ITALIC),
+        StyleId::Heading => Style::default()
+            .fg(Color::Rgb(232, 234, 240))
+            .add_modifier(Modifier::BOLD),
+        StyleId::Code => Style::default().fg(Color::Rgb(180, 166, 206)),
+        StyleId::HeadingCode => Style::default()
+            .fg(Color::Rgb(190, 180, 214))
+            .add_modifier(Modifier::BOLD),
         StyleId::Selection => Style::default().add_modifier(Modifier::REVERSED),
-        StyleId::Status => Style::default()
-            .fg(Color::Rgb(208, 208, 214))
-            .bg(Color::Rgb(18, 18, 24)),
+        StyleId::Status => Style::default().fg(Color::Rgb(166, 174, 186)),
         StyleId::Prompt => Style::default()
-            .fg(Color::Rgb(226, 220, 206))
-            .bg(Color::Rgb(24, 24, 32)),
+            .fg(Color::Rgb(220, 224, 232))
+            .bg(Color::Rgb(28, 32, 40)),
+        StyleId::Command => Style::default().fg(Color::Rgb(126, 162, 208)),
+        StyleId::SyntaxError => Style::default().fg(Color::Rgb(218, 112, 112)),
         StyleId::Ansi(ansi) => ansi_ratatui_style(ansi),
     }
 }

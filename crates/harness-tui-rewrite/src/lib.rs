@@ -16,6 +16,7 @@ mod terminal;
 mod transcript;
 mod view;
 mod preview;
+pub mod picker;
 
 pub use runtime::run_with_runtime;
 pub use preview::render_preview;

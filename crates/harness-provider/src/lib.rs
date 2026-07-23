@@ -707,6 +707,19 @@ impl ProviderDriverConfig {
     }
 }
 
+/// Level of support for `developer` role in place of `system`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DeveloperRoleSupport {
+    /// Disallow developer role / use standard `system` role.
+    #[default]
+    Disabled,
+    /// Support developer role (maps `system` messages to `developer`).
+    Supported,
+    /// Only allow developer role and disallow `system` role.
+    DeveloperOnly,
+}
+
 /// Locally configured model capability metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderModelConfig {
@@ -723,6 +736,15 @@ pub struct ProviderModelConfig {
     /// List of available service tiers.
     #[serde(default)]
     pub service_tiers: Vec<String>,
+    /// Developer role support override for this model (inherits provider default if None).
+    #[serde(default)]
+    pub developer_role_support: Option<DeveloperRoleSupport>,
+    /// Whether the model allows multiple system/developer messages (inherits provider default if None).
+    #[serde(default)]
+    pub allow_multiple_system_messages: Option<bool>,
+    /// Whether response storing is enabled (`store: true` vs `store: false`) (inherits provider default if None).
+    #[serde(default)]
+    pub store: Option<bool>,
 }
 
 /// Provider profile persisted by the harness.
@@ -749,6 +771,19 @@ pub struct ProviderProfile {
     pub model_configs: Vec<ProviderModelConfig>,
     /// Model used for tool-output summary requests.
     pub tool_output_summary_model: Option<String>,
+    /// Provider-wide default level of support for `developer` role.
+    #[serde(default)]
+    pub developer_role_support: DeveloperRoleSupport,
+    /// Provider-wide default for whether multiple system/developer messages are allowed.
+    #[serde(default = "default_true")]
+    pub allow_multiple_system_messages: bool,
+    /// Provider-wide default for whether responses should be stored (`store: true`).
+    #[serde(default = "default_true")]
+    pub store: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Provider configuration document.

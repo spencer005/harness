@@ -87,6 +87,28 @@ pub(super) fn adapt_runtime_event(event: RuntimeEvent) -> DomainEvent {
         RuntimeEvent::SteeringChanged(queued) => {
             DomainEvent::SteeringChanged(queued.map(ExternalText::new))
         }
+        RuntimeEvent::OpenSessionPicker(sessions) => DomainEvent::OpenSessionPicker(
+            sessions
+                .into_iter()
+                .map(|s| crate::picker::SessionMeta {
+                    id: s.id,
+                    modified: std::time::UNIX_EPOCH + std::time::Duration::from_secs(s.modified_secs),
+                    all_text: s.all_text,
+                    model: s.model,
+                    title: s.title,
+                    initial_entries: s.initial_entries,
+                })
+                .collect(),
+        ),
+        RuntimeEvent::OpenRewindPicker(options) => DomainEvent::OpenRewindPicker(
+            options
+                .into_iter()
+                .map(|o| crate::picker::RewindOptionMeta {
+                    sequence: o.sequence,
+                    label: o.label,
+                })
+                .collect(),
+        ),
         RuntimeEvent::Failure(failure) => DomainEvent::Failure(failure.message),
         RuntimeEvent::ShutdownComplete => DomainEvent::ShutdownCompleted,
     }
@@ -107,7 +129,7 @@ pub(super) fn export_runtime_request(request: RuntimeRequest) -> RuntimeCommand 
         RuntimeRequest::CancelCompaction => RuntimeCommand::CancelCompaction,
         RuntimeRequest::StopRequestLoop => RuntimeCommand::StopRequestLoop,
         RuntimeRequest::AbortResponse => RuntimeCommand::AbortResponse,
-        RuntimeRequest::ApplySteering { text } => RuntimeCommand::Interrupt { text },
+        RuntimeRequest::Interrupt { text } => RuntimeCommand::Interrupt { text },
         RuntimeRequest::LoadTranscriptPage { before_sequence } => {
             RuntimeCommand::LoadOlderTranscript { before_sequence }
         }
@@ -428,7 +450,7 @@ mod tests {
     #[test]
     fn runtime_requests_export_with_clean_boundary_names() {
         let RuntimeCommand::Interrupt { text } =
-            export_runtime_request(RuntimeRequest::ApplySteering {
+            export_runtime_request(RuntimeRequest::Interrupt {
                 text: "\r\n\u{1b}exact".into(),
             })
         else {

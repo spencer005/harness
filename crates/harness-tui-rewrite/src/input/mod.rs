@@ -152,7 +152,6 @@ impl PromptEditor {
         })
     }
 
-    #[cfg(test)]
     /// Returns current prompt text.
     pub(crate) fn text(&self) -> &str {
         &self.text

@@ -136,6 +136,18 @@ pub enum SessionPayload {
         /// Validated durable summary.
         summary: String,
     },
+    /// Response metadata associated with a successful model attempt.
+    ModelResponseMetadata {
+        turn_id: u64,
+        attempt_id: u64,
+        provider: String,
+        response_id: String,
+    },
+    /// Goal state persisted for continuous execution.
+    Goal {
+        instruction: String,
+        state: String,
+    },
     /// Session closes.
     SessionClosed,
 }

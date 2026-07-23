@@ -1077,23 +1077,6 @@ fn parse_anchor(value: &str) -> Result<LineAnchor, String> {
     Ok(LineAnchor { line_number, hash })
 }
 
-fn format_line_anchor(anchor: LineAnchor) -> Option<String> {
-    Some(format!(
-        "{}{} ",
-        anchor.line_number,
-        edit_anchor_word(anchor.hash)?
-    ))
-}
-
-fn line_hash(line: &str) -> u8 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in line.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100_0000_01b3);
-    }
-    (hash & 0xff) as u8
-}
-
 const EDIT_ANCHOR_VOCABULARY: &str = include_str!("../../../../dictionary.txt");
 
 fn edit_anchor_word(hash: u8) -> Option<&'static str> {
