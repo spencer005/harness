@@ -163,6 +163,7 @@ fn route_picker_key(key: KeyEvent) -> Option<UserCommand> {
         KeyCode::Esc => Some(UserCommand::PickerCancel),
         KeyCode::Char('c') if control => Some(UserCommand::PickerCancel),
         KeyCode::Enter => Some(UserCommand::PickerConfirm),
+        KeyCode::Delete => Some(UserCommand::PickerDelete),
         KeyCode::Up => Some(UserCommand::PickerUp),
         KeyCode::Down => Some(UserCommand::PickerDown),
         KeyCode::Backspace => Some(UserCommand::PickerBackspace),
@@ -422,10 +423,7 @@ fn route_mouse_event(
 /// Drains pending runtime events before a lifecycle-sensitive terminal command.
 ///
 /// Submit, interrupt, and shutdown decisions require current runtime state.
-fn drain_pending_runtime_events(
-    application: &mut Application,
-    events: &mut RuntimeEventReceiver,
-) {
+fn drain_pending_runtime_events(application: &mut Application, events: &mut RuntimeEventReceiver) {
     let mut pending_delta = None;
     loop {
         match events.try_recv() {
@@ -514,9 +512,7 @@ async fn execute_effects(
             },
             AppEffect::Clipboard(text) => terminal.copy_to_clipboard(&text)?,
             AppEffect::OpenSessionPicker(sessions) => {
-                application.handle_user_command(
-                    crate::app::UserCommand::OpenPicker(sessions)
-                );
+                application.handle_user_command(crate::app::UserCommand::OpenPicker(sessions));
             }
         }
     }
@@ -541,6 +537,18 @@ mod tests {
         };
 
         assert_eq!(fragment.as_str(), source);
+    }
+    #[test]
+    fn delete_key_routes_to_message_deletion_while_a_picker_is_open() {
+        let command = route_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE)),
+            &prepared_frame(),
+            false,
+            MouseCapture::None,
+            true,
+        );
+
+        assert!(matches!(command, Some(UserCommand::PickerDelete)));
     }
 
     fn prepared_frame() -> PreparedFrame {
@@ -715,5 +723,22 @@ mod tests {
             .top_line;
         assert!(scrolled_top < initial_top);
         assert!(events.try_recv().unwrap().is_some());
+    }
+    #[test]
+    fn session_changed_event_updates_active_and_exported_session_id() {
+        let mut application = application_with_transcript();
+        let mut pending_delta = None;
+
+        reduce_runtime_event(
+            &mut application,
+            harness_runtime_api::RuntimeEvent::SessionChanged("fork-session".to_string()),
+            &mut pending_delta,
+        );
+
+        assert_eq!(application.session().session_id.as_str(), "fork-session");
+        assert_eq!(
+            application.into_final_state().session_id.as_str(),
+            "fork-session"
+        );
     }
 }

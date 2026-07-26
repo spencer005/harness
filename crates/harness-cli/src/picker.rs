@@ -1,5 +1,7 @@
 use std::{fs, io, path::Path, time::SystemTime};
+
 use harness_tui_rewrite::picker::SessionMeta;
+
 use crate::CliError;
 
 pub fn list_sessions(root: &Path) -> Result<Vec<SessionMeta>, CliError> {
@@ -15,7 +17,11 @@ pub fn list_sessions(root: &Path) -> Result<Vec<SessionMeta>, CliError> {
     let mut sessions = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|source| CliError::Io { source })?;
-        if !entry.file_type().map_err(|source| CliError::Io { source })?.is_file() {
+        if !entry
+            .file_type()
+            .map_err(|source| CliError::Io { source })?
+            .is_file()
+        {
             continue;
         }
         let path = entry.path();
@@ -37,7 +43,12 @@ pub fn list_sessions(root: &Path) -> Result<Vec<SessionMeta>, CliError> {
         if let Ok(content) = fs::read_to_string(&path) {
             if let Ok(records) = serde_json::from_str::<Vec<crate::SerializableRecord>>(&content) {
                 for record in &records {
-                    if let Some(entry) = crate::transcript_snapshot_entry(&crate::from_serializable_record(record.clone(), &harness_session_store::SessionId::new("preview").unwrap())) {
+                    if let Some(entry) = harness_conversation_runtime::project_transcript_record(
+                        &crate::from_serializable_record(
+                            record.clone(),
+                            &harness_session_store::SessionId::new("preview").unwrap(),
+                        ),
+                    ) {
                         initial_entries.push(entry);
                     }
                     match &record.payload {
@@ -49,7 +60,9 @@ pub fn list_sessions(root: &Path) -> Result<Vec<SessionMeta>, CliError> {
                             all_text.push_str(text);
                             all_text.push(' ');
                         }
-                        crate::SerializablePayload::ProviderBinding { model: m, .. } if model.is_empty() => {
+                        crate::SerializablePayload::ProviderBinding { model: m, .. }
+                            if model.is_empty() =>
+                        {
                             model = m.clone();
                         }
                         crate::SerializablePayload::Metadata { title: t } if title.is_empty() => {
@@ -74,4 +87,3 @@ pub fn list_sessions(root: &Path) -> Result<Vec<SessionMeta>, CliError> {
     sessions.sort_by(|a, b| b.modified.cmp(&a.modified));
     Ok(sessions)
 }
-

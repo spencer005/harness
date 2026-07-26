@@ -1,15 +1,14 @@
+use std::time::SystemTime;
+
+use chrono::{DateTime, Local};
+use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
 use ratatui::{
-    layout::{Constraint, Direction, Layout},
+    buffer::Buffer,
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, StatefulWidget, Widget},
-    buffer::Buffer,
-    layout::Rect,
 };
-use fuzzy_matcher::FuzzyMatcher;
-use fuzzy_matcher::skim::SkimMatcherV2;
-use std::time::SystemTime;
-use chrono::{DateTime, Local};
 
 #[derive(Clone)]
 pub struct SessionMeta {
@@ -43,15 +42,22 @@ impl SessionPickerState {
 
     pub fn filtered_sessions(&self) -> Vec<(&SessionMeta, i64)> {
         let matcher = SkimMatcherV2::default();
-        let mut filtered: Vec<(&SessionMeta, i64)> = self.sessions.iter().map(|s| {
-            if self.query.is_empty() {
-                (s, 0)
-            } else {
-                let text_to_match = format!("{} {} {} {}", s.title, s.id, s.model, s.all_text);
-                let score = matcher.fuzzy_match(&text_to_match, &self.query).unwrap_or(0);
-                (s, score)
-            }
-        }).filter(|(_, score)| self.query.is_empty() || *score > 0).collect();
+        let mut filtered: Vec<(&SessionMeta, i64)> = self
+            .sessions
+            .iter()
+            .map(|s| {
+                if self.query.is_empty() {
+                    (s, 0)
+                } else {
+                    let text_to_match = format!("{} {} {} {}", s.title, s.id, s.model, s.all_text);
+                    let score = matcher
+                        .fuzzy_match(&text_to_match, &self.query)
+                        .unwrap_or(0);
+                    (s, score)
+                }
+            })
+            .filter(|(_, score)| self.query.is_empty() || *score > 0)
+            .collect();
 
         if !self.query.is_empty() {
             filtered.sort_by(|a, b| b.1.cmp(&a.1));
@@ -66,7 +72,9 @@ pub struct SessionPickerWidget<'a> {
 
 impl<'a> SessionPickerWidget<'a> {
     pub fn new() -> Self {
-        Self { _marker: std::marker::PhantomData }
+        Self {
+            _marker: std::marker::PhantomData,
+        }
     }
 }
 
@@ -86,8 +94,14 @@ impl<'a> StatefulWidget for SessionPickerWidget<'a> {
             format!("> {}", state.query)
         };
 
-        let search_block = Paragraph::new(prompt_text)
-            .block(Block::default().title(Span::styled(" RESUME SESSION ", Style::default().add_modifier(Modifier::BOLD))).borders(Borders::NONE));
+        let search_block = Paragraph::new(prompt_text).block(
+            Block::default()
+                .title(Span::styled(
+                    " RESUME SESSION ",
+                    Style::default().add_modifier(Modifier::BOLD),
+                ))
+                .borders(Borders::NONE),
+        );
         Widget::render(search_block, chunks[0], buf);
 
         let filtered = state.filtered_sessions();
@@ -98,7 +112,10 @@ impl<'a> StatefulWidget for SessionPickerWidget<'a> {
                 let date_str = dt.format("%Y-%m-%d %H:%M").to_string();
                 let display_title = if s.title.is_empty() { &s.id } else { &s.title };
                 ListItem::new(Line::from(vec![
-                    Span::styled(format!("{:16} ", date_str), Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("{:16} ", date_str),
+                        Style::default().fg(Color::DarkGray),
+                    ),
                     Span::raw(display_title.to_string()),
                 ]))
             })
@@ -106,7 +123,11 @@ impl<'a> StatefulWidget for SessionPickerWidget<'a> {
 
         let list = List::new(items)
             .block(Block::default().borders(Borders::NONE))
-            .highlight_style(Style::default().add_modifier(Modifier::REVERSED).add_modifier(Modifier::BOLD))
+            .highlight_style(
+                Style::default()
+                    .add_modifier(Modifier::REVERSED)
+                    .add_modifier(Modifier::BOLD),
+            )
             .highlight_symbol(" ");
         StatefulWidget::render(list, chunks[1], buf, &mut state.list_state);
     }

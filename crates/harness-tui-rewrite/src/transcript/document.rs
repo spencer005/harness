@@ -2,7 +2,6 @@
 
 use std::collections::{HashMap, HashSet};
 
-
 use crate::domain::{
     ExternalText, MessageRole, PersistedTranscriptEntry, TranscriptPayload, TranscriptSnapshotEntry,
 };
@@ -69,7 +68,9 @@ impl TranscriptDocument {
             if let Some(sequence) = entry.sequence
                 && document.sequence_index.contains_key(&sequence)
             {
-                return Err(crate::transcript::TranscriptError::ConflictingSequence(sequence));
+                return Err(crate::transcript::TranscriptError::ConflictingSequence(
+                    sequence,
+                ));
             }
             document.insert_tail(entry.sequence, entry.payload);
         }
@@ -106,15 +107,23 @@ impl TranscriptDocument {
     ) -> Result<TranscriptEntryId, crate::transcript::TranscriptError> {
         if let Some(sequence) = entry.sequence {
             if self.sequence_index.contains_key(&sequence) {
-                return Err(crate::transcript::TranscriptError::ConflictingSequence(sequence));
+                return Err(crate::transcript::TranscriptError::ConflictingSequence(
+                    sequence,
+                ));
             }
         }
         Ok(self.insert_tail(entry.sequence, entry.payload))
     }
 
-    pub(crate) fn attach_sequence(&mut self, id: TranscriptEntryId, sequence: u64) -> Result<(), crate::transcript::TranscriptError> {
+    pub(crate) fn attach_sequence(
+        &mut self,
+        id: TranscriptEntryId,
+        sequence: u64,
+    ) -> Result<(), crate::transcript::TranscriptError> {
         if self.sequence_index.contains_key(&sequence) {
-            return Err(crate::transcript::TranscriptError::ConflictingSequence(sequence));
+            return Err(crate::transcript::TranscriptError::ConflictingSequence(
+                sequence,
+            ));
         }
         let Some(index) = self.index_of(id) else {
             return Ok(());
@@ -126,12 +135,10 @@ impl TranscriptDocument {
         Ok(())
     }
 
-    pub(super) fn append_assistant_text(
-        &mut self,
-        id: TranscriptEntryId,
-        delta: &ExternalText,
-    ) {
-        let Some(index) = self.index_of(id) else { return; };
+    pub(super) fn append_assistant_text(&mut self, id: TranscriptEntryId, delta: &ExternalText) {
+        let Some(index) = self.index_of(id) else {
+            return;
+        };
         let entry = &mut self.entries[index];
         let TranscriptPayload::Message {
             role: MessageRole::Assistant,
@@ -148,12 +155,10 @@ impl TranscriptDocument {
         self.bump_revision();
     }
 
-    pub(super) fn append_thinking_text(
-        &mut self,
-        id: TranscriptEntryId,
-        delta: &ExternalText,
-    ) {
-        let Some(index) = self.index_of(id) else { return; };
+    pub(super) fn append_thinking_text(&mut self, id: TranscriptEntryId, delta: &ExternalText) {
+        let Some(index) = self.index_of(id) else {
+            return;
+        };
         let entry = &mut self.entries[index];
         let TranscriptPayload::Thinking(text) = &mut entry.payload else {
             return;

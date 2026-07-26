@@ -2,7 +2,6 @@
 
 use crossfire::{AsyncRx, MAsyncTx, TrySendError, mpsc::Array};
 use harness_model_api::{ContextLimits, ModelCapabilities, ModelSelection, ModelTerminalOutcome};
-use harness_tool_api::ToolInput;
 
 /// Error returned when a runtime channel cannot accept a message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,8 +50,11 @@ pub enum RuntimeCommand {
     StopRequestLoop,
     /// Aborts the active model response immediately.
     AbortResponse,
-    /// Interrupts the active attempt with exact user text.
+    /// Interrupts the active attempt and submits exact user text at its terminal boundary.
     Interrupt { text: String },
+    /// Interrupts the active attempt and submits the queued steering at its terminal boundary.
+    SendQueuedSteering,
+
     /// Changes the selected model.
     SetModel { selection: ModelSelection },
     /// Requests older persisted transcript entries.
@@ -76,6 +78,8 @@ pub enum RuntimeEvent {
     TranscriptAppended(TranscriptSnapshotEntry),
     /// A transcript page is loaded.
     TranscriptPageLoaded(TranscriptPage),
+    /// The complete active transcript is replaced after a session switch.
+    TranscriptReplaced(Vec<TranscriptSnapshotEntry>),
     /// Persisted sequences are assigned to the active streamed entries.
     TranscriptCommitted {
         /// Sequence assigned to the reasoning entry, when reasoning is persisted.
@@ -83,6 +87,8 @@ pub enum RuntimeEvent {
         /// Sequence assigned to the assistant message entry.
         assistant_sequence: u64,
     },
+    /// The active session changes.
+    SessionChanged(String),
     /// The provider changes.
     ProviderChanged(ProviderSummary),
     /// The model changes.
@@ -121,12 +127,16 @@ pub enum RuntimeEvent {
     AssistantFirstToken(u64),
     /// Runtime steering queue state changed.
     SteeringChanged(Option<String>),
+    /// Runtime reports a non-fatal warning.
+    Warning(String),
     /// Runtime reports a typed failure.
     Failure(RuntimeFailure),
     /// Open the session picker overlay in the frontend.
     OpenSessionPicker(Vec<SessionPickerMeta>),
     /// Open the rewind picker overlay in the frontend.
     OpenRewindPicker(Vec<RewindOptionMeta>),
+    /// Open the transcript-message editor overlay in the frontend.
+    OpenMessageEditor(Vec<EditableMessage>),
     /// Runtime acknowledges joined shutdown.
     ShutdownComplete,
 }
@@ -138,6 +148,28 @@ pub struct RewindOptionMeta {
     pub sequence: u64,
     /// Display label for turn/checkpoint option.
     pub label: String,
+}
+
+/// One persisted transcript entry available for editing or deletion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditableMessage {
+    /// Persisted sequence identity used by the edit command.
+    pub sequence: u64,
+    /// Supported conversation entry kind shown by the editor.
+    pub role: EditableMessageRole,
+    /// Exact current message or native tool input text.
+    pub text: String,
+}
+
+/// Persisted transcript entry kinds accepted by the message editor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditableMessageRole {
+    /// Persisted user input.
+    User,
+    /// Persisted assistant output.
+    Assistant,
+    /// Persisted native tool invocation.
+    Tool { name: String },
 }
 
 /// Session metadata payload for the session picker modal.
@@ -178,6 +210,26 @@ pub struct TranscriptSnapshotEntry {
     pub payload: TranscriptPayload,
 }
 
+/// Model-facing encoding of a tool input shown in the transcript.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TranscriptToolInput {
+    /// Provider-independent freeform input.
+    Freeform(String),
+    /// Serialized function arguments.
+    FunctionJson(String),
+    /// Input loaded from storage without a recorded encoding.
+    Unspecified(String),
+}
+
+impl TranscriptToolInput {
+    /// Returns the exact model-provided input representation.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Freeform(input) | Self::FunctionJson(input) | Self::Unspecified(input) => input,
+        }
+    }
+}
+
 /// Transcript payload represented by the frontend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TranscriptPayload {
@@ -189,8 +241,8 @@ pub enum TranscriptPayload {
         call_id: String,
         /// Tool name.
         name: String,
-        /// Input.
-        input: ToolInput,
+        /// Input and its model-facing encoding.
+        input: TranscriptToolInput,
     },
     /// Tool result payload.
     ToolResult {

@@ -39,6 +39,7 @@ pub(super) fn project(payload: &TranscriptPayload) -> DisplayDocument<ControlFre
                 let label = match kind {
                     ToolInvocationKind::Freeform => "",
                     ToolInvocationKind::Function => "arguments: ",
+                    ToolInvocationKind::Unspecified => "",
                 };
                 if !label.is_empty() {
                     builder.plain(label, StyleId::Muted, false);

@@ -1,5 +1,7 @@
-use std::fmt::Write as _;
-use std::process::{Command, ExitStatus};
+use std::{
+    fmt::Write as _,
+    process::{Command, ExitStatus},
+};
 
 use serde::Deserialize;
 
@@ -7,7 +9,10 @@ use super::{ShellWord, WorkspaceRoot};
 
 pub(crate) fn check(workspace: &WorkspaceRoot, args: &[ShellWord]) -> Result<String, String> {
     let mut parsed_args = parse_cargo_check_command(args)?;
-    if !parsed_args.iter().any(|arg| arg.starts_with("--message-format")) {
+    if !parsed_args
+        .iter()
+        .any(|arg| arg.starts_with("--message-format"))
+    {
         parsed_args.push("--message-format=json".to_string());
     }
     let output = Command::new("cargo")
@@ -54,11 +59,7 @@ pub(crate) fn test(workspace: &WorkspaceRoot, args: &[ShellWord]) -> Result<Stri
             .env("RUSTC_BOOTSTRAP", "1")
             .current_dir(workspace.path())
             .output()
-            .map_err(|error| {
-                format!(
-                    "{formatted}failed to execute `cargo test`: {error}"
-                )
-            })?;
+            .map_err(|error| format!("{formatted}failed to execute `cargo test`: {error}"))?;
 
         if label_filters {
             let _ = writeln!(
@@ -100,7 +101,9 @@ fn parse_cargo_check_command(args: &[ShellWord]) -> Result<Vec<String>, String> 
                 command_args.push(word.value.clone());
                 index += 1;
                 let pkg = args.get(index).ok_or_else(|| {
-                    format!("failed to parse `inspect` check input: {value} requires a package name")
+                    format!(
+                        "failed to parse `inspect` check input: {value} requires a package name"
+                    )
                 })?;
                 command_args.push(pkg.value.clone());
             }
@@ -317,7 +320,8 @@ fn parse_json_diagnostics(stdout: &str) -> Vec<RustErrorLocation> {
         if let Ok(msg) = sonic_rs::from_str::<CargoMessage>(line) {
             if let CargoMessage::CompilerMessage { message } = msg {
                 if message.level == "error" {
-                    let code = message.code
+                    let code = message
+                        .code
                         .map(|c| {
                             let c_str = c.code.as_str();
                             if let Some(rest) = c_str.strip_prefix("E0") {
@@ -329,7 +333,7 @@ fn parse_json_diagnostics(stdout: &str) -> Vec<RustErrorLocation> {
                             }
                         })
                         .unwrap_or_else(|| "0".to_string());
-                    
+
                     if let Some(span) = message.spans.iter().find(|s| s.is_primary) {
                         // Extract the label from the primary span if present.
                         let label = span.label.clone();
@@ -344,9 +348,7 @@ fn parse_json_diagnostics(stdout: &str) -> Vec<RustErrorLocation> {
                             // Rustc reports the nearest opener like:
                             //   "the nearest open delimiter"
                             //   "missing open `(` for this delimiter"
-                            if !msg.contains("open delimiter")
-                                && !msg.contains("missing open")
-                            {
+                            if !msg.contains("open delimiter") && !msg.contains("missing open") {
                                 return None;
                             }
                             child.spans.first().map(|s| RustRelatedSpan {
@@ -488,13 +490,19 @@ fn format_cargo_test_success(summary: CargoTestSummary) -> String {
     if summary.ignored == 0 {
         format!("ok: {} passed\n", summary.passed)
     } else {
-        format!("ok: {} passed; {} ignored\n", summary.passed, summary.ignored)
+        format!(
+            "ok: {} passed; {} ignored\n",
+            summary.passed, summary.ignored
+        )
     }
 }
 
 fn format_cargo_test_failure(summary: CargoTestSummary) -> String {
     if summary.ignored == 0 {
-        format!("FAILED: {} failed; {} passed\n", summary.failed, summary.passed)
+        format!(
+            "FAILED: {} failed; {} passed\n",
+            summary.failed, summary.passed
+        )
     } else {
         format!(
             "FAILED: {} failed; {} passed; {} ignored\n",
@@ -502,7 +510,6 @@ fn format_cargo_test_failure(summary: CargoTestSummary) -> String {
         )
     }
 }
-
 
 fn rust_test_runtime_failure_sections(stderr: &str) -> String {
     let mut output = String::new();
@@ -666,7 +673,12 @@ mod tests {
     #[test]
     fn inspect_check_parser_accepts_packages_and_target_selectors() {
         assert_eq!(
-            parse_cargo_check_command(&[word("harness-core"), word("--lib"), word("--all-targets")]).unwrap(),
+            parse_cargo_check_command(&[
+                word("harness-core"),
+                word("--lib"),
+                word("--all-targets")
+            ])
+            .unwrap(),
             vec![
                 "check".to_string(),
                 "--locked".to_string(),
@@ -682,7 +694,8 @@ mod tests {
         );
 
         assert_eq!(
-            parse_cargo_check_command(&[word("-p"), word("pkg1"), word("-p"), word("pkg2")]).unwrap(),
+            parse_cargo_check_command(&[word("-p"), word("pkg1"), word("-p"), word("pkg2")])
+                .unwrap(),
             vec![
                 "check".to_string(),
                 "--locked".to_string(),
@@ -710,7 +723,8 @@ mod tests {
             "failed to parse `inspect` check input: unsupported option `--message-format=short`"
         );
 
-        let file_error = parse_cargo_check_command(&[word("crates/tool-grammar/src/lib.rs")]).unwrap_err();
+        let file_error =
+            parse_cargo_check_command(&[word("crates/tool-grammar/src/lib.rs")]).unwrap_err();
         assert_eq!(
             file_error,
             "failed to parse `inspect` check input: `crates/tool-grammar/src/lib.rs` appears to be a file path, but `check` expects package names (e.g., `tool-grammar`), `--lib`, or `--all-targets`"
@@ -748,11 +762,7 @@ mod tests {
             r#"{"reason":"compiler-message","message":{"code":null,"level":"error","message":"unexpected closing delimiter: `}`","spans":[{"file_name":"src/main.rs","line_start":55,"column_start":1,"is_primary":true}],"children":[{"level":"note","message":"the nearest open delimiter","spans":[{"file_name":"src/main.rs","line_start":42,"column_start":1,"is_primary":true,"label":"the nearest open delimiter"}]}]}}"#,
             "\n"
         );
-        let output = format_cargo_check_output(
-            status,
-            stdout,
-            "",
-        );
+        let output = format_cargo_check_output(status, stdout, "");
 
         assert_eq!(
             output,
@@ -783,11 +793,7 @@ mod tests {
             .status()
             .unwrap();
         let stdout = r#"{"reason":"compiler-message","message":{"code":null,"level":"error","message":"this file contains an unclosed delimiter","spans":[{"file_name":"src/globals.rs","line_start":740,"column_start":3,"is_primary":true}]}}"#;
-        let output = format_cargo_check_output(
-            status,
-            stdout,
-            "",
-        );
+        let output = format_cargo_check_output(status, stdout, "");
 
         assert_eq!(
             output,
@@ -854,4 +860,3 @@ mod tests {
         );
     }
 }
-

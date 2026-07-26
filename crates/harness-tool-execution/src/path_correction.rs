@@ -59,7 +59,7 @@ pub fn suggest_correction(workspace_root: &Path, requested: &str) -> Option<Corr
         &missing_suffix,
         "",
         &mut candidates,
-        3,         // max walk depth
+        3, // max walk depth
         &mut budget,
     );
 
@@ -124,7 +124,9 @@ fn walk_files(
         return;
     }
 
-    let Ok(entries) = std::fs::read_dir(root) else { return };
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
 
     for entry in entries.flatten() {
         if *budget == 0 {
@@ -145,18 +147,13 @@ fn walk_files(
             format!("{relative}/{name}")
         };
 
-        let Ok(file_type) = entry.file_type() else { continue };
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
 
         if file_type.is_dir() {
             // Recurse into subdirectories.
-            walk_files(
-                &entry.path(),
-                target,
-                &rel,
-                candidates,
-                depth - 1,
-                budget,
-            );
+            walk_files(&entry.path(), target, &rel, candidates, depth - 1, budget);
         } else if file_type.is_file() {
             let score = levenshtein(&rel, target);
             candidates.push((score, rel));
@@ -166,7 +163,9 @@ fn walk_files(
 
 /// Generate a simple sorted directory listing.
 fn list_directory(abs_path: &Path, prefix: &str) -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir(abs_path) else { return Vec::new() };
+    let Ok(entries) = std::fs::read_dir(abs_path) else {
+        return Vec::new();
+    };
 
     let mut listing: Vec<String> = entries
         .flatten()
@@ -225,9 +224,7 @@ fn levenshtein(a: &str, b: &str) -> usize {
             } else {
                 1
             };
-            curr[j] = (curr[j - 1] + 1)
-                .min(prev[j] + 1)
-                .min(prev[j - 1] + cost);
+            curr[j] = (curr[j - 1] + 1).min(prev[j] + 1).min(prev[j - 1] + cost);
         }
         std::mem::swap(&mut prev, &mut curr);
     }
@@ -321,7 +318,11 @@ mod tests {
             "should insert missing src/ subdirectory"
         );
         // Listing should show contents of ira_ast/.
-        assert!(correction.listing.contains(&"ira/crates/ira_ast/src/".to_string()));
+        assert!(
+            correction
+                .listing
+                .contains(&"ira/crates/ira_ast/src/".to_string())
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

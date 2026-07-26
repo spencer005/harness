@@ -3,11 +3,11 @@
 use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use futures_util::{Stream, StreamExt};
+use harness_chat_completions_protocol::{ChatEventDecoder, encode_request};
 use harness_model_api::{
     ModelAttempt, ModelAttemptHandle, ModelCancellation, ModelEvent, ModelFailure,
     ModelFailureKind, ModelInterruption, ModelTerminalOutcome, ModelTransport,
 };
-use harness_chat_completions_protocol::{ChatEventDecoder, encode_request};
 use thiserror::Error;
 use tokio::{
     sync::{Mutex, mpsc},

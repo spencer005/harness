@@ -251,9 +251,11 @@ impl ResponsesEventDecoder {
             }
             let mut events = vec![ModelEvent::Started];
             if let Some(resp_id) = &self.created_response_id {
-                events.push(ModelEvent::Metadata(harness_model_api::ModelResponseMetadata {
-                    response_id: Some(resp_id.clone()),
-                }));
+                events.push(ModelEvent::Metadata(
+                    harness_model_api::ModelResponseMetadata {
+                        response_id: Some(resp_id.clone()),
+                    },
+                ));
             }
             return Ok(events);
         }
@@ -280,9 +282,11 @@ impl ResponsesEventDecoder {
             self.usage = extract_usage(&value);
             let mut events = Vec::new();
             if let Some(resp_id) = &self.confirmed_response_id {
-                events.push(ModelEvent::Metadata(harness_model_api::ModelResponseMetadata {
-                    response_id: Some(resp_id.clone()),
-                }));
+                events.push(ModelEvent::Metadata(
+                    harness_model_api::ModelResponseMetadata {
+                        response_id: Some(resp_id.clone()),
+                    },
+                ));
             }
             if self.terminal_seen {
                 return Err(ProtocolError::DuplicateTerminal);
@@ -372,7 +376,8 @@ impl ResponsesEventDecoder {
                 | "response.function_call_arguments.done"
                 | "response.custom_tool_call_input.done"
                 | "codex.rate_limits"
-        ) || event_type.starts_with("codex.") {
+        ) || event_type.starts_with("codex.")
+        {
             return Ok(Vec::new());
         }
 
@@ -390,7 +395,11 @@ impl ResponsesEventDecoder {
 
         let event = match decode_event_value(&value, &mut self.assistant_text, &mut self.usage) {
             Ok(event) => event,
-            Err(ProtocolError::UnsupportedEvent(_)) if event_type.contains(':') => return Ok(Vec::new()),
+            Err(ProtocolError::UnsupportedEvent(event_type)) => {
+                return Ok(vec![ModelEvent::Warning(format!(
+                    "ignored unknown Responses event type: {event_type}"
+                ))]);
+            }
             Err(error) => return Err(error),
         };
 
@@ -638,7 +647,9 @@ pub fn encode_input(
                             match developer_role_support {
                                 harness_model_api::DeveloperRoleSupport::Disabled => "system",
                                 harness_model_api::DeveloperRoleSupport::Supported
-                                | harness_model_api::DeveloperRoleSupport::DeveloperOnly => "developer",
+                                | harness_model_api::DeveloperRoleSupport::DeveloperOnly => {
+                                    "developer"
+                                }
                             }
                         }
                     }
@@ -860,12 +871,36 @@ mod tests {
             .push(b"data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"status\":\"completed\"}}\n\n")
             .unwrap()
             .is_empty());
-        assert!(
-            decoder
-                .push(b"data: {\"type\":\"vendor:trace\",\"sequence_number\":1}\n\n")
-                .unwrap()
-                .is_empty()
-        );
+    }
+ 
+    #[test]
+    fn unknown_event_warns_and_does_not_stop_the_response_stream() {
+        let mut decoder = ResponsesEventDecoder::new();
+
+        let events = decoder
+            .push(b"data: {\"type\":\"response.future_event\",\"detail\":\"new\"}\n\n")
+            .unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [ModelEvent::Warning(message)] if message.contains("response.future_event")
+        ));
+
+        let events = decoder
+            .push(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"still running\"}\n\n")
+            .unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [ModelEvent::AssistantTextDelta(text)] if text == "still running"
+        ));
+
+        let events = decoder
+            .push(b"data: {\"type\":\"response.completed\"}\n\n")
+            .unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [ModelEvent::Terminal(ModelTerminalOutcome::Completed(completion))]
+                if completion.text == "still running"
+        ));
     }
 
     #[test]
@@ -1023,7 +1058,10 @@ mod tests {
         let event = decode_event(&item_wrapper.to_string(), &mut text, &mut usage).unwrap();
         if let ModelEvent::ReasoningItem(reasoning) = event {
             assert_eq!(reasoning.content.as_deref(), Some("raw reasoning step"));
-            assert_eq!(reasoning.encrypted_content.as_deref(), Some("enc_payload_xyz"));
+            assert_eq!(
+                reasoning.encrypted_content.as_deref(),
+                Some("enc_payload_xyz")
+            );
             assert_eq!(reasoning.summary.as_deref(), Some("reasoning summary"));
         } else {
             panic!("Expected ReasoningItem event");
@@ -1051,7 +1089,9 @@ mod tests {
     fn test_captures_and_confirms_response_id() {
         let mut decoder = ResponsesEventDecoder::new();
         let events = decoder
-            .push(b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_abc123\"}}\n\n")
+            .push(
+                b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_abc123\"}}\n\n",
+            )
             .unwrap();
         assert_eq!(
             events,

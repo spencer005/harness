@@ -1,5 +1,6 @@
-use ratatui::widgets::ListState;
 use std::time::SystemTime;
+
+use ratatui::widgets::ListState;
 
 #[derive(Clone, Debug)]
 pub struct SessionMeta {
@@ -89,6 +90,32 @@ impl RewindPickerState {
         Self {
             options,
             list_state: state,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct EditableMessage {
+    pub sequence: u64,
+    pub role: harness_runtime_api::EditableMessageRole,
+    pub text: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct MessageEditorState {
+    pub messages: Vec<EditableMessage>,
+    pub list_state: ListState,
+}
+
+impl MessageEditorState {
+    pub fn new(messages: Vec<EditableMessage>) -> Self {
+        let mut list_state = ListState::default();
+        if !messages.is_empty() {
+            list_state.select(Some(messages.len() - 1));
+        }
+        Self {
+            messages,
+            list_state,
         }
     }
 }

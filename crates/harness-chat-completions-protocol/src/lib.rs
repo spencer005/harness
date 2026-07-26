@@ -120,11 +120,7 @@ fn encode_messages(input: &[ModelInput]) -> Result<Vec<Value>, ChatCompletionsPr
                             call_id,
                             name,
                             input,
-                        } => (
-                            call_id,
-                            name,
-                            json!({ "input": input }).to_string(),
-                        ),
+                        } => (call_id, name, json!({ "input": input }).to_string()),
                         _ => break,
                     };
                     calls.push(json!({
@@ -258,7 +254,10 @@ impl ChatEventDecoder {
         Ok(decoded)
     }
 
-    fn decode_chunk(&mut self, payload: &str) -> Result<Vec<ModelEvent>, ChatCompletionsProtocolError> {
+    fn decode_chunk(
+        &mut self,
+        payload: &str,
+    ) -> Result<Vec<ModelEvent>, ChatCompletionsProtocolError> {
         if self.terminal_seen {
             return Err(ChatCompletionsProtocolError::EventAfterTerminal);
         }
@@ -337,10 +336,9 @@ impl ChatEventDecoder {
                 .into_iter()
                 .flatten()
             {
-                let index = call
-                    .get("index")
-                    .and_then(Value::as_u64)
-                    .ok_or(ChatCompletionsProtocolError::InvalidField("tool_calls.index"))?;
+                let index = call.get("index").and_then(Value::as_u64).ok_or(
+                    ChatCompletionsProtocolError::InvalidField("tool_calls.index"),
+                )?;
                 let partial = self.tool_calls.entry(index).or_default();
                 if let Some(call_id) = call.get("id").and_then(Value::as_str) {
                     partial.call_id = Some(call_id.to_owned());
@@ -388,12 +386,16 @@ impl ChatEventDecoder {
                 .ok_or(ChatCompletionsProtocolError::InvalidField("tool_calls.id"))?;
             let name = partial
                 .name
-                .ok_or(ChatCompletionsProtocolError::InvalidField("tool_calls.function.name"))?;
+                .ok_or(ChatCompletionsProtocolError::InvalidField(
+                    "tool_calls.function.name",
+                ))?;
             let input = if self.freeform_tools.contains(&name) {
                 let wrapped: Value = sonic_rs::from_str(&partial.arguments)
                     .map_err(ChatCompletionsProtocolError::InvalidFreeformArguments)?;
                 let input = wrapped.get("input").and_then(Value::as_str).ok_or(
-                    ChatCompletionsProtocolError::InvalidField("tool_calls.function.arguments.input"),
+                    ChatCompletionsProtocolError::InvalidField(
+                        "tool_calls.function.arguments.input",
+                    ),
                 )?;
                 ToolInput::Freeform(input.to_owned())
             } else {

@@ -6,8 +6,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use super::{
-    DocumentLimits, DocumentLine, DocumentRun, LaidOut, StyleId,
-    is_permitted_display_character,
+    DocumentLimits, DocumentLine, DocumentRun, LaidOut, StyleId, is_permitted_display_character,
 };
 
 pub(super) const OMISSION_MARKER: &str = "… output truncated …";
@@ -109,9 +108,7 @@ impl LaidOutLine {
 
 pub(super) fn bound_lines(lines: Vec<DocumentLine>, limits: DocumentLimits) -> Vec<DocumentLine> {
     let source_metrics = document_metrics(&lines);
-    if source_metrics.bytes <= limits.max_bytes
-        && source_metrics.lines <= limits.max_lines
-    {
+    if source_metrics.bytes <= limits.max_bytes && source_metrics.lines <= limits.max_lines {
         return ensure_nonempty(lines);
     }
 
@@ -176,9 +173,7 @@ pub(super) fn bound_one_line(
 ) -> Vec<DocumentLine> {
     let lines = ensure_nonempty(lines);
     let source_metrics = document_metrics(&lines);
-    if lines.len() == 1
-        && source_metrics.bytes <= limits.max_bytes
-        && source_metrics.cells <= width
+    if lines.len() == 1 && source_metrics.bytes <= limits.max_bytes && source_metrics.cells <= width
     {
         return lines;
     }

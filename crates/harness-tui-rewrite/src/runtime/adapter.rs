@@ -2,9 +2,8 @@
 
 use harness_runtime_api::{
     Activity, ActivityStatus as RuntimeActivityStatus, AgentStatus as RuntimeAgentStatus,
-    ModelSummary, ProviderSummary, RuntimeCommand, RuntimeEvent,
+    ModelSummary, ProviderSummary, RuntimeCommand, RuntimeEvent, TranscriptToolInput,
 };
-use harness_tool_api::ToolInput;
 
 use crate::domain::{
     ActivityState, ActivityStatus, AgentId, AgentState, AgentStatus, ContextUsage, DomainEvent,
@@ -35,6 +34,9 @@ pub(super) fn adapt_runtime_event(event: RuntimeEvent) -> DomainEvent {
                 reached_start: page.reached_start,
             }
         }
+        RuntimeEvent::TranscriptReplaced(entries) => DomainEvent::ReplaceTranscript(
+            entries.into_iter().map(convert_snapshot_entry).collect(),
+        ),
         RuntimeEvent::TranscriptCommitted {
             reasoning_sequence,
             assistant_sequence,
@@ -42,6 +44,9 @@ pub(super) fn adapt_runtime_event(event: RuntimeEvent) -> DomainEvent {
             reasoning_sequence,
             assistant_sequence,
         },
+        RuntimeEvent::SessionChanged(session_id) => {
+            DomainEvent::SessionChanged(ExternalText::new(session_id))
+        }
         RuntimeEvent::ProviderChanged(summary) => {
             DomainEvent::ProviderChanged(convert_provider(summary))
         }
@@ -92,7 +97,8 @@ pub(super) fn adapt_runtime_event(event: RuntimeEvent) -> DomainEvent {
                 .into_iter()
                 .map(|s| crate::picker::SessionMeta {
                     id: s.id,
-                    modified: std::time::UNIX_EPOCH + std::time::Duration::from_secs(s.modified_secs),
+                    modified: std::time::UNIX_EPOCH
+                        + std::time::Duration::from_secs(s.modified_secs),
                     all_text: s.all_text,
                     model: s.model,
                     title: s.title,
@@ -109,6 +115,17 @@ pub(super) fn adapt_runtime_event(event: RuntimeEvent) -> DomainEvent {
                 })
                 .collect(),
         ),
+        RuntimeEvent::OpenMessageEditor(messages) => DomainEvent::OpenMessageEditor(
+            messages
+                .into_iter()
+                .map(|message| crate::picker::EditableMessage {
+                    sequence: message.sequence,
+                    role: message.role,
+                    text: message.text,
+                })
+                .collect(),
+        ),
+        RuntimeEvent::Warning(message) => DomainEvent::Warning(message),
         RuntimeEvent::Failure(failure) => DomainEvent::Failure(failure.message),
         RuntimeEvent::ShutdownComplete => DomainEvent::ShutdownCompleted,
     }
@@ -130,6 +147,7 @@ pub(super) fn export_runtime_request(request: RuntimeRequest) -> RuntimeCommand 
         RuntimeRequest::StopRequestLoop => RuntimeCommand::StopRequestLoop,
         RuntimeRequest::AbortResponse => RuntimeCommand::AbortResponse,
         RuntimeRequest::Interrupt { text } => RuntimeCommand::Interrupt { text },
+        RuntimeRequest::SendQueuedSteering => RuntimeCommand::SendQueuedSteering,
         RuntimeRequest::LoadTranscriptPage { before_sequence } => {
             RuntimeCommand::LoadOlderTranscript { before_sequence }
         }
@@ -162,8 +180,9 @@ pub fn convert_payload(payload: harness_runtime_api::TranscriptPayload) -> Trans
             input,
         } => {
             let kind = match input {
-                ToolInput::Freeform(_) => ToolInvocationKind::Freeform,
-                ToolInput::FunctionJson(_) => ToolInvocationKind::Function,
+                TranscriptToolInput::Freeform(_) => ToolInvocationKind::Freeform,
+                TranscriptToolInput::FunctionJson(_) => ToolInvocationKind::Function,
+                TranscriptToolInput::Unspecified(_) => ToolInvocationKind::Unspecified,
             };
             TranscriptPayload::ToolCall {
                 call_id: ExternalText::new(call_id),
@@ -262,9 +281,8 @@ mod tests {
     use harness_runtime_api::{
         Activity, ActivityStatus as RuntimeActivityStatus, ContextUsage as RuntimeContextUsage,
         ModelSummary, ProviderSummary, RuntimeCommand, RuntimeEvent, TranscriptPage,
-        TranscriptSnapshotEntry,
+        TranscriptSnapshotEntry, TranscriptToolInput,
     };
-    use harness_tool_api::ToolInput;
 
     use super::{adapt_runtime_event, export_runtime_request};
     use crate::domain::{
@@ -339,7 +357,7 @@ mod tests {
                 payload: harness_runtime_api::TranscriptPayload::ToolCall {
                     call_id: "call-1".into(),
                     name: "echo".into(),
-                    input: ToolInput::Freeform("raw text".into()),
+                    input: TranscriptToolInput::Freeform("raw text".into()),
                 },
             }));
         let DomainEvent::AppendTranscript(entry) = freeform else {
@@ -357,7 +375,7 @@ mod tests {
                 payload: harness_runtime_api::TranscriptPayload::ToolCall {
                     call_id: "call-2".into(),
                     name: "run".into(),
-                    input: ToolInput::FunctionJson("{\"cmd\":true}".into()),
+                    input: TranscriptToolInput::FunctionJson("{\"cmd\":true}".into()),
                 },
             }));
         let DomainEvent::AppendTranscript(entry) = function else {
@@ -368,6 +386,23 @@ mod tests {
         };
         assert_eq!(kind, super::ToolInvocationKind::Function);
         assert_eq!(input.as_str(), "{\"cmd\":true}");
+        let unspecified =
+            adapt_runtime_event(RuntimeEvent::TranscriptAppended(TranscriptSnapshotEntry {
+                sequence: Some(9),
+                payload: harness_runtime_api::TranscriptPayload::ToolCall {
+                    call_id: "call-old".into(),
+                    name: "inspect".into(),
+                    input: TranscriptToolInput::Unspecified("read src/main.rs".into()),
+                },
+            }));
+        let DomainEvent::AppendTranscript(entry) = unspecified else {
+            panic!("persisted tool call adapts");
+        };
+        let TranscriptPayload::ToolCall { kind, input, .. } = entry.payload else {
+            panic!("persisted tool call payload adapts");
+        };
+        assert_eq!(kind, super::ToolInvocationKind::Unspecified);
+        assert_eq!(input.as_str(), "read src/main.rs");
     }
 
     #[test]
@@ -457,6 +492,10 @@ mod tests {
             panic!("immediate steering exports to Interrupt");
         };
         assert_eq!(text, "\r\n\u{1b}exact");
+        assert_eq!(
+            export_runtime_request(RuntimeRequest::SendQueuedSteering),
+            RuntimeCommand::SendQueuedSteering
+        );
 
         let RuntimeCommand::LoadOlderTranscript { before_sequence } =
             export_runtime_request(RuntimeRequest::LoadTranscriptPage {
@@ -484,5 +523,16 @@ mod tests {
             panic!("failure adapts to failure");
         };
         assert_eq!(message, "model unreachable");
+    }
+ 
+    #[test]
+    fn warning_event_surfaces_without_becoming_a_failure() {
+        let event = adapt_runtime_event(RuntimeEvent::Warning(
+            "ignored unknown Responses event type: response.future".into(),
+        ));
+        assert!(matches!(
+            event,
+            DomainEvent::Warning(message) if message.contains("response.future")
+        ));
     }
 }

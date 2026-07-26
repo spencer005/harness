@@ -48,6 +48,7 @@ harness-conversation-runtime = { path = "crates/harness-conversation-runtime" }
 harness-provider = { path = "crates/harness-provider" }
 harness-responses-transport = { path = "crates/harness-responses-transport" }
 harness-tool-execution = { path = "crates/harness-tool-execution" }
+harness-session-picker = { path = "crates/harness-session-picker" }
 
 
 
@@ -64,6 +65,8 @@ hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "http1", "tokio"] }
 libc = "0.2"
 ratatui = "0.29"
+regex = "1"
+globset = "0.4"
 object = { version = "0.36", default-features = false, features = ["elf", "read_core", "std"] }
 criterion = "0.5"
 serde = { version = "1", features = ["derive"] }

@@ -171,6 +171,11 @@ The bottom status line shows the session id, model/reasoning/tier, `role: develo
 - `/developer on` sends subsequent input as Responses `developer` messages. This is the default.
 - `/developer off` sends subsequent input as Responses `user` messages.
 - `/developer` toggles between developer and user input roles.
+- `/edit` opens the persisted user/assistant message and native tool-call picker. `Enter` loads the
+  selected message or exact native tool input into the prompt for editing. `Delete` removes any
+  selected entry. Direct forms are `/edit <sequence> <replacement text>` and
+  `/edit delete <sequence>`. Each change activates a new session fork, leaving the original session
+  unchanged. Deleting a tool call also removes its correlated execution and result records.
 - `/model <model> [reasoning] [tier]` updates the model settings for subsequent turns.
 - `/persist [task|pause|continue]` toggles or controls automatic continuation for the previous or explicitly provided task
   until the model verifies completion criteria and calls the `mark_task_complete` custom tool. Run

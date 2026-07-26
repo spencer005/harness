@@ -10,7 +10,6 @@ crossterm.workspace = true
 futures-util.workspace = true
 harness-runtime-api.workspace = true
 harness-model-api.workspace = true
-harness-tool-api.workspace = true
 ratatui.workspace = true
 tokio.workspace = true
 unicode-segmentation.workspace = true

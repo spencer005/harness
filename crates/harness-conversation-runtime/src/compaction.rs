@@ -135,7 +135,10 @@ impl CompactionCoordinator {
                         self.validated()
                     }
                     Err(error) => {
-                        self.state = CompactionState::Failed { source, instruction };
+                        self.state = CompactionState::Failed {
+                            source,
+                            instruction,
+                        };
                         Err(error)
                     }
                 }
@@ -185,24 +188,20 @@ impl CompactionCoordinator {
         instruction: Option<String>,
     ) -> Result<(), CompactionStateError> {
         let (source, previous_instruction) = match &self.state {
-            CompactionState::Failed { source, instruction } => {
-                (source.clone(), instruction.clone())
-            }
+            CompactionState::Failed {
+                source,
+                instruction,
+            } => (source.clone(), instruction.clone()),
             CompactionState::Validated { result } => {
                 (result.source.clone(), result.instruction.clone())
             }
-            CompactionState::Running { draft } => {
-                (draft.source.clone(), draft.instruction.clone())
-            }
+            CompactionState::Running { draft } => (draft.source.clone(), draft.instruction.clone()),
             CompactionState::Committed | CompactionState::Cancelled => {
-                return Err(CompactionStateError::SourceUnavailable)
+                return Err(CompactionStateError::SourceUnavailable);
             }
         };
         self.state = CompactionState::Running {
-            draft: CompactionDraft::new(
-                source,
-                instruction.unwrap_or(previous_instruction),
-            ),
+            draft: CompactionDraft::new(source, instruction.unwrap_or(previous_instruction)),
         };
         Ok(())
     }
@@ -244,9 +243,16 @@ impl CompactionCoordinator {
 /// State of a compaction transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CompactionState {
-    Running { draft: CompactionDraft },
-    Failed { source: CompactionSource, instruction: String },
-    Validated { result: ValidatedCompaction },
+    Running {
+        draft: CompactionDraft,
+    },
+    Failed {
+        source: CompactionSource,
+        instruction: String,
+    },
+    Validated {
+        result: ValidatedCompaction,
+    },
     Committed,
     Cancelled,
 }
@@ -300,7 +306,10 @@ mod tests {
 
     #[test]
     fn empty_and_short_results_are_rejected() {
-        assert_eq!(validate_summary(" \n"), Err(CompactionValidationError::Empty));
+        assert_eq!(
+            validate_summary(" \n"),
+            Err(CompactionValidationError::Empty)
+        );
         assert!(matches!(
             validate_summary("too short"),
             Err(CompactionValidationError::TooShort { .. })
@@ -330,8 +339,8 @@ mod tests {
             revision: 7,
             history: Vec::new(),
         };
-        let mut coordinator = CompactionCoordinator::begin(source.clone(), "retain blockers".into())
-            .unwrap();
+        let mut coordinator =
+            CompactionCoordinator::begin(source.clone(), "retain blockers".into()).unwrap();
         coordinator
             .push_delta("The active task and unresolved blockers are:")
             .unwrap();
@@ -360,6 +369,9 @@ mod tests {
         let mut coordinator = CompactionCoordinator::begin(source, String::new()).unwrap();
         coordinator.cancel();
         assert_eq!(coordinator.source(), None);
-        assert_eq!(coordinator.redo(), Err(CompactionStateError::SourceUnavailable));
+        assert_eq!(
+            coordinator.redo(),
+            Err(CompactionStateError::SourceUnavailable)
+        );
     }
 }

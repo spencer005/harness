@@ -105,15 +105,19 @@ impl ToolExecutor for Executor {
         &self,
         request: ToolExecutionRequest,
     ) -> Pin<Box<dyn Future<Output = Result<ToolResult, ToolFailure>> + Send + '_>> {
-        let result = if request.tool.as_str() != NAME || request.route.identifier != NAME {
-            Err(ToolFailure::Execution(format!(
+        if request.tool.as_str() != NAME || request.route.identifier != NAME {
+            return Box::pin(std::future::ready(Err(ToolFailure::Execution(format!(
                 "executor route does not match `{NAME}` for tool {}",
                 request.tool.as_str()
-            )))
-        } else {
-            execute(&self.workspace, &request.input)
-        };
-        Box::pin(std::future::ready(result))
+            )))));
+        }
+
+        let workspace = self.workspace.clone();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || execute(&workspace, &request.input))
+                .await
+                .map_err(|error| ToolFailure::Execution(error.to_string()))?
+        })
     }
 }
 
@@ -180,29 +184,30 @@ pub struct LineAnchor {
 }
 
 fn validate_body_line(line: &str) -> Result<(), String> {
-    let trimmed = line.trim_start();
-    let first = match trimmed.split_whitespace().next() {
-        Some(w) => w,
-        None => return Ok(()),
-    };
+    // ERROR PRONE CODE, do not reenable
+    // let trimmed = line.trim_start();
+    // let first = match trimmed.split_whitespace().next() {
+    //     Some(w) => w,
+    //     None => return Ok(()),
+    // };
 
     // Check for a full anchor prefix like `42!` (digits + hash char).
-    if parse_anchor(first).is_ok() {
-        return Err(format!(
-            "failed to parse `edit_file` input: replacement content appears to \
-             include an `inspect` line prefix: `{first}`.\n\
-             \n\
-             Anchor markers are labels printed by `inspect`; they are not part \
-             of the file content.\n\
-             \n\
-             Wrong:\n\
-             `{line}`\n\
-             \n\
-             Correct: remove `{first}` from the beginning of the line.\n\
-             Use anchors only in edit headers, for example:\n\
-             `§ Replace 42é108ä`"
-        ));
-    }
+    // if parse_anchor(first).is_ok() {
+    //     return Err(format!(
+    //         "failed to parse `edit_file` input: replacement content appears to \
+    //          include an `inspect` line prefix: `{first}`.\n\
+    //          \n\
+    //          Anchor markers are labels printed by `inspect`; they are not part \
+    //          of the file content.\n\
+    //          \n\
+    //          Wrong:\n\
+    //          `{line}`\n\
+    //          \n\
+    //          Correct: remove `{first}` from the beginning of the line.\n\
+    //          Use anchors only in edit headers, for example:\n\
+    //          `§ Replace 42é108ä`"
+    //     ));
+    // }
 
     Ok(())
 }
@@ -332,10 +337,7 @@ fn resolve_existing_path(workspace: &WorkspaceRoot, path: &str) -> Result<PathBu
         let mut msg = format!("failed to edit {path}: file does not exist");
         msg.push_str(&format!("\nDid you mean: `{}`?", correction.suggested));
         if !correction.listing.is_empty() {
-            msg.push_str(&format!(
-                "\nFiles in `{}`:",
-                correction.deepest_prefix,
-            ));
+            msg.push_str(&format!("\nFiles in `{}`:", correction.deepest_prefix,));
             for entry in &correction.listing {
                 msg.push_str(&format!("\n  {entry}"));
             }
@@ -1063,10 +1065,7 @@ fn parse_anchor(value: &str) -> Result<LineAnchor, String> {
 
     // Look up the hash character in the dictionary to find its index.
     let hash = (0..=u8::MAX)
-        .find(|&h| {
-            edit_anchor_word(h)
-                .map_or(false, |word| word.chars().next() == Some(hash_char))
-        })
+        .find(|&h| edit_anchor_word(h).map_or(false, |word| word.chars().next() == Some(hash_char)))
         .ok_or_else(|| {
             format!(
                 "failed to parse `edit_file` input: hash character `{}` is not \

@@ -41,6 +41,8 @@ pub enum ToolInvocationKind {
     Freeform,
     /// JSON/function arguments.
     Function,
+    /// Persisted input whose original encoding was not recorded.
+    Unspecified,
 }
 
 /// Structured display data for a tool output.
@@ -359,6 +361,8 @@ pub(crate) enum DomainEvent {
         /// Whether the oldest persisted entry was reached.
         reached_start: bool,
     },
+    /// Complete replacement transcript after an active-session switch.
+    ReplaceTranscript(Vec<TranscriptSnapshotEntry>),
     /// Persisted sequences are assigned to active streamed entries.
     TranscriptCommitted {
         /// Sequence assigned to the reasoning entry, when present.
@@ -366,6 +370,8 @@ pub(crate) enum DomainEvent {
         /// Sequence assigned to the assistant message entry.
         assistant_sequence: u64,
     },
+    /// The active session changed.
+    SessionChanged(ExternalText),
     /// Model settings changed.
     ModelChanged(ModelState),
     /// Provider changed.
@@ -404,12 +410,16 @@ pub(crate) enum DomainEvent {
     SteeringChanged(Option<ExternalText>),
     /// A background activity changed.
     ActivityChanged(ActivityState),
+    /// A non-fatal runtime warning surfaced to the frontend.
+    Warning(String),
     /// A runtime failure surfaced to the frontend.
     Failure(String),
     /// Open session picker modal.
     OpenSessionPicker(Vec<crate::picker::SessionMeta>),
     /// Open rewind picker modal.
     OpenRewindPicker(Vec<crate::picker::RewindOptionMeta>),
+    /// Open transcript-message editor modal.
+    OpenMessageEditor(Vec<crate::picker::EditableMessage>),
     /// Runtime shutdown completed.
     ShutdownCompleted,
 }
@@ -435,8 +445,11 @@ pub(crate) enum RuntimeRequest {
     StopRequestLoop,
     /// Abort the active model response immediately.
     AbortResponse,
-    /// Interrupt and optional steering.
+    /// Interrupt and submit exact prompt text at the terminal boundary.
     Interrupt { text: String },
+    /// Interrupt and submit the queued steering at the terminal boundary.
+    SendQueuedSteering,
+
     /// Load the next older persisted transcript page.
     LoadTranscriptPage {
         /// Load entries with sequence numbers below this cursor.

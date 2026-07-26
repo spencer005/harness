@@ -4,7 +4,7 @@ use std::{
     cmp::Ordering,
     time::{Duration, Instant},
 };
-use crate::picker::{RewindPickerState, SessionMeta, SessionPickerState};
+
 use crate::{
     display::ClipboardText,
     domain::{
@@ -15,6 +15,7 @@ use crate::{
         BoundedInput, HorizontalUnit, InputFragment, PromptCapacityError, PromptEditor,
         PromptImportError, PromptPosition, RawInput, VerticalDirection,
     },
+    picker::{MessageEditorState, RewindPickerState, SessionMeta, SessionPickerState},
     transcript::{Transcript, TranscriptPosition, TranscriptScrollDirection},
 };
 
@@ -44,8 +45,6 @@ pub(crate) enum MouseCapture {
         thumb_offset: u16,
     },
 }
-
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SlashCommandSpec {
@@ -109,6 +108,12 @@ pub(crate) static KNOWN_SLASH_COMMANDS: &[SlashCommandSpec] = &[
         aliases: &[],
         usage: "[compact] [before:<sequence>]",
         summary: "Fork the current session, optionally rewinding before the last compaction",
+    },
+    SlashCommandSpec {
+        name: "edit",
+        aliases: &[],
+        usage: "[<sequence> <text>|delete <sequence>]",
+        summary: "Edit or delete a persisted transcript message",
     },
 ];
 
@@ -267,6 +272,8 @@ pub(crate) enum UserCommand {
     PickerDown,
     /// Confirm the current picker selection.
     PickerConfirm,
+    /// Delete the current transcript-message selection.
+    PickerDelete,
     /// Cancel/dismiss the session picker.
     PickerCancel,
     /// Insert a character into the picker search query.
@@ -354,7 +361,6 @@ impl From<crate::transcript::TranscriptError> for ApplicationImportError {
     }
 }
 
-
 /// Rewrite-owned application state.
 #[derive(Debug)]
 pub(crate) struct Application {
@@ -369,6 +375,8 @@ pub(crate) struct Application {
     pub(crate) session_picker: Option<SessionPickerState>,
     /// Active rewind picker state, present while the overlay is open.
     pub(crate) rewind_picker: Option<RewindPickerState>,
+    /// Active transcript-message editor state.
+    pub(crate) message_editor: Option<MessageEditorState>,
 }
 
 impl Application {
@@ -398,6 +406,7 @@ impl Application {
             should_exit: false,
             session_picker: None,
             rewind_picker: None,
+            message_editor: None,
         })
     }
 
@@ -491,11 +500,11 @@ impl Application {
         self.interaction.mouse_capture
     }
 
-
-
-    /// Returns whether the session picker overlay is currently open.
+    /// Returns whether a modal picker is currently open.
     pub(crate) fn picker_active(&self) -> bool {
         self.session_picker.is_some()
+            || self.rewind_picker.is_some()
+            || self.message_editor.is_some()
     }
 
     /// Returns whether exit confirmation is armed.
@@ -569,14 +578,23 @@ impl Application {
     pub(crate) fn handle_user_command(&mut self, command: UserCommand) -> Vec<AppEffect> {
         // When a modal picker is open, most normal commands are suppressed —
         // only picker-specific commands pass through.
-        if self.session_picker.is_some() || self.rewind_picker.is_some() {
+        if self.session_picker.is_some()
+            || self.rewind_picker.is_some()
+            || self.message_editor.is_some()
+        {
             match command {
                 UserCommand::PickerUp => {
                     if let Some(picker) = &mut self.session_picker {
                         let filtered_len = picker.filtered_sessions().len();
                         if filtered_len > 0 {
                             let i = match picker.list_state.selected() {
-                                Some(i) => if i == 0 { filtered_len - 1 } else { i - 1 },
+                                Some(i) => {
+                                    if i == 0 {
+                                        filtered_len - 1
+                                    } else {
+                                        i - 1
+                                    }
+                                }
                                 None => 0,
                             };
                             picker.list_state.select(Some(i));
@@ -585,10 +603,26 @@ impl Application {
                         let options_len = picker.options.len();
                         if options_len > 0 {
                             let i = match picker.list_state.selected() {
-                                Some(i) => if i == 0 { options_len - 1 } else { i - 1 },
+                                Some(i) => {
+                                    if i == 0 {
+                                        options_len - 1
+                                    } else {
+                                        i - 1
+                                    }
+                                }
                                 None => 0,
                             };
                             picker.list_state.select(Some(i));
+                        }
+                    } else if let Some(picker) = &mut self.message_editor {
+                        let messages_len = picker.messages.len();
+                        if messages_len > 0 {
+                            let index = match picker.list_state.selected() {
+                                Some(0) => messages_len - 1,
+                                Some(index) => index - 1,
+                                None => 0,
+                            };
+                            picker.list_state.select(Some(index));
                         }
                     }
                 }
@@ -597,7 +631,13 @@ impl Application {
                         let filtered_len = picker.filtered_sessions().len();
                         if filtered_len > 0 {
                             let i = match picker.list_state.selected() {
-                                Some(i) => if i >= filtered_len - 1 { 0 } else { i + 1 },
+                                Some(i) => {
+                                    if i >= filtered_len - 1 {
+                                        0
+                                    } else {
+                                        i + 1
+                                    }
+                                }
                                 None => 0,
                             };
                             picker.list_state.select(Some(i));
@@ -606,10 +646,26 @@ impl Application {
                         let options_len = picker.options.len();
                         if options_len > 0 {
                             let i = match picker.list_state.selected() {
-                                Some(i) => if i >= options_len - 1 { 0 } else { i + 1 },
+                                Some(i) => {
+                                    if i >= options_len - 1 {
+                                        0
+                                    } else {
+                                        i + 1
+                                    }
+                                }
                                 None => 0,
                             };
                             picker.list_state.select(Some(i));
+                        }
+                    } else if let Some(picker) = &mut self.message_editor {
+                        let messages_len = picker.messages.len();
+                        if messages_len > 0 {
+                            let index = match picker.list_state.selected() {
+                                Some(index) if index >= messages_len - 1 => 0,
+                                Some(index) => index + 1,
+                                None => 0,
+                            };
+                            picker.list_state.select(Some(index));
                         }
                     }
                 }
@@ -633,9 +689,10 @@ impl Application {
                 UserCommand::PickerConfirm => {
                     if let Some(mut picker) = self.session_picker.take() {
                         let filtered = picker.filtered_sessions();
-                        let selected_id = picker.list_state.selected().and_then(|i| {
-                            filtered.get(i).map(|(s, _)| s.id.clone())
-                        });
+                        let selected_id = picker
+                            .list_state
+                            .selected()
+                            .and_then(|i| filtered.get(i).map(|(s, _)| s.id.clone()));
                         if let Some(id) = selected_id {
                             return vec![AppEffect::Runtime {
                                 request: RuntimeRequest::SubmitInput {
@@ -645,13 +702,57 @@ impl Application {
                             }];
                         }
                     } else if let Some(mut picker) = self.rewind_picker.take() {
-                        let selected_seq = picker.list_state.selected().and_then(|i| {
-                            picker.options.get(i).map(|o| o.sequence)
-                        });
+                        let selected_seq = picker
+                            .list_state
+                            .selected()
+                            .and_then(|i| picker.options.get(i).map(|o| o.sequence));
                         if let Some(seq) = selected_seq {
                             return vec![AppEffect::Runtime {
                                 request: RuntimeRequest::SubmitInput {
-                                    text: format!("/rewind {}", seq),
+                                    text: format!("/rewind before:{}", seq),
+                                },
+                                completion: DeliveryCompletion::None,
+                            }];
+                        }
+                    } else if let Some(picker) = self.message_editor.as_ref() {
+                        let selected = picker
+                            .list_state
+                            .selected()
+                            .and_then(|index| picker.messages.get(index))
+                            .map(|message| (message.sequence, message.text.clone()));
+                        match selected {
+                            Some((sequence, text)) => {
+                                self.message_editor = None;
+                                let command = format!("/edit {sequence} {text}");
+                                self.prompt.clear();
+                                match InputFragment::<RawInput>::new(command).bound() {
+                                    Ok(fragment) => {
+                                        if let Err(error) = self.prompt.insert(fragment) {
+                                            self.set_notice(error.to_string());
+                                        } else {
+                                            self.interaction.focus = Focus::Prompt;
+                                        }
+                                    }
+                                    Err(error) => self.set_notice(error.to_string()),
+                                }
+                            }
+                            None => {
+                                self.message_editor = None;
+                            }
+                        }
+                    }
+                }
+                UserCommand::PickerDelete => {
+                    if let Some(mut picker) = self.message_editor.take() {
+                        let selected_sequence = picker
+                            .list_state
+                            .selected()
+                            .and_then(|index| picker.messages.get(index))
+                            .map(|message| message.sequence);
+                        if let Some(sequence) = selected_sequence {
+                            return vec![AppEffect::Runtime {
+                                request: RuntimeRequest::SubmitInput {
+                                    text: format!("/edit delete {}", sequence),
                                 },
                                 completion: DeliveryCompletion::None,
                             }];
@@ -661,6 +762,7 @@ impl Application {
                 UserCommand::PickerCancel => {
                     self.session_picker = None;
                     self.rewind_picker = None;
+                    self.message_editor = None;
                 }
                 UserCommand::OpenPicker(sessions) => {
                     self.session_picker = Some(SessionPickerState::new(sessions));
@@ -751,9 +853,8 @@ impl Application {
                         if !matches.is_empty() {
                             match direction {
                                 VerticalDirection::Up => {
-                                    self.completion_selected_index = selected_index
-                                        .checked_sub(1)
-                                        .unwrap_or(matches.len() - 1);
+                                    self.completion_selected_index =
+                                        selected_index.checked_sub(1).unwrap_or(matches.len() - 1);
                                 }
                                 VerticalDirection::Down => {
                                     self.completion_selected_index =
@@ -1009,6 +1110,7 @@ impl Application {
             UserCommand::PickerUp
             | UserCommand::PickerDown
             | UserCommand::PickerConfirm
+            | UserCommand::PickerDelete
             | UserCommand::PickerCancel
             | UserCommand::PickerChar(_)
             | UserCommand::PickerBackspace => {}
@@ -1021,9 +1123,7 @@ impl Application {
         match event {
             DomainEvent::AppendTranscript(entry) => {
                 if let Err(error) = self.transcript.append_snapshot(entry) {
-                    self.set_notice(
-                        format!("runtime transcript protocol violation: {}", error),
-                    );
+                    self.set_notice(format!("runtime transcript protocol violation: {}", error));
                 }
             }
             DomainEvent::TranscriptPage {
@@ -1031,25 +1131,32 @@ impl Application {
                 next_before_sequence,
                 reached_start,
             } => {
-                if let Err(error) = self.transcript
-                    .apply_page(entries, next_before_sequence, reached_start)
+                if let Err(error) =
+                    self.transcript
+                        .apply_page(entries, next_before_sequence, reached_start)
                 {
-                    self.set_notice(
-                        format!("runtime transcript protocol violation: {}", error),
-                    );
+                    self.set_notice(format!("runtime transcript protocol violation: {}", error));
                 }
             }
+            DomainEvent::ReplaceTranscript(entries) => match Transcript::import_complete(entries) {
+                Ok(transcript) => self.transcript = transcript,
+                Err(error) => {
+                    self.set_notice(format!("runtime transcript protocol violation: {}", error));
+                }
+            },
             DomainEvent::TranscriptCommitted {
                 reasoning_sequence,
                 assistant_sequence,
             } => {
-                if let Err(error) = self.transcript
+                if let Err(error) = self
+                    .transcript
                     .reconcile_commit(reasoning_sequence, assistant_sequence)
                 {
-                    self.set_notice(
-                        format!("runtime transcript protocol violation: {}", error),
-                    );
+                    self.set_notice(format!("runtime transcript protocol violation: {}", error));
                 }
+            }
+            DomainEvent::SessionChanged(session_id) => {
+                self.session.session_id = session_id;
             }
             DomainEvent::ModelChanged(model) => {
                 self.session.model = model;
@@ -1078,9 +1185,7 @@ impl Application {
             }
             DomainEvent::ResponseStreamStarted => {
                 if let Err(error) = self.transcript.begin_response_stream() {
-                    self.set_notice(
-                        format!("runtime transcript protocol violation: {}", error),
-                    );
+                    self.set_notice(format!("runtime transcript protocol violation: {}", error));
                 }
                 self.session.response_streaming = true;
                 self.session.model_awaiting = false;
@@ -1091,32 +1196,24 @@ impl Application {
             }
             DomainEvent::AssistantTextDelta(delta) => {
                 if let Err(error) = self.transcript.append_assistant_delta(delta) {
-                    self.set_notice(
-                        format!("runtime transcript protocol violation: {}", error),
-                    );
+                    self.set_notice(format!("runtime transcript protocol violation: {}", error));
                 }
             }
             DomainEvent::ThinkingDelta(delta) => {
                 if let Err(error) = self.transcript.append_thinking_delta(delta) {
-                    self.set_notice(
-                        format!("runtime transcript protocol violation: {}", error),
-                    );
+                    self.set_notice(format!("runtime transcript protocol violation: {}", error));
                 }
             }
             DomainEvent::ResponseStreamCompleted => {
                 if let Err(error) = self.transcript.complete_response_stream() {
-                    self.set_notice(
-                        format!("runtime transcript protocol violation: {}", error),
-                    );
+                    self.set_notice(format!("runtime transcript protocol violation: {}", error));
                 }
                 self.session.response_streaming = false;
                 self.session.model_awaiting = false;
             }
             DomainEvent::ResponseStreamFailed => {
                 if let Err(error) = self.transcript.complete_response_stream() {
-                    self.set_notice(
-                        format!("runtime transcript protocol violation: {}", error),
-                    );
+                    self.set_notice(format!("runtime transcript protocol violation: {}", error));
                 }
                 self.session.response_streaming = false;
                 self.session.model_awaiting = false;
@@ -1175,6 +1272,12 @@ impl Application {
                         )));
                 }
             }
+            DomainEvent::Warning(message) => {
+                self.transcript
+                    .append(crate::domain::TranscriptPayload::Event(ExternalText::new(
+                        format!("warning: {message}"),
+                    )));
+            }
             DomainEvent::Failure(message) => {
                 self.set_notice(message);
             }
@@ -1184,6 +1287,9 @@ impl Application {
             }
             DomainEvent::OpenRewindPicker(options) => {
                 self.rewind_picker = Some(crate::picker::RewindPickerState::new(options));
+            }
+            DomainEvent::OpenMessageEditor(messages) => {
+                self.message_editor = Some(crate::picker::MessageEditorState::new(messages));
             }
             DomainEvent::ShutdownCompleted => {
                 self.should_exit = true;
@@ -1302,11 +1408,9 @@ impl Application {
             }];
         }
 
-        if let Some(queued) = self.session.queued_steering.as_ref() {
+        if self.session.queued_steering.is_some() {
             return vec![AppEffect::Runtime {
-                request: RuntimeRequest::Interrupt {
-                    text: queued.as_str().to_owned(),
-                },
+                request: RuntimeRequest::SendQueuedSteering,
                 completion: DeliveryCompletion::None,
             }];
         }
@@ -1347,14 +1451,13 @@ impl Application {
         !self.interaction.prompt_delivery_pending
     }
 
-
-
     fn set_notice(&mut self, text: impl Into<String>) {
         let msg = text.into();
-        self.transcript.append(crate::domain::TranscriptPayload::Error {
-            category: crate::domain::RuntimeFailureCategory::Command,
-            message: ExternalText::new(msg),
-        });
+        self.transcript
+            .append(crate::domain::TranscriptPayload::Error {
+                category: crate::domain::RuntimeFailureCategory::Command,
+                message: ExternalText::new(msg),
+            });
     }
 }
 
@@ -1442,7 +1545,9 @@ mod tests {
         let mut app = Application::import(initial()).unwrap();
         app.handle_user_command(insert("/go"));
         let status = app.slash_command_status();
-        assert!(matches!(status, SlashCommandStatus::Autocompleting { ref prefix, ref matches, .. } if prefix == "go" && matches.iter().any(|m| m.name == "goal")));
+        assert!(
+            matches!(status, SlashCommandStatus::Autocompleting { ref prefix, ref matches, .. } if prefix == "go" && matches.iter().any(|m| m.name == "goal"))
+        );
     }
 
     #[test]
@@ -1540,10 +1645,11 @@ mod tests {
         assert!(matches!(
             &effects[0],
             AppEffect::Runtime {
-                request: RuntimeRequest::Interrupt { text },
+                request: RuntimeRequest::SendQueuedSteering,
                 completion: DeliveryCompletion::None,
-            } if text == "already queued"
+            }
         ));
+
         assert_eq!(app.transcript.entries().count(), 0);
     }
     #[test]
@@ -1631,5 +1737,101 @@ mod tests {
 
         app.handle_user_command(UserCommand::CancelMouseCapture);
         assert_eq!(app.next_visual_change_in(deadline), None);
+    }
+    #[test]
+    fn message_editor_loads_exact_message_text_into_the_prompt() {
+        let mut app = Application::import(initial()).unwrap();
+        app.apply_domain_event(DomainEvent::OpenMessageEditor(vec![
+            crate::picker::EditableMessage {
+                sequence: 42,
+                role: harness_runtime_api::EditableMessageRole::User,
+                text: " leading space\nsecond line".to_string(),
+            },
+        ]));
+
+        assert!(
+            app.handle_user_command(UserCommand::PickerConfirm)
+                .is_empty()
+        );
+
+        assert_eq!(app.prompt().text(), "/edit 42  leading space\nsecond line");
+        assert!(app.message_editor.is_none());
+    }
+
+    #[test]
+    fn message_editor_loads_exact_native_tool_input_into_the_prompt() {
+        let mut app = Application::import(initial()).unwrap();
+        app.apply_domain_event(DomainEvent::OpenMessageEditor(vec![
+            crate::picker::EditableMessage {
+                sequence: 42,
+                role: harness_runtime_api::EditableMessageRole::Tool {
+                    name: "inspect".to_string(),
+                },
+                text: "read src/main.rs".to_string(),
+            },
+        ]));
+
+        assert!(
+            app.handle_user_command(UserCommand::PickerConfirm)
+                .is_empty()
+        );
+
+        assert_eq!(app.prompt().text(), "/edit 42 read src/main.rs");
+        assert!(app.message_editor.is_none());
+    }
+
+    #[test]
+    fn message_editor_delete_submits_the_selected_sequence() {
+        let mut app = Application::import(initial()).unwrap();
+        app.apply_domain_event(DomainEvent::OpenMessageEditor(vec![
+            crate::picker::EditableMessage {
+                sequence: 42,
+                role: harness_runtime_api::EditableMessageRole::Assistant,
+                text: "remove".to_string(),
+            },
+        ]));
+
+        let effects = app.handle_user_command(UserCommand::PickerDelete);
+
+        assert!(matches!(
+            effects.as_slice(),
+            [AppEffect::Runtime {
+                request: RuntimeRequest::SubmitInput { text },
+                completion: DeliveryCompletion::None,
+            }] if text == "/edit delete 42"
+        ));
+        assert!(app.message_editor.is_none());
+    }
+
+    #[test]
+    fn transcript_replacement_discards_the_previous_session_entries() {
+        let mut state = initial();
+        state.transcript = vec![TranscriptSnapshotEntry {
+            sequence: Some(1),
+            payload: TranscriptPayload::Message {
+                role: MessageRole::User,
+                text: ExternalText::new("old session"),
+            },
+        }];
+        let mut app = Application::import(state).unwrap();
+
+        app.apply_domain_event(DomainEvent::ReplaceTranscript(vec![
+            TranscriptSnapshotEntry {
+                sequence: Some(7),
+                payload: TranscriptPayload::Message {
+                    role: MessageRole::Assistant,
+                    text: ExternalText::new("active session"),
+                },
+            },
+        ]));
+
+        let entries = app.transcript.entries().collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(
+            entries[0].payload(),
+            TranscriptPayload::Message { text, .. } if text.as_str() == "active session"
+        ));
+        drop(entries);
+        assert!(app.transcript.request_older_page(80, 20).is_none());
     }
 }

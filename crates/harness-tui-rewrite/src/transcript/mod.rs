@@ -17,7 +17,6 @@ use crate::{
     domain::{PersistedTranscriptEntry, TranscriptPayload, TranscriptSnapshotEntry},
 };
 
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TranscriptError {
     DeltaOutsideStream,
@@ -63,7 +62,10 @@ impl std::fmt::Display for TranscriptError {
                  Ensure the storage backend correctly increments the session sequence.",
                 seq
             ),
-            Self::PageCursorDidNotAdvance { requested_before, next_before_sequence } => write!(
+            Self::PageCursorDidNotAdvance {
+                requested_before,
+                next_before_sequence,
+            } => write!(
                 f,
                 "received a historical transcript page that failed to advance the sequence cursor.\n\
                  Requested before sequence {:?}, but the page returned a next cursor of {:?}.\n\
@@ -155,8 +157,6 @@ enum PageRequestState {
     Rejected,
 }
 
-
-
 /// One transcript line prepared for a viewport.
 #[derive(Debug, Clone)]
 pub(crate) enum TranscriptViewportLine {
@@ -234,6 +234,14 @@ impl Transcript {
             page_request: PageRequestState::Idle,
             before_sequence,
         })
+    }
+    /// Imports a complete persisted transcript with no older pages available.
+    pub(crate) fn import_complete(
+        entries: Vec<TranscriptSnapshotEntry>,
+    ) -> Result<Self, TranscriptError> {
+        let mut transcript = Self::import(entries, false)?;
+        transcript.page_request = PageRequestState::ReachedStart;
+        Ok(transcript)
     }
 
     #[cfg(test)]
@@ -372,7 +380,8 @@ impl Transcript {
         next_before_sequence: Option<u64>,
         reached_start: bool,
     ) -> Result<(), TranscriptError> {
-        if (matches!(self.page_request, PageRequestState::Idle) || matches!(self.page_request, PageRequestState::ReachedStart))
+        if (matches!(self.page_request, PageRequestState::Idle)
+            || matches!(self.page_request, PageRequestState::ReachedStart))
             && reached_start
             && next_before_sequence.is_none()
         {
@@ -720,7 +729,8 @@ mod tests {
                 payload: message("same"),
             }],
             false,
-        ).unwrap();
+        )
+        .unwrap();
         let page = vec![
             PersistedTranscriptEntry {
                 sequence: 1,
@@ -746,7 +756,8 @@ mod tests {
                 payload: message("hello world"),
             }],
             false,
-        ).unwrap();
+        )
+        .unwrap();
         let entry = transcript.entries().next().unwrap().id();
         let start = transcript.test_position(entry, 0);
         let end = transcript.test_position(entry, 5);
@@ -767,7 +778,8 @@ mod tests {
                 payload: message("short"),
             }],
             false,
-        ).unwrap();
+        )
+        .unwrap();
 
         transcript.scroll_to_top(80, 20);
         assert!(matches!(
@@ -791,7 +803,8 @@ mod tests {
                 },
             ],
             false,
-        ).unwrap();
+        )
+        .unwrap();
 
         assert!(matches!(
             transcript.request_older_page(80, 20),
@@ -809,7 +822,8 @@ mod tests {
                 payload: message("abcdefghijklmnopqrstuvwxyz0123456789"),
             }],
             false,
-        ).unwrap();
+        )
+        .unwrap();
         let width = 5;
         let height = 2;
         let maximum_top = transcript.viewport(width, height).top_line;
@@ -847,7 +861,8 @@ mod tests {
                 },
             ],
             false,
-        ).unwrap();
+        )
+        .unwrap();
 
         transcript.scroll_by(80, 1, 1);
         for _ in 0..4 {
@@ -868,7 +883,8 @@ mod tests {
                 payload: message("abcdefghijkl"),
             }],
             false,
-        ).unwrap();
+        )
+        .unwrap();
 
         transcript.scroll_by(3, 1, 2);
         let narrow = transcript.viewport(3, 1);
@@ -888,7 +904,8 @@ mod tests {
                 payload: message("abcdefghijklmnop"),
             }],
             false,
-        ).unwrap();
+        )
+        .unwrap();
 
         transcript.scroll_by(4, 1, 2);
         assert!(viewport_first_line_text(&transcript.viewport(4, 1)).contains('g'));
@@ -918,7 +935,8 @@ mod tests {
                 },
             ],
             false,
-        ).unwrap();
+        )
+        .unwrap();
         let retained_oldest = transcript.entries().next().unwrap().id();
 
         transcript.scroll_to_top(80, 1);
@@ -971,7 +989,8 @@ mod tests {
                 payload: message("ten"),
             }],
             false,
-        ).unwrap();
+        )
+        .unwrap();
         assert!(unchanged_cursor.request_older_page(80, 20).is_some());
         assert_eq!(
             unchanged_cursor.apply_page(Vec::new(), Some(10), false),
@@ -988,7 +1007,8 @@ mod tests {
                 payload: message("ten"),
             }],
             false,
-        ).unwrap();
+        )
+        .unwrap();
         assert!(empty_page.request_older_page(80, 20).is_some());
         assert_eq!(
             empty_page.apply_page(Vec::new(), Some(9), false),

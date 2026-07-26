@@ -421,6 +421,8 @@ pub enum ModelEvent {
     ToolInputDelta(ToolInputDelta),
     /// Complete tool call.
     ToolCall(ToolCall),
+    /// Non-fatal provider or protocol condition.
+    Warning(String),
     /// Observed usage.
     Usage(ModelUsage),
     /// Exactly one terminal event.

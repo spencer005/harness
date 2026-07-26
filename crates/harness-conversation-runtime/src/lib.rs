@@ -4,7 +4,10 @@
 //! credentials, or implement PTYs. The session store remains behind its
 //! current-format adapter until the final user-run migration phase.
 
-use std::{collections::BTreeMap, sync::{Arc, RwLock}};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, RwLock},
+};
 
 pub mod compaction;
 
@@ -14,19 +17,110 @@ use harness_model_api::{
 };
 use harness_runtime_api::{
     MessageRole, RuntimeCommand, RuntimeEvent, RuntimeFailureCategory, TranscriptPayload,
-    TranscriptSnapshotEntry,
+    TranscriptSnapshotEntry, TranscriptToolInput,
 };
 use harness_session_store::{
-    AppendReceipt, Durability, PageSize, SessionErrorCategory, SessionPayload, SessionStore,
-    SessionStoreError, SessionWriter, TranscriptPage as StoredTranscriptPage, TurnOutcome,
+    AppendReceipt, Durability, PageSize, SessionErrorCategory, SessionPayload, SessionRecord,
+    SessionStore, SessionStoreError, SessionToolInput, SessionWriter,
+    TranscriptPage as StoredTranscriptPage, TurnOutcome,
 };
 use harness_tool_api::{
     ToolAvailability, ToolExecutionId, ToolExecutionPolicy, ToolExecutionRequest, ToolExecutor,
-    ToolName, ToolRegistry,
+    ToolInput, ToolName, ToolRegistry,
 };
 use thiserror::Error;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+
+/// Projects one durable record into its frontend transcript representation.
+pub fn project_transcript_record(record: &SessionRecord) -> Option<TranscriptSnapshotEntry> {
+    let payload = match &record.payload {
+        SessionPayload::InputMessage { text, .. } => TranscriptPayload::Message {
+            role: MessageRole::User,
+            text: text.clone(),
+        },
+        SessionPayload::AssistantMessage { text, .. } => TranscriptPayload::Message {
+            role: MessageRole::Assistant,
+            text: text.clone(),
+        },
+        SessionPayload::Reasoning {
+            summary, content, ..
+        } => {
+            let text = summary.as_deref().or(content.as_deref())?;
+            if text.is_empty() {
+                return None;
+            }
+            TranscriptPayload::Thinking {
+                text: text.to_owned(),
+            }
+        }
+        SessionPayload::Error {
+            category, message, ..
+        } => TranscriptPayload::Error {
+            category: match category {
+                SessionErrorCategory::Model => RuntimeFailureCategory::Model,
+                SessionErrorCategory::Protocol => RuntimeFailureCategory::Protocol,
+                SessionErrorCategory::Tool => RuntimeFailureCategory::Tool,
+                SessionErrorCategory::Lifecycle => RuntimeFailureCategory::Lifecycle,
+            },
+            message: message.clone(),
+        },
+        SessionPayload::ToolCallAccepted {
+            call_id,
+            name,
+            input,
+            ..
+        } => TranscriptPayload::ToolCall {
+            call_id: call_id.clone(),
+            name: name.clone(),
+            input: match input {
+                SessionToolInput::Freeform(input) => TranscriptToolInput::Freeform(input.clone()),
+                SessionToolInput::FunctionJson(input) => {
+                    TranscriptToolInput::FunctionJson(input.clone())
+                }
+                SessionToolInput::Unspecified(input) => {
+                    TranscriptToolInput::Unspecified(input.clone())
+                }
+            },
+        },
+        SessionPayload::ToolExecutionFinished {
+            call_id, output, ..
+        } => TranscriptPayload::ToolResult {
+            call_id: call_id.clone(),
+            output: output.clone(),
+        },
+        SessionPayload::CompactionCheckpoint { summary, .. } => TranscriptPayload::Thinking {
+            text: summary.clone(),
+        },
+        SessionPayload::Metadata(_)
+        | SessionPayload::ProviderBinding(_)
+        | SessionPayload::TurnStarted { .. }
+        | SessionPayload::ModelAttemptStarted { .. }
+        | SessionPayload::ToolExecutionStarted { .. }
+        | SessionPayload::TurnFinished { .. }
+        | SessionPayload::ModelResponseMetadata { .. }
+        | SessionPayload::Goal { .. }
+        | SessionPayload::SessionClosed => return None,
+    };
+    Some(TranscriptSnapshotEntry {
+        sequence: Some(record.sequence),
+        payload,
+    })
+}
+
+fn persist_tool_input(input: &ToolInput) -> SessionToolInput {
+    match input {
+        ToolInput::Freeform(input) => SessionToolInput::Freeform(input.clone()),
+        ToolInput::FunctionJson(input) => SessionToolInput::FunctionJson(input.clone()),
+    }
+}
+
+fn transcript_tool_input(input: &ToolInput) -> TranscriptToolInput {
+    match input {
+        ToolInput::Freeform(input) => TranscriptToolInput::Freeform(input.clone()),
+        ToolInput::FunctionJson(input) => TranscriptToolInput::FunctionJson(input.clone()),
+    }
+}
 
 /// Lifecycle of the conversation runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,7 +263,7 @@ impl ActiveModelAttempt {
             ModelEvent::ToolInputDelta(_) | ModelEvent::ToolCall(_) => {
                 self.phase = AttemptPhase::Streaming;
             }
-            ModelEvent::Metadata(_) | ModelEvent::Usage(_) => {}
+            ModelEvent::Metadata(_) | ModelEvent::Usage(_) | ModelEvent::Warning(_) => {}
             ModelEvent::Terminal(outcome) => {
                 self.phase = AttemptPhase::Terminal;
                 self.terminal_outcome = Some(outcome);
@@ -462,7 +556,8 @@ impl ConversationRuntime {
             let next_before_sequence = page.next_before;
             let mut hit_checkpoint = false;
             for entry in page.entries {
-                let is_compaction = matches!(&entry.payload, SessionPayload::CompactionCheckpoint { .. });
+                let is_compaction =
+                    matches!(&entry.payload, SessionPayload::CompactionCheckpoint { .. });
                 records.push(entry.payload);
                 if is_compaction {
                     hit_checkpoint = true;
@@ -514,29 +609,27 @@ impl ConversationRuntime {
                 | SessionPayload::CompactionCheckpoint { .. }
                 | SessionPayload::ModelResponseMetadata { .. }
                 | SessionPayload::SessionClosed => {}
-                SessionPayload::Goal { instruction, state } => {
-                    match state.as_str() {
-                        "active" => {
-                            self.persist_state = PersistState::Active(PersistTask {
-                                instruction: instruction.clone(),
-                                completion_policy: CompletionPolicy::ModelMayComplete,
-                            });
-                        }
-                        "paused" => {
-                            self.persist_state = PersistState::Paused(PersistTask {
-                                instruction: instruction.clone(),
-                                completion_policy: CompletionPolicy::ModelMayComplete,
-                            });
-                        }
-                        "completed" | "cleared" => {
-                            self.persist_state = PersistState::Completed(PersistTask {
-                                instruction: instruction.clone(),
-                                completion_policy: CompletionPolicy::ModelMayComplete,
-                            });
-                        }
-                        _ => {}
+                SessionPayload::Goal { instruction, state } => match state.as_str() {
+                    "active" => {
+                        self.persist_state = PersistState::Active(PersistTask {
+                            instruction: instruction.clone(),
+                            completion_policy: CompletionPolicy::ModelMayComplete,
+                        });
                     }
-                }
+                    "paused" => {
+                        self.persist_state = PersistState::Paused(PersistTask {
+                            instruction: instruction.clone(),
+                            completion_policy: CompletionPolicy::ModelMayComplete,
+                        });
+                    }
+                    "completed" | "cleared" => {
+                        self.persist_state = PersistState::Completed(PersistTask {
+                            instruction: instruction.clone(),
+                            completion_policy: CompletionPolicy::ModelMayComplete,
+                        });
+                    }
+                    _ => {}
+                },
             }
             if let SessionPayload::ModelAttemptStarted { attempt_id, .. } = payload {
                 highest_attempt_id = highest_attempt_id.max(*attempt_id);
@@ -710,6 +803,47 @@ impl ConversationRuntime {
         self.phase = ConversationPhase::PreparingAttempt { turn_id };
         Ok(receipt)
     }
+    async fn start_prompt_turn(
+        &mut self,
+        text: String,
+    ) -> Result<Vec<RuntimeEffect>, RuntimeError> {
+        let persisted_text = text.clone();
+        let receipt = self.submit_prompt(text).await?;
+        let start_model = self.start_model_request().await?;
+        let mut effects = vec![
+            RuntimeEffect::Emit(RuntimeEvent::AgenticLoopStarted),
+            RuntimeEffect::Emit(RuntimeEvent::TranscriptAppended(
+                harness_runtime_api::TranscriptSnapshotEntry {
+                    sequence: receipt.sequences.clone().last(),
+                    payload: harness_runtime_api::TranscriptPayload::Message {
+                        role: harness_runtime_api::MessageRole::User,
+                        text: persisted_text,
+                    },
+                },
+            )),
+        ];
+        effects.extend(start_model);
+        Ok(effects)
+    }
+
+    async fn start_pending_interrupt(&mut self) -> Result<Vec<RuntimeEffect>, RuntimeError> {
+        let Some(text) = self.pending_interrupt.take() else {
+            return Ok(Vec::new());
+        };
+        self.start_prompt_turn(text).await
+    }
+
+    fn request_interrupt_boundary(&mut self) -> Result<(), RuntimeError> {
+        self.request_loop_stopped = true;
+        match &self.phase {
+            ConversationPhase::AwaitingModel {
+                turn_id,
+                attempt_id,
+            } => self.interrupt(*turn_id, *attempt_id),
+            ConversationPhase::Cancelling { .. } => Ok(()),
+            _ => Ok(()),
+        }
+    }
 
     /// Builds the next request and schedules compaction first when its estimated
     /// input reaches the selected model's compaction threshold.
@@ -733,13 +867,16 @@ impl ConversationRuntime {
         request_history.extend_from_slice(&records);
 
         let request = if self.compatibility_mode {
-            self.configuration.ports.request_builder.build_compatibility(
-                next_revision,
-                &self.configuration.model,
-                self.configuration.ports.model_route.generation,
-                &request_history,
-                &self.queued_steering,
-            )?
+            self.configuration
+                .ports
+                .request_builder
+                .build_compatibility(
+                    next_revision,
+                    &self.configuration.model,
+                    self.configuration.ports.model_route.generation,
+                    &request_history,
+                    &self.queued_steering,
+                )?
         } else {
             self.configuration.ports.request_builder.build(
                 next_revision,
@@ -927,8 +1064,7 @@ impl ConversationRuntime {
                             RuntimeEffect::Emit(RuntimeEvent::AgenticLoopCompleted),
                             RuntimeEffect::Emit(RuntimeEvent::Failure(
                                 harness_runtime_api::RuntimeFailure {
-                                    category:
-                                        harness_runtime_api::RuntimeFailureCategory::Protocol,
+                                    category: harness_runtime_api::RuntimeFailureCategory::Protocol,
                                     message: "compaction stream completed before it started"
                                         .to_string(),
                                 },
@@ -959,6 +1095,9 @@ impl ConversationRuntime {
                             )),
                         ]),
                     }
+                }
+                ModelEvent::Warning(message) => {
+                    Ok(vec![RuntimeEffect::Emit(RuntimeEvent::Warning(message))])
                 }
                 ModelEvent::ReasoningSummaryDelta(_)
                 | ModelEvent::ReasoningContentDelta(_)
@@ -1047,7 +1186,7 @@ impl ConversationRuntime {
                         payload: harness_runtime_api::TranscriptPayload::ToolCall {
                             call_id: call.call_id.clone(),
                             name: call.name.clone(),
-                            input: call.input.clone(),
+                            input: transcript_tool_input(&call.input),
                         },
                     },
                 ));
@@ -1061,13 +1200,15 @@ impl ConversationRuntime {
                 }
                 Ok(Vec::new())
             }
+            ModelEvent::Warning(message) => {
+                self.ensure_model_attempt(turn_id, attempt_id)?;
+                Ok(vec![RuntimeEffect::Emit(RuntimeEvent::Warning(message))])
+            }
             ModelEvent::Usage(_) => {
                 self.ensure_model_attempt(turn_id, attempt_id)?;
                 Ok(Vec::new())
             }
-            ModelEvent::Terminal(outcome)
-                if !self.pending_tool_inputs.is_empty() =>
-            {
+            ModelEvent::Terminal(outcome) if !self.pending_tool_inputs.is_empty() => {
                 // The model stream ended with partial tool input deltas that
                 // never completed into full ToolCall events (e.g. user
                 // interrupt or cancellation mid-tool-call).  Discard the
@@ -1234,7 +1375,6 @@ impl ConversationRuntime {
         self.transient_reasoning_content.clear();
         self.transient_reasoning_summary.clear();
         self.transient_reasoning_encrypted = None;
-        self.pending_interrupt = None;
         self.model_started = false;
         self.phase = ConversationPhase::PreparingContinuation { turn_id };
         Ok(vec![
@@ -1432,11 +1572,10 @@ impl ConversationRuntime {
         self.transient_reasoning_content.clear();
         self.transient_reasoning_summary.clear();
         self.transient_reasoning_encrypted = None;
-        self.pending_interrupt = None;
         self.model_started = false;
         self.phase = ConversationPhase::Idle;
 
-        let mut effects = Vec::with_capacity(3);
+        let mut effects = Vec::with_capacity(7);
         if let Some((_, category, message)) = failure_details {
             effects.push(RuntimeEffect::Emit(RuntimeEvent::TranscriptAppended(
                 TranscriptSnapshotEntry {
@@ -1447,6 +1586,7 @@ impl ConversationRuntime {
         }
         effects.push(RuntimeEffect::Emit(RuntimeEvent::ResponseFinished(outcome)));
         effects.push(RuntimeEffect::Emit(RuntimeEvent::AgenticLoopCompleted));
+        effects.extend(self.start_pending_interrupt().await?);
         Ok(effects)
     }
 
@@ -1500,23 +1640,7 @@ impl ConversationRuntime {
                         Some(self.queued_steering.join("\n")),
                     ))]);
                 }
-                let persisted_text = text.clone();
-                let receipt = self.submit_prompt(text).await?;
-                let start_model = self.start_model_request().await?;
-                let mut effects = vec![
-                    RuntimeEffect::Emit(RuntimeEvent::AgenticLoopStarted),
-                    RuntimeEffect::Emit(RuntimeEvent::TranscriptAppended(
-                        harness_runtime_api::TranscriptSnapshotEntry {
-                            sequence: receipt.sequences.clone().last(),
-                            payload: harness_runtime_api::TranscriptPayload::Message {
-                                role: harness_runtime_api::MessageRole::User,
-                                text: persisted_text,
-                            },
-                        },
-                    )),
-                ];
-                effects.extend(start_model);
-                Ok(effects)
+                self.start_prompt_turn(text).await
             }
             RuntimeCommand::Retry => {
                 if self.lifecycle != RuntimeLifecycle::Ready {
@@ -1529,10 +1653,14 @@ impl ConversationRuntime {
                 let mut retry_turn = None;
                 for payload in self.canonical_history.iter().rev() {
                     match payload {
-                        // Errors and turn/attempt markers are bookkeeping around the
+                        // A failed attempt identifies its retryable turn even when
+                        // compaction replaced the original turn records.
+                        SessionPayload::Error { turn_id, .. } => {
+                            retry_turn.get_or_insert(*turn_id);
+                        }
+                        // Turn and attempt markers are bookkeeping around the
                         // actual turn and must not hide a retryable input or tool result.
-                        SessionPayload::Error { .. }
-                        | SessionPayload::TurnFinished { .. }
+                        SessionPayload::TurnFinished { .. }
                         | SessionPayload::ModelAttemptStarted { .. }
                         | SessionPayload::ToolExecutionStarted { .. }
                         | SessionPayload::TurnStarted { .. } => {}
@@ -1621,7 +1749,10 @@ impl ConversationRuntime {
                     return Err(RuntimeError::InvalidLifecycle);
                 }
                 match &self.phase {
-                    ConversationPhase::AwaitingModel { turn_id, attempt_id } => {
+                    ConversationPhase::AwaitingModel {
+                        turn_id,
+                        attempt_id,
+                    } => {
                         self.interrupt(*turn_id, *attempt_id)?;
                     }
                     ConversationPhase::Cancelling { .. } => {}
@@ -1635,32 +1766,24 @@ impl ConversationRuntime {
                 if self.lifecycle != RuntimeLifecycle::Ready {
                     return Err(RuntimeError::InvalidLifecycle);
                 }
-                // Stash steering text (if any) for the next model attempt.
                 if !text.is_empty() {
                     self.pending_interrupt = Some(text);
                 }
-                // Interrupt the active model attempt if one is awaiting. If the
-                // runtime is between attempts (preparing, executing tools, or
-                // persisting), the pending interrupt / stopped loop flag will
-                // short-circuit the turn at the next continuation.
-                let interrupted = match &self.phase {
-                    ConversationPhase::AwaitingModel {
-                        turn_id,
-                        attempt_id,
-                    } => {
-                        self.interrupt(*turn_id, *attempt_id)?;
-                        true
-                    }
-                    ConversationPhase::Cancelling { .. } => true,
-                    _ => false,
-                };
-                if !interrupted {
-                    // Signal the request loop to stop so the turn ends as soon
-                    // as the current phase completes, rather than starting
-                    // another model attempt.
-                    self.request_loop_stopped = true;
-                }
+                self.request_interrupt_boundary()?;
                 Ok(Vec::new())
+            }
+            RuntimeCommand::SendQueuedSteering => {
+                if self.lifecycle != RuntimeLifecycle::Ready {
+                    return Err(RuntimeError::InvalidLifecycle);
+                }
+                if self.queued_steering.is_empty() {
+                    return Err(RuntimeError::NoQueuedSteering);
+                }
+                self.pending_interrupt = Some(std::mem::take(&mut self.queued_steering).join("\n"));
+                self.request_interrupt_boundary()?;
+                Ok(vec![RuntimeEffect::Emit(RuntimeEvent::SteeringChanged(
+                    None,
+                ))])
             }
             RuntimeCommand::SetModel { selection } => {
                 if self.lifecycle != RuntimeLifecycle::Ready {
@@ -1758,21 +1881,17 @@ impl ConversationRuntime {
                 PersistState::Active(task)
                     if task.completion_policy == CompletionPolicy::ModelMayComplete
             );
+        let tool_call_record = SessionPayload::ToolCallAccepted {
+            turn_id,
+            call_id: call_id.clone(),
+            name: call.name.clone(),
+            input: persist_tool_input(&call.input),
+        };
         let records = if goal_completion {
-            vec![SessionPayload::ToolCallAccepted {
-                turn_id,
-                call_id: call_id.clone(),
-                name: call.name.clone(),
-                input: call.input.as_str().to_owned(),
-            }]
+            vec![tool_call_record]
         } else {
             vec![
-                SessionPayload::ToolCallAccepted {
-                    turn_id,
-                    call_id: call_id.clone(),
-                    name: call.name.clone(),
-                    input: call.input.as_str().to_owned(),
-                },
+                tool_call_record,
                 SessionPayload::ToolExecutionStarted {
                     turn_id,
                     call_id: call_id.clone(),
@@ -1808,7 +1927,7 @@ impl ConversationRuntime {
                 payload: harness_runtime_api::TranscriptPayload::ToolCall {
                     call_id: call.call_id.clone(),
                     name: call.name.clone(),
-                    input: call.input.clone(),
+                    input: transcript_tool_input(&call.input),
                 },
             },
         ));
@@ -1935,10 +2054,7 @@ impl ConversationRuntime {
         let transcript = RuntimeEffect::Emit(RuntimeEvent::TranscriptAppended(
             harness_runtime_api::TranscriptSnapshotEntry {
                 sequence: None,
-                payload: harness_runtime_api::TranscriptPayload::ToolResult {
-                    call_id,
-                    output,
-                },
+                payload: harness_runtime_api::TranscriptPayload::ToolResult { call_id, output },
             },
         ));
         if self.pending_tool_calls.is_empty() {
@@ -1963,7 +2079,9 @@ impl ConversationRuntime {
             self.active_tool_call = None;
             self.queued_steering.clear();
             self.complete_turn(turn_id).await?;
-            return Ok(vec![RuntimeEffect::Emit(RuntimeEvent::AgenticLoopCompleted)]);
+            let mut effects = vec![RuntimeEffect::Emit(RuntimeEvent::AgenticLoopCompleted)];
+            effects.extend(self.start_pending_interrupt().await?);
+            return Ok(effects);
         }
         if self.pending_tool_calls.is_empty() {
             if !self.queued_steering.is_empty() {
@@ -1992,7 +2110,9 @@ impl ConversationRuntime {
                 return Ok(vec![RuntimeEffect::ContinueModel { turn_id }]);
             }
             self.complete_turn(turn_id).await?;
-            return Ok(vec![RuntimeEffect::Emit(RuntimeEvent::AgenticLoopCompleted)]);
+            return Ok(vec![RuntimeEffect::Emit(
+                RuntimeEvent::AgenticLoopCompleted,
+            )]);
         }
         self.accept_next_tool_call(turn_id).await
     }
@@ -2020,59 +2140,8 @@ impl ConversationRuntime {
     pub fn apply_transcript_page(&self, page: StoredTranscriptPage) -> RuntimeEffect {
         let entries = page
             .entries
-            .into_iter()
-            .filter_map(|record| {
-                let payload = match record.payload {
-                    SessionPayload::InputMessage { text, .. } => TranscriptPayload::Message {
-                        role: MessageRole::User,
-                        text,
-                    },
-                    SessionPayload::AssistantMessage { text, .. } => TranscriptPayload::Message {
-                        role: MessageRole::Assistant,
-                        text,
-                    },
-                    SessionPayload::Reasoning {
-                        summary, content, ..
-                    } => {
-                        let text = summary.or(content).unwrap_or_default();
-                        if text.is_empty() {
-                            return None;
-                        }
-                        TranscriptPayload::Thinking { text }
-                    }
-                    SessionPayload::Error {
-                        category, message, ..
-                    } => TranscriptPayload::Error {
-                        category: match category {
-                            SessionErrorCategory::Model => RuntimeFailureCategory::Model,
-                            SessionErrorCategory::Protocol => RuntimeFailureCategory::Protocol,
-                            SessionErrorCategory::Tool => RuntimeFailureCategory::Tool,
-                            SessionErrorCategory::Lifecycle => RuntimeFailureCategory::Lifecycle,
-                        },
-                        message,
-                    },
-                    SessionPayload::ToolExecutionFinished {
-                        call_id, output, ..
-                    } => TranscriptPayload::ToolResult { call_id, output },
-                    SessionPayload::CompactionCheckpoint { summary, .. } => {
-                        TranscriptPayload::Thinking { text: summary }
-                    }
-                    SessionPayload::Metadata(_)
-                    | SessionPayload::ProviderBinding(_)
-                    | SessionPayload::TurnStarted { .. }
-                    | SessionPayload::ModelAttemptStarted { .. }
-                    | SessionPayload::ToolCallAccepted { .. }
-                    | SessionPayload::ToolExecutionStarted { .. }
-                    | SessionPayload::TurnFinished { .. }
-                    | SessionPayload::ModelResponseMetadata { .. }
-                    | SessionPayload::Goal { .. }
-                    | SessionPayload::SessionClosed => return None,
-                };
-                Some(TranscriptSnapshotEntry {
-                    sequence: Some(record.sequence),
-                    payload,
-                })
-            })
+            .iter()
+            .filter_map(project_transcript_record)
             .collect();
 
         RuntimeEffect::Emit(RuntimeEvent::TranscriptPageLoaded(
@@ -2089,10 +2158,7 @@ impl ConversationRuntime {
     }
 
     /// Begins a staged compaction against the current canonical history.
-    pub fn begin_compaction(
-        &mut self,
-        instruction: String,
-    ) -> Result<(), RuntimeError> {
+    pub fn begin_compaction(&mut self, instruction: String) -> Result<(), RuntimeError> {
         if self.lifecycle != RuntimeLifecycle::Ready {
             return Err(RuntimeError::InvalidLifecycle);
         }
@@ -2137,13 +2203,17 @@ impl ConversationRuntime {
             } if active_turn == turn_id && active_attempt == attempt_id => {}
             _ => return Err(RuntimeError::InvalidPhase),
         }
-        let request = self.configuration.ports.request_builder.build_compatibility(
-            self.canonical_revision,
-            &self.configuration.model,
-            self.configuration.ports.model_route.generation,
-            &self.canonical_history,
-            &[],
-        )?;
+        let request = self
+            .configuration
+            .ports
+            .request_builder
+            .build_compatibility(
+                self.canonical_revision,
+                &self.configuration.model,
+                self.configuration.ports.model_route.generation,
+                &self.canonical_history,
+                &[],
+            )?;
         if request.provider_generation != self.configuration.ports.model_route.generation {
             return Err(RuntimeError::ProviderGenerationMismatch);
         }
@@ -2151,7 +2221,9 @@ impl ConversationRuntime {
             return Err(RuntimeError::RequestRevisionMismatch);
         }
         let new_attempt_id = self.next_attempt_id;
-        self.next_attempt_id = new_attempt_id.checked_add(1).ok_or(RuntimeError::IdExhausted)?;
+        self.next_attempt_id = new_attempt_id
+            .checked_add(1)
+            .ok_or(RuntimeError::IdExhausted)?;
         self.phase = ConversationPhase::AwaitingModel {
             turn_id,
             attempt_id: new_attempt_id,
@@ -2181,14 +2253,22 @@ impl ConversationRuntime {
             } if active_turn == turn_id && active_attempt == attempt_id => {}
             _ => return Err(RuntimeError::InvalidPhase),
         }
+        let history_without_metadata: Vec<_> = self
+            .canonical_history
+            .iter()
+            .filter(|p| !matches!(p, SessionPayload::ModelResponseMetadata { .. }))
+            .cloned()
+            .collect();
+
         // Build a request without using any previous_response_id
         let mut request = (*self.configuration.ports.request_builder.build(
             self.canonical_revision,
             &self.configuration.model,
             self.configuration.ports.model_route.generation,
-            &self.canonical_history,
+            &history_without_metadata,
             &[],
-        )?).clone();
+        )?)
+        .clone();
         request.previous_response_id = None;
         if request.provider_generation != self.configuration.ports.model_route.generation {
             return Err(RuntimeError::ProviderGenerationMismatch);
@@ -2197,7 +2277,9 @@ impl ConversationRuntime {
             return Err(RuntimeError::RequestRevisionMismatch);
         }
         let new_attempt_id = self.next_attempt_id;
-        self.next_attempt_id = new_attempt_id.checked_add(1).ok_or(RuntimeError::IdExhausted)?;
+        self.next_attempt_id = new_attempt_id
+            .checked_add(1)
+            .ok_or(RuntimeError::IdExhausted)?;
         self.phase = ConversationPhase::AwaitingModel {
             turn_id,
             attempt_id: new_attempt_id,
@@ -2502,6 +2584,9 @@ pub enum RuntimeError {
     /// The durable tail does not identify a user or tool turn that can be retried.
     #[error("the last durable message cannot be retried")]
     RetryUnavailable,
+    /// No queued steering is available to send immediately.
+    #[error("no queued steering is available")]
+    NoQueuedSteering,
 }
 
 fn is_goal_completion_input(input: &str) -> bool {
@@ -2654,5 +2739,492 @@ impl RuntimeSessionWriter {
     /// Closes the writer and joins its owned work.
     pub async fn close(self) -> Result<(), SessionStoreError> {
         self.writer.close().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        future::Future,
+        path::PathBuf,
+        pin::Pin,
+        sync::{Mutex, MutexGuard},
+    };
+
+    use harness_model_api::{
+        ModelCancellation, ModelCompletion, ModelInput, ModelMessageRole, ModelRequestId,
+        ProviderId,
+    };
+    use harness_session_store::{SessionId, SessionReader, TranscriptPage};
+
+    use super::*;
+
+    #[derive(Clone, Default)]
+    struct MemorySessionStore {
+        records: Arc<Mutex<Vec<SessionRecord>>>,
+    }
+
+    impl MemorySessionStore {
+        fn records(&self) -> MutexGuard<'_, Vec<SessionRecord>> {
+            self.records.lock().unwrap()
+        }
+    }
+
+    struct MemorySessionReader {
+        records: Arc<Mutex<Vec<SessionRecord>>>,
+    }
+
+    impl SessionReader for MemorySessionReader {
+        fn load_older(
+            &self,
+            session_id: SessionId,
+            before: Option<u64>,
+            maximum_entries: PageSize,
+        ) -> Result<TranscriptPage, SessionStoreError> {
+            let records = self.records.lock().unwrap();
+            if records.is_empty() {
+                return Err(SessionStoreError::NotFound(session_id));
+            }
+            let entries = records
+                .iter()
+                .rev()
+                .filter(|record| before.is_none_or(|before| record.sequence < before))
+                .take(maximum_entries.get() as usize)
+                .cloned()
+                .collect::<Vec<_>>();
+            let reached_start = entries.len() == records.len();
+            let next_before = (!reached_start)
+                .then(|| entries.last().map(|record| record.sequence))
+                .flatten();
+            Ok(TranscriptPage {
+                entries,
+                next_before,
+                reached_start,
+            })
+        }
+    }
+
+    struct MemorySessionWriter {
+        session_id: SessionId,
+        records: Arc<Mutex<Vec<SessionRecord>>>,
+    }
+
+    impl SessionWriter for MemorySessionWriter {
+        fn append<'a>(
+            &'a mut self,
+            payloads: &'a [SessionPayload],
+            durability: Durability,
+        ) -> Pin<Box<dyn Future<Output = Result<AppendReceipt, SessionStoreError>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                let mut records = self.records.lock().unwrap();
+                let start = u64::try_from(records.len()).unwrap() + 1;
+                for (offset, payload) in payloads.iter().enumerate() {
+                    records.push(SessionRecord {
+                        session_id: self.session_id.clone(),
+                        sequence: start + u64::try_from(offset).unwrap(),
+                        payload: payload.clone(),
+                    });
+                }
+                let end = start + u64::try_from(payloads.len()).unwrap() - 1;
+                Ok(AppendReceipt {
+                    sequences: start..=end,
+                    durability,
+                })
+            })
+        }
+
+        fn close(
+            self: Box<Self>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), SessionStoreError>> + Send>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    impl SessionStore for MemorySessionStore {
+        fn reader(&self) -> Result<Box<dyn SessionReader>, SessionStoreError> {
+            Ok(Box::new(MemorySessionReader {
+                records: Arc::clone(&self.records),
+            }))
+        }
+
+        fn writer(
+            &self,
+            session_id: SessionId,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<Box<dyn SessionWriter>, SessionStoreError>> + Send + '_>,
+        > {
+            let records = Arc::clone(&self.records);
+            Box::pin(async move {
+                Ok(Box::new(MemorySessionWriter {
+                    session_id,
+                    records,
+                }) as Box<dyn SessionWriter>)
+            })
+        }
+
+        fn session_path(&self, session_id: SessionId) -> Result<PathBuf, SessionStoreError> {
+            Ok(PathBuf::from(session_id.as_str()))
+        }
+    }
+
+    struct HistoryRequestBuilder;
+
+    impl ModelRequestBuilder for HistoryRequestBuilder {
+        fn build(
+            &self,
+            revision: u64,
+            selection: &ModelSelection,
+            provider_generation: ProviderGeneration,
+            history: &[SessionPayload],
+            steering: &[String],
+        ) -> Result<Arc<ModelRequest>, RuntimeError> {
+            let mut input = history
+                .iter()
+                .filter_map(|payload| match payload {
+                    SessionPayload::InputMessage { text, .. } => Some(ModelInput::Message {
+                        role: ModelMessageRole::User,
+                        text: text.clone(),
+                    }),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            input.extend(steering.iter().map(|text| ModelInput::Message {
+                role: ModelMessageRole::User,
+                text: text.clone(),
+            }));
+            Ok(Arc::new(ModelRequest {
+                request_id: ModelRequestId(revision),
+                context_usage: None,
+                provider_generation,
+                history_revision: revision,
+                selection: selection.clone(),
+                input: input.into(),
+                tools: Arc::from([]),
+                previous_response_id: None,
+            }))
+        }
+    }
+
+    struct UnusedModelTransport;
+
+    impl ModelTransport for UnusedModelTransport {
+        fn start(
+            &self,
+            _attempt: Arc<ModelAttempt>,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            Box<dyn harness_model_api::ModelAttemptHandle>,
+                            harness_model_api::ModelFailure,
+                        >,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            panic!("the reducer test does not execute transport effects")
+        }
+
+        fn shutdown(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = Result<(), harness_model_api::ModelFailure>> + Send + '_>>
+        {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn runtime_configuration(store: MemorySessionStore) -> RuntimeConfiguration {
+        let provider = ProviderId::new("test-provider").unwrap();
+        let selection = ModelSelection::new(provider.clone(), "test-model", None, None);
+        let route = ResolvedModelRoute::new(
+            provider,
+            ProviderGeneration(1),
+            "test-route",
+            selection.clone(),
+        )
+        .unwrap();
+        RuntimeConfiguration {
+            session_id: SessionId::new("send-now-test").unwrap(),
+            model: selection,
+            ports: RuntimePorts {
+                session_store: Arc::new(store),
+                tool_registry: ToolRegistry::new(),
+                tool_executor: None,
+                model_transport: Arc::new(UnusedModelTransport),
+                request_builder: Arc::new(HistoryRequestBuilder),
+                model_route: route.clone(),
+                compaction_route: route,
+                tool_availability: Arc::new(RwLock::new(ToolAvailability::default())),
+            },
+        }
+    }
+
+    async fn runtime_with_queued_send() -> (
+        ConversationRuntime,
+        MemorySessionStore,
+        u64,
+        u64,
+        Vec<RuntimeEffect>,
+    ) {
+        let store = MemorySessionStore::default();
+        let mut runtime = ConversationRuntime::new(runtime_configuration(store.clone()));
+        runtime.begin_startup().await.unwrap();
+        runtime.mark_ready().unwrap();
+
+        let first_effects = runtime
+            .dispatch_command(RuntimeCommand::SubmitPrompt {
+                text: "first prompt".to_string(),
+            })
+            .await
+            .unwrap();
+        let (turn_id, attempt_id) = first_effects
+            .iter()
+            .find_map(|effect| match effect {
+                RuntimeEffect::StartModel {
+                    turn_id, attempt, ..
+                } => Some((*turn_id, attempt.attempt_id.0)),
+                _ => None,
+            })
+            .unwrap();
+
+        runtime
+            .dispatch_command(RuntimeCommand::QueueSteering {
+                text: "send this now".to_string(),
+            })
+            .await
+            .unwrap();
+        let send_effects = runtime
+            .dispatch_command(RuntimeCommand::SendQueuedSteering)
+            .await
+            .unwrap();
+
+        (runtime, store, turn_id, attempt_id, send_effects)
+    }
+
+    #[tokio::test]
+    async fn sending_queued_steering_now_persists_and_submits_it_after_cancellation() {
+        let (mut runtime, store, turn_id, attempt_id, send_effects) =
+            runtime_with_queued_send().await;
+
+        assert!(matches!(
+            send_effects.as_slice(),
+            [RuntimeEffect::Emit(RuntimeEvent::SteeringChanged(None))]
+        ));
+        assert!(runtime.queued_steering().is_empty());
+        assert_eq!(
+            runtime.phase(),
+            &ConversationPhase::Cancelling {
+                turn_id,
+                attempt_id,
+            }
+        );
+
+        let terminal_effects = runtime
+            .finish_model_attempt(
+                turn_id,
+                attempt_id,
+                ModelTerminalOutcome::Cancelled(ModelCancellation {
+                    reason: "user interrupt".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+
+        let next_attempt = terminal_effects
+            .iter()
+            .find_map(|effect| match effect {
+                RuntimeEffect::StartModel {
+                    turn_id, attempt, ..
+                } => Some((*turn_id, attempt)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(next_attempt.0, turn_id + 1);
+        assert!(next_attempt.1.request.input.iter().any(|input| matches!(
+            input,
+            ModelInput::Message {
+                role: ModelMessageRole::User,
+                text,
+            } if text == "send this now"
+        )));
+
+        let records = store.records();
+        assert!(records.iter().any(|record| matches!(
+            &record.payload,
+            SessionPayload::TurnFinished {
+                turn_id: finished_turn,
+                outcome: TurnOutcome::Cancelled { .. },
+            } if *finished_turn == turn_id
+        )));
+        assert!(records.iter().any(|record| matches!(
+            &record.payload,
+            SessionPayload::InputMessage {
+                turn_id: input_turn,
+                text,
+            } if *input_turn == turn_id + 1 && text == "send this now"
+        )));
+    }
+
+    #[tokio::test]
+    async fn queued_send_survives_a_completed_terminal_event_racing_with_cancellation() {
+        let (mut runtime, store, turn_id, attempt_id, _) = runtime_with_queued_send().await;
+        runtime
+            .dispatch_model_event(turn_id, attempt_id, ModelEvent::Started)
+            .await
+            .unwrap();
+        runtime
+            .dispatch_model_event(
+                turn_id,
+                attempt_id,
+                ModelEvent::AssistantTextDelta("completed before cancellation".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let terminal_effects = runtime
+            .finish_model_attempt(
+                turn_id,
+                attempt_id,
+                ModelTerminalOutcome::Completed(ModelCompletion {
+                    text: "completed before cancellation".to_string(),
+                    usage: None,
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(terminal_effects.iter().any(|effect| matches!(
+            effect,
+            RuntimeEffect::CommitAssistant {
+                turn_id: effect_turn,
+                attempt_id: effect_attempt,
+            } if *effect_turn == turn_id && *effect_attempt == attempt_id
+        )));
+
+        let commit_effects = runtime.commit_assistant(turn_id, attempt_id).await.unwrap();
+        assert!(commit_effects.iter().any(|effect| matches!(
+            effect,
+            RuntimeEffect::ContinueTurn {
+                turn_id: effect_turn,
+            } if *effect_turn == turn_id
+        )));
+
+        let continuation_effects = runtime.continue_turn(turn_id).await.unwrap();
+        let next_attempt = continuation_effects
+            .iter()
+            .find_map(|effect| match effect {
+                RuntimeEffect::StartModel {
+                    turn_id, attempt, ..
+                } => Some((*turn_id, attempt)),
+                _ => None,
+            })
+            .unwrap();
+
+        assert_eq!(next_attempt.0, turn_id + 1);
+        assert!(next_attempt.1.request.input.iter().any(|input| matches!(
+            input,
+            ModelInput::Message {
+                role: ModelMessageRole::User,
+                text,
+            } if text == "send this now"
+        )));
+        assert!(store.records().iter().any(|record| matches!(
+            &record.payload,
+            SessionPayload::InputMessage {
+                turn_id: input_turn,
+                text,
+            } if *input_turn == turn_id + 1 && text == "send this now"
+        )));
+    }
+ 
+    #[tokio::test]
+    async fn warning_does_not_end_the_active_model_attempt() {
+        let store = MemorySessionStore::default();
+        let mut runtime = ConversationRuntime::new(runtime_configuration(store));
+        runtime.begin_startup().await.unwrap();
+        runtime.mark_ready().unwrap();
+
+        let effects = runtime
+            .dispatch_command(RuntimeCommand::SubmitPrompt {
+                text: "keep streaming".to_string(),
+            })
+            .await
+            .unwrap();
+        let (turn_id, attempt_id) = effects
+            .iter()
+            .find_map(|effect| match effect {
+                RuntimeEffect::StartModel {
+                    turn_id, attempt, ..
+                } => Some((*turn_id, attempt.attempt_id.0)),
+                _ => None,
+            })
+            .unwrap();
+
+        let effects = runtime
+            .dispatch_model_event(
+                turn_id,
+                attempt_id,
+                ModelEvent::Warning(
+                    "ignored unknown Responses event type: response.future".into(),
+                ),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            effects.as_slice(),
+            [RuntimeEffect::Emit(RuntimeEvent::Warning(message))]
+                if message.contains("response.future")
+        ));
+        assert_eq!(
+            runtime.phase(),
+            &ConversationPhase::AwaitingModel {
+                turn_id,
+                attempt_id,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_attempt_after_compaction_remains_retryable() {
+        let store = MemorySessionStore::default();
+        let mut runtime = ConversationRuntime::new(runtime_configuration(store));
+        runtime.begin_startup().await.unwrap();
+        runtime.mark_ready().unwrap();
+        runtime.canonical_history = vec![
+            SessionPayload::CompactionCheckpoint {
+                source_revision: 12,
+                summary: "Summary of the earlier conversation and active user request.".into(),
+            },
+            SessionPayload::ModelAttemptStarted {
+                turn_id: 7,
+                attempt_id: 9,
+            },
+            SessionPayload::Error {
+                turn_id: 7,
+                category: SessionErrorCategory::Protocol,
+                message: "ignored event was previously fatal".into(),
+            },
+            SessionPayload::TurnFinished {
+                turn_id: 7,
+                outcome: TurnOutcome::Failed {
+                    message: "ignored event was previously fatal".into(),
+                },
+            },
+        ];
+
+        let effects = runtime.dispatch_command(RuntimeCommand::Retry).await.unwrap();
+
+        assert!(matches!(
+            effects.as_slice(),
+            [
+                RuntimeEffect::Emit(RuntimeEvent::AgenticLoopStarted),
+                RuntimeEffect::ContinueModel { turn_id: 7 }
+            ]
+        ));
+        assert_eq!(
+            runtime.phase(),
+            &ConversationPhase::PreparingAttempt { turn_id: 7 }
+        );
     }
 }

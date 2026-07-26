@@ -3,8 +3,8 @@
 use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
 
 use harness_tool_api::{
-    DuplicateToolName, InvalidToolName, ToolExecutionRequest, ToolExecutor,
-    ToolFailure, ToolRegistry, ToolResult, ToolSpec,
+    DuplicateToolName, InvalidToolName, ToolExecutionRequest, ToolExecutor, ToolFailure,
+    ToolRegistry, ToolResult, ToolSpec,
 };
 
 use crate::WorkspaceRoot;

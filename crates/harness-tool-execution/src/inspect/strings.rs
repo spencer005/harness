@@ -1,6 +1,10 @@
 use std::fs;
+
 use super::{ShellWord, resolve};
-pub(crate) fn execute(workspace: &super::WorkspaceRoot, args: &[ShellWord]) -> Result<String, String> {
+pub(crate) fn execute(
+    workspace: &super::WorkspaceRoot,
+    args: &[ShellWord],
+) -> Result<String, String> {
     let mut path_arg: Option<String> = None;
     let mut literal: Option<String> = None;
     let mut max = 100usize;
@@ -9,9 +13,9 @@ pub(crate) fn execute(workspace: &super::WorkspaceRoot, args: &[ShellWord]) -> R
         match args[index].value.as_str() {
             "--max" => {
                 index += 1;
-                let value = args.get(index).ok_or(
-                    "failed to parse `inspect` input: `--max` needs a value",
-                )?;
+                let value = args
+                    .get(index)
+                    .ok_or("failed to parse `inspect` input: `--max` needs a value")?;
                 max = super::positive(&value.value, "strings --max")?;
                 index += 1;
             }
@@ -28,7 +32,8 @@ pub(crate) fn execute(workspace: &super::WorkspaceRoot, args: &[ShellWord]) -> R
             }
         }
     }
-    let path = path_arg.ok_or("failed to parse `inspect` input: usage: `strings <path> [literal]`")?;
+    let path =
+        path_arg.ok_or("failed to parse `inspect` input: usage: `strings <path> [literal]`")?;
     let (_, path) = resolve(workspace, &path)?;
     let data = fs::read(&path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
     let literal = literal.as_deref();
@@ -36,7 +41,11 @@ pub(crate) fn execute(workspace: &super::WorkspaceRoot, args: &[ShellWord]) -> R
     let mut run = Vec::new();
     let mut offset = 0usize;
     let mut matches = 0;
-    for (index, byte) in data.iter().enumerate().chain(std::iter::once((data.len(), &0))) {
+    for (index, byte) in data
+        .iter()
+        .enumerate()
+        .chain(std::iter::once((data.len(), &0)))
+    {
         if byte.is_ascii_graphic() || *byte == b' ' {
             if run.is_empty() {
                 offset = index;
@@ -58,7 +67,9 @@ pub(crate) fn execute(workspace: &super::WorkspaceRoot, args: &[ShellWord]) -> R
     if matches == 0 {
         out.push_str("no results\n");
     } else if matches > max {
-        out.push_str(&format!("[strings output truncated: showing first {max} results; use --max]\n"));
+        out.push_str(&format!(
+            "[strings output truncated: showing first {max} results; use --max]\n"
+        ));
     }
     Ok(out)
 }

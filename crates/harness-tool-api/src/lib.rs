@@ -1,9 +1,11 @@
 //! Provider-independent contracts for tool discovery, invocation, and results.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, RwLock},
+};
 
 use thiserror::Error;
-use std::sync::RwLock;
 
 /// Stable name assigned to a tool.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -286,7 +288,11 @@ impl ToolAvailability {
     }
 
     /// Sets the enabled state for a glob pattern such as `terminal*`.
-    pub fn set(&mut self, pattern: impl Into<String>, enabled: bool) -> Result<(), ToolPatternError> {
+    pub fn set(
+        &mut self,
+        pattern: impl Into<String>,
+        enabled: bool,
+    ) -> Result<(), ToolPatternError> {
         let pattern = pattern.into();
         if pattern.is_empty() || pattern == "*" && !enabled {
             return Err(ToolPatternError);
@@ -349,11 +355,11 @@ pub struct AvailabilityToolExecutor {
 
 impl AvailabilityToolExecutor {
     /// Wraps an executor with shared dynamic availability state.
-    pub fn new(
-        inner: Arc<dyn ToolExecutor>,
-        availability: Arc<RwLock<ToolAvailability>>,
-    ) -> Self {
-        Self { inner, availability }
+    pub fn new(inner: Arc<dyn ToolExecutor>, availability: Arc<RwLock<ToolAvailability>>) -> Self {
+        Self {
+            inner,
+            availability,
+        }
     }
 }
 
@@ -361,7 +367,9 @@ impl ToolExecutor for AvailabilityToolExecutor {
     fn execute(
         &self,
         request: ToolExecutionRequest,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ToolResult, ToolFailure>> + Send + '_>> {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolFailure>> + Send + '_>,
+    > {
         let enabled = self
             .availability
             .read()

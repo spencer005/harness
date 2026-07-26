@@ -13,10 +13,10 @@ mod input;
 pub mod runtime;
 mod terminal;
 
+pub mod picker;
+mod preview;
 mod transcript;
 mod view;
-mod preview;
-pub mod picker;
 
-pub use runtime::run_with_runtime;
 pub use preview::render_preview;
+pub use runtime::run_with_runtime;

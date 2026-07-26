@@ -2,7 +2,6 @@
 
 use std::time::Instant;
 
-use crate::picker::SessionPickerState;
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Position, Rect},
@@ -18,6 +17,7 @@ use crate::{
     },
     domain::{AgentStatus, ContextUsage, ExternalText, SessionState},
     input::{PromptPosition, PromptViewport},
+    picker::SessionPickerState,
     transcript::{
         TranscriptPosition, TranscriptScrollDirection, TranscriptViewport, TranscriptViewportLine,
     },
@@ -113,6 +113,8 @@ pub(crate) struct PreparedFrame {
     pub(crate) picker_state: Option<SessionPickerState>,
     /// Cloned rewind picker state when the overlay is open, None otherwise.
     pub(crate) rewind_picker_state: Option<crate::picker::RewindPickerState>,
+    /// Cloned transcript-message editor state when its overlay is open.
+    pub(crate) message_editor_state: Option<crate::picker::MessageEditorState>,
 }
 
 impl PreparedFrame {
@@ -139,8 +141,12 @@ impl PreparedFrame {
         if area.width == 0 || area.height == 0 {
             return None;
         }
-        let column = point.x.clamp(area.x, area.x.saturating_add(area.width.saturating_sub(1)));
-        let r = point.y.clamp(area.y, area.y.saturating_add(area.height.saturating_sub(1)));
+        let column = point
+            .x
+            .clamp(area.x, area.x.saturating_add(area.width.saturating_sub(1)));
+        let r = point
+            .y
+            .clamp(area.y, area.y.saturating_add(area.height.saturating_sub(1)));
         Some(self.prompt_viewport.position_at(
             usize::from(r.saturating_sub(area.y)),
             usize::from(column.saturating_sub(area.x)),
@@ -171,8 +177,12 @@ impl PreparedFrame {
         if area.width == 0 || area.height == 0 {
             return None;
         }
-        let column = point.x.clamp(area.x, area.x.saturating_add(area.width.saturating_sub(1)));
-        let r = point.y.clamp(area.y, area.y.saturating_add(area.height.saturating_sub(1)));
+        let column = point
+            .x
+            .clamp(area.x, area.x.saturating_add(area.width.saturating_sub(1)));
+        let r = point
+            .y
+            .clamp(area.y, area.y.saturating_add(area.height.saturating_sub(1)));
         self.transcript.position_at(
             usize::from(r.saturating_sub(area.y)),
             usize::from(column.saturating_sub(area.x)),
@@ -192,7 +202,9 @@ impl PreparedFrame {
             return None;
         }
         let cell = usize::from(
-            point.x.clamp(area.x, area.x.saturating_add(area.width.saturating_sub(1)))
+            point
+                .x
+                .clamp(area.x, area.x.saturating_add(area.width.saturating_sub(1)))
                 .saturating_sub(area.x),
         );
         let after_final_row = area.y.saturating_add(area.height);
@@ -208,8 +220,7 @@ impl PreparedFrame {
     /// Maps a scrollbar press to an absolute top line and stable thumb offset.
     pub(crate) fn transcript_scrollbar_press(&self, point: Position) -> Option<(usize, u16)> {
         let scrollbar = self.transcript_scrollbar?;
-        contains(scrollbar.area, point)
-            .then(|| scrollbar.press(point.y, self.transcript.top_line))
+        contains(scrollbar.area, point).then(|| scrollbar.press(point.y, self.transcript.top_line))
     }
 
     /// Maps any captured drag point to the nearest scrollbar track row.
@@ -252,7 +263,12 @@ pub(crate) fn prepare(application: &mut Application, area: Rect, now: Instant) -
         .map(|document| document.lines().len())
         .unwrap_or(0);
     let session_picker_open = application.session_picker.is_some();
-    let areas = allocate_areas(area, prompt_metrics.line_count, activity_line_count, session_picker_open);
+    let areas = allocate_areas(
+        area,
+        prompt_metrics.line_count,
+        activity_line_count,
+        session_picker_open,
+    );
     let prompt_metrics = if areas.prompt_content.width == provisional_prompt_width {
         prompt_metrics
     } else {
@@ -271,7 +287,8 @@ pub(crate) fn prepare(application: &mut Application, area: Rect, now: Instant) -
     );
     let slash_status = application.slash_command_status();
     let prompt_cursor = prompt_cursor_position(&prompt_viewport, areas.prompt_content);
-    let prompt_document = prepare_prompt(&prompt_viewport, areas.prompt_content.width, &slash_status);
+    let prompt_document =
+        prepare_prompt(&prompt_viewport, areas.prompt_content.width, &slash_status);
     let status_document = prepare_status(application.session(), areas.status.width);
     let notice_document = prepare_notice(application, area.width);
     let transcript = if let Some(picker) = &application.session_picker {
@@ -342,6 +359,7 @@ pub(crate) fn prepare(application: &mut Application, area: Rect, now: Instant) -
         prompt_cursor,
         picker_state: application.session_picker.clone(),
         rewind_picker_state: application.rewind_picker.clone(),
+        message_editor_state: application.message_editor.clone(),
     }
 }
 
@@ -356,6 +374,8 @@ pub(crate) fn render(frame: &mut Frame<'_>, prepared: &PreparedFrame) {
         render_session_picker_overlay(frame, prepared);
     } else if prepared.rewind_picker_state.is_some() {
         render_rewind_picker_overlay(frame, prepared);
+    } else if prepared.message_editor_state.is_some() {
+        render_message_editor_overlay(frame, prepared);
     } else {
         render_slash_command_overlay(frame, prepared);
         if let Some(cursor) = prepared.prompt_cursor {
@@ -364,7 +384,12 @@ pub(crate) fn render(frame: &mut Frame<'_>, prepared: &PreparedFrame) {
     }
 }
 
-fn allocate_areas(area: Rect, prompt_line_count: usize, activity_line_count: usize, session_picker_open: bool) -> FrameAreas {
+fn allocate_areas(
+    area: Rect,
+    prompt_line_count: usize,
+    activity_line_count: usize,
+    session_picker_open: bool,
+) -> FrameAreas {
     let (picker_rect, main_rect) = if session_picker_open && area.width >= 40 {
         let picker_width = (area.width * 30 / 100).max(25);
         let left = Rect {
@@ -919,18 +944,12 @@ fn render_slash_command_overlay(frame: &mut Frame<'_>, prepared: &PreparedFrame)
                     Span::styled(format!(" {}", spec.usage), usage_style),
                 ];
                 if !spec.summary.is_empty() {
-                    spans.push(Span::styled(
-                        format!(" — {}", spec.summary),
-                        summary_style,
-                    ));
+                    spans.push(Span::styled(format!(" — {}", spec.summary), summary_style));
                 }
 
                 lines.push(Line::from(spans));
             }
-            frame.render_widget(
-                Paragraph::new(lines).wrap(Wrap { trim: false }),
-                popup_area,
-            );
+            frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), popup_area);
         }
         SlashCommandStatus::Matched {
             spec, syntax_valid, ..
@@ -1077,12 +1096,85 @@ fn render_rewind_picker_overlay(frame: &mut Frame<'_>, prepared: &PreparedFrame)
     let items: Vec<ListItem> = picker_state
         .options
         .iter()
-        .map(|opt| ListItem::new(Line::from(Span::styled(opt.label.clone(), backend_style(StyleId::Plain)))))
+        .map(|opt| {
+            ListItem::new(Line::from(Span::styled(
+                opt.label.clone(),
+                backend_style(StyleId::Plain),
+            )))
+        })
         .collect();
 
     let mut list_state = ListState::default();
     list_state.select(picker_state.list_state.selected());
 
+    frame.render_stateful_widget(
+        List::new(items)
+            .highlight_style(backend_style(StyleId::Selection))
+            .highlight_symbol("> "),
+        inner,
+        &mut list_state,
+    );
+}
+
+fn render_message_editor_overlay(frame: &mut Frame<'_>, prepared: &PreparedFrame) {
+    let Some(editor) = prepared.message_editor_state.as_ref() else {
+        return;
+    };
+
+    let area = frame.area();
+    if area.width < 10 || area.height < 4 {
+        return;
+    }
+
+    let modal_width = (area.width * 9 / 10).max(40).min(area.width);
+    let modal_height = (area.height * 3 / 4).max(6).min(area.height);
+    let modal = Rect {
+        x: area.x + (area.width.saturating_sub(modal_width)) / 2,
+        y: area.y + (area.height.saturating_sub(modal_height)) / 2,
+        width: modal_width,
+        height: modal_height,
+    };
+
+    frame.render_widget(Clear, modal);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(backend_style(StyleId::Active))
+            .title(" Edit or delete transcript "),
+        modal,
+    );
+
+    let inner = Rect {
+        x: modal.x + 1,
+        y: modal.y + 1,
+        width: modal.width.saturating_sub(2),
+        height: modal.height.saturating_sub(2),
+    };
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let items = editor
+        .messages
+        .iter()
+        .map(|message| {
+            let role = match &message.role {
+                harness_runtime_api::EditableMessageRole::User => "user".to_string(),
+                harness_runtime_api::EditableMessageRole::Assistant => "assistant".to_string(),
+                harness_runtime_api::EditableMessageRole::Tool { name } => {
+                    format!("tool {name}")
+                }
+            };
+            let text = message.text.replace(['\r', '\n'], " ");
+            ListItem::new(Line::from(Span::styled(
+                format!("[#{}] {}: {}", message.sequence, role, text),
+                backend_style(StyleId::Plain),
+            )))
+        })
+        .collect::<Vec<_>>();
+
+    let mut list_state = ListState::default();
+    list_state.select(editor.list_state.selected());
     frame.render_stateful_widget(
         List::new(items)
             .highlight_style(backend_style(StyleId::Selection))
@@ -1188,7 +1280,7 @@ mod tests {
                 width: 2,
                 height,
             };
-            let areas = allocate_areas(area, 10, 3);
+            let areas = allocate_areas(area, 10, 3, false);
             assert_eq!(
                 areas.status.y.saturating_add(areas.status.height),
                 area.y.saturating_add(area.height)
@@ -1268,9 +1360,7 @@ mod tests {
     #[test]
     fn notice_uses_sanitized_cell_width_for_right_aligned_overlay() {
         let mut app = application("");
-        app.apply_domain_event(DomainEvent::Failure(
-            "error message".to_string(),
-        ));
+        app.apply_domain_event(DomainEvent::Failure("error message".to_string()));
         // Failure is now routed directly into the transcript as a chat error entry.
         assert_eq!(app.into_final_state().transcript.len(), 1);
         let fresh_app = application("");

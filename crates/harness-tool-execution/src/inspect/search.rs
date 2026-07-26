@@ -121,8 +121,7 @@ fn parse_options(args: &[ShellWord]) -> Result<SearchOptions, String> {
     }
 
     Ok(SearchOptions {
-        pattern: pattern
-            .ok_or("failed to parse `inspect` search input: pattern is required")?,
+        pattern: pattern.ok_or("failed to parse `inspect` search input: pattern is required")?,
         roots,
         max,
         literal,
@@ -139,8 +138,11 @@ fn build_matcher(options: &SearchOptions) -> Result<Regex, String> {
     } else {
         options.pattern.clone()
     };
-    let case_insensitive =
-        options.ignore_case || !options.pattern.bytes().any(|byte| byte.is_ascii_uppercase());
+    let case_insensitive = options.ignore_case
+        || !options
+            .pattern
+            .bytes()
+            .any(|byte| byte.is_ascii_uppercase());
     RegexBuilder::new(&pattern)
         .case_insensitive(case_insensitive)
         .build()
@@ -275,7 +277,11 @@ mod tests {
             "fn take_body() {}\nfn parse_anchor() {}\n",
         )
         .unwrap();
-        std::fs::write(root_path.join("src/generated.rs"), "fn take_generated() {}\n").unwrap();
+        std::fs::write(
+            root_path.join("src/generated.rs"),
+            "fn take_generated() {}\n",
+        )
+        .unwrap();
         std::fs::create_dir_all(root_path.join("tests")).unwrap();
         std::fs::write(root_path.join("tests/search.rs"), "fn parse_test() {}\n").unwrap();
         let workspace = super::super::WorkspaceRoot::open(&root_path).unwrap();

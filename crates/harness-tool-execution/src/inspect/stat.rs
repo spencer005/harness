@@ -26,7 +26,9 @@ pub(crate) fn execute(
     args: &[ShellWord],
 ) -> Result<String, String> {
     if args.is_empty() {
-        return Err("failed to parse `inspect` input: usage: `stat <path> [path ...] [--metadata]`".into());
+        return Err(
+            "failed to parse `inspect` input: usage: `stat <path> [path ...] [--metadata]`".into(),
+        );
     }
     let metadata = args.iter().any(|arg| arg.value == "--metadata");
     let paths = args

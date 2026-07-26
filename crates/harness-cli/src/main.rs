@@ -21,6 +21,10 @@ use std::{
 };
 
 use futures_util::Stream;
+use harness_chat_completions_transport::{
+    ChatCompletionsTransport, ChatStreamChunk, ChatStreamError, ChatStreamingClient,
+    ChatTransportConfiguration,
+};
 use harness_conversation_runtime::{
     ConversationRuntime, ModelRequestBuilder, RuntimeConfiguration, RuntimeEffect, RuntimeError,
     RuntimePorts,
@@ -29,10 +33,6 @@ use harness_model_api::{
     ModelAttempt, ModelAttemptHandle, ModelFailure, ModelInput, ModelMessageRole, ModelRequest,
     ModelRequestId, ModelSelection, ModelTransport, ProviderGeneration, RequestContextUsage,
     ResolvedModelRoute,
-};
-use harness_chat_completions_transport::{
-    ChatStreamChunk, ChatStreamError, ChatStreamingClient, ChatTransportConfiguration,
-    ChatCompletionsTransport,
 };
 use harness_provider::{
     ProviderAuthConfig, ProviderConfig, ProviderDriverConfig, ProviderError, ProviderIdentity,
@@ -51,7 +51,8 @@ use harness_runtime_api::{
     RuntimeCommandSender, RuntimeEventReceiver, TranscriptSnapshotEntry, channel_pair,
 };
 use harness_session_store::{
-    SessionPayload, SessionReader, SessionRecord, SessionStore, SessionStoreError, SessionWriter,
+    SessionPayload, SessionReader, SessionRecord, SessionStore, SessionStoreError,
+    SessionToolInput, SessionWriter,
 };
 use harness_tool_api::{
     AvailabilityToolExecutor, ToolAvailability, ToolExecutor, ToolFailure, ToolRegistry,
@@ -113,7 +114,7 @@ pub(crate) enum SerializablePayload {
         turn_id: u64,
         call_id: String,
         name: String,
-        input: String,
+        input: SerializableToolInput,
     },
     ToolExecutionStarted {
         turn_id: u64,
@@ -143,6 +144,19 @@ pub(crate) enum SerializablePayload {
         state: String,
     },
     SessionClosed,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+#[serde(untagged)]
+pub(crate) enum SerializableToolInput {
+    Encoded(SerializableEncodedToolInput),
+    Unspecified(String),
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub(crate) enum SerializableEncodedToolInput {
+    Freeform(String),
+    FunctionJson(String),
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy)]
@@ -232,7 +246,17 @@ fn to_serializable_payload(payload: &SessionPayload) -> SerializablePayload {
             turn_id: *turn_id,
             call_id: call_id.clone(),
             name: name.clone(),
-            input: input.clone(),
+            input: match input {
+                SessionToolInput::Freeform(input) => SerializableToolInput::Encoded(
+                    SerializableEncodedToolInput::Freeform(input.clone()),
+                ),
+                SessionToolInput::FunctionJson(input) => SerializableToolInput::Encoded(
+                    SerializableEncodedToolInput::FunctionJson(input.clone()),
+                ),
+                SessionToolInput::Unspecified(input) => {
+                    SerializableToolInput::Unspecified(input.clone())
+                }
+            },
         },
         SessionPayload::ToolExecutionStarted { turn_id, call_id } => {
             SerializablePayload::ToolExecutionStarted {
@@ -363,7 +387,15 @@ fn from_serializable_payload(sp: SerializablePayload) -> SessionPayload {
             turn_id,
             call_id,
             name,
-            input,
+            input: match input {
+                SerializableToolInput::Encoded(SerializableEncodedToolInput::Freeform(input)) => {
+                    SessionToolInput::Freeform(input)
+                }
+                SerializableToolInput::Encoded(SerializableEncodedToolInput::FunctionJson(
+                    input,
+                )) => SessionToolInput::FunctionJson(input),
+                SerializableToolInput::Unspecified(input) => SessionToolInput::Unspecified(input),
+            },
         },
         SerializablePayload::ToolExecutionStarted { turn_id, call_id } => {
             SessionPayload::ToolExecutionStarted { turn_id, call_id }
@@ -410,10 +442,9 @@ fn from_serializable_payload(sp: SerializablePayload) -> SessionPayload {
             provider,
             response_id,
         },
-        SerializablePayload::Goal { instruction, state } => SessionPayload::Goal {
-            instruction,
-            state,
-        },
+        SerializablePayload::Goal { instruction, state } => {
+            SessionPayload::Goal { instruction, state }
+        }
         SerializablePayload::SessionClosed => SessionPayload::SessionClosed,
     }
 }
@@ -650,7 +681,8 @@ impl RealModelRequestBuilder {
             tiktoken_rs::get_bpe_from_model(selection.model.as_str()).ok()?
         };
         let mut tokens = 0usize;
-        let mut add = |value: &str| tokens = tokens.saturating_add(tokenizer.encode_ordinary(value).len());
+        let mut add =
+            |value: &str| tokens = tokens.saturating_add(tokenizer.encode_ordinary(value).len());
 
         if !self.base_instructions.is_empty() {
             add(&self.base_instructions);
@@ -678,7 +710,7 @@ impl RealModelRequestBuilder {
                 } => {
                     add(call_id);
                     add(name);
-                    add(input);
+                    add(input.as_str());
                 }
                 SessionPayload::ToolExecutionFinished {
                     call_id, output, ..
@@ -725,20 +757,22 @@ impl ModelRequestBuilder for RealModelRequestBuilder {
             .tool_registry
             .read()
             .map_err(|_| RuntimeError::ToolRegistryUnavailable)?;
-        let is_freeform_tool = |name: &str| {
-            registry.iter().any(|(_, tool)| {
+        let uses_freeform_encoding = |name: &str, input: &SessionToolInput| match input {
+            SessionToolInput::Freeform(_) => true,
+            SessionToolInput::FunctionJson(_) => false,
+            SessionToolInput::Unspecified(_) => registry.iter().any(|(_, tool)| {
                 tool.definition.name.as_str() == name
                     && matches!(
                         &tool.definition.input_schema,
                         harness_tool_api::ToolInputSchema::FreeformGrammar { .. }
                     )
-            })
+            }),
         };
 
         let last_response_meta = if self.store {
-            let last_compaction_pos = history
-                .iter()
-                .rposition(|payload| matches!(payload, SessionPayload::CompactionCheckpoint { .. }));
+            let last_compaction_pos = history.iter().rposition(|payload| {
+                matches!(payload, SessionPayload::CompactionCheckpoint { .. })
+            });
             history.iter().enumerate().rev().find_map(|(idx, payload)| {
                 if let Some(comp_pos) = last_compaction_pos {
                     if idx < comp_pos {
@@ -765,7 +799,8 @@ impl ModelRequestBuilder for RealModelRequestBuilder {
             .iter()
             .rposition(|payload| matches!(payload, SessionPayload::CompactionCheckpoint { .. }));
 
-        let (history_slice, previous_response_id) = match (last_response_meta, last_compaction_pos) {
+        let (history_slice, previous_response_id) = match (last_response_meta, last_compaction_pos)
+        {
             (Some((meta_idx, response_id)), Some(comp_idx)) if meta_idx > comp_idx => {
                 (&history[meta_idx + 1..], Some(response_id))
             }
@@ -820,17 +855,17 @@ impl ModelRequestBuilder for RealModelRequestBuilder {
                     input: tool_input,
                     ..
                 } => {
-                    if is_freeform_tool(name) {
+                    if uses_freeform_encoding(name, tool_input) {
                         input.push(ModelInput::FreeformToolCall {
                             call_id: call_id.clone(),
                             name: name.clone(),
-                            input: tool_input.clone(),
+                            input: tool_input.as_str().to_owned(),
                         });
                     } else {
                         input.push(ModelInput::AssistantToolCall {
                             call_id: call_id.clone(),
                             name: name.clone(),
-                            arguments: tool_input.clone(),
+                            arguments: tool_input.as_str().to_owned(),
                         });
                     }
                 }
@@ -843,8 +878,10 @@ impl ModelRequestBuilder for RealModelRequestBuilder {
                             SessionPayload::ToolCallAccepted {
                                 call_id: prior_call_id,
                                 name: prior_name,
+                                input: prior_input,
                                 ..
-                            } if prior_call_id == call_id && is_freeform_tool(prior_name)
+                            } if prior_call_id == call_id
+                                && uses_freeform_encoding(prior_name, prior_input)
                         )
                     }) {
                         input.push(ModelInput::FreeformToolResult {
@@ -900,13 +937,7 @@ impl ModelRequestBuilder for RealModelRequestBuilder {
         history: &[SessionPayload],
         steering: &[String],
     ) -> Result<Arc<ModelRequest>, RuntimeError> {
-        let request = self.build(
-            revision,
-            selection,
-            provider_generation,
-            history,
-            steering,
-        )?;
+        let request = self.build(revision, selection, provider_generation, history, steering)?;
         let input = request
             .input
             .iter()
@@ -1035,7 +1066,8 @@ impl ProviderSelectionStore for FileProviderSelectionStore {
 
     fn load(
         &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<ProviderSelection>, ProviderError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Option<ProviderSelection>, ProviderError>> + Send + '_>>
+    {
         let path = self.root.join("provider-bound.json");
         Box::pin(async move {
             let data = match tokio::fs::read_to_string(&path).await {
@@ -1047,10 +1079,14 @@ impl ProviderSelectionStore for FileProviderSelectionStore {
                     )));
                 }
             };
-            let ser: SerializableProviderSelection = serde_json::from_str(&data)
-                .map_err(|e| ProviderError::Persistence(format!("invalid provider-bound.json: {e}")))?;
-            let provider = harness_model_api::ProviderId::new(ser.provider)
-                .map_err(|e| ProviderError::Persistence(format!("invalid provider ID in persisted selection: {e}")))?;
+            let ser: SerializableProviderSelection = serde_json::from_str(&data).map_err(|e| {
+                ProviderError::Persistence(format!("invalid provider-bound.json: {e}"))
+            })?;
+            let provider = harness_model_api::ProviderId::new(ser.provider).map_err(|e| {
+                ProviderError::Persistence(format!(
+                    "invalid provider ID in persisted selection: {e}"
+                ))
+            })?;
             let model = ModelSelection::new(
                 provider.clone(),
                 ser.model.model,
@@ -1108,7 +1144,11 @@ impl StreamingClient for CodexWsClient {
         headers.client_request_id = attempt.attempt_id.0.to_string();
         headers.thread_id = attempt.attempt_id.0.to_string();
         Box::pin(async move {
-            let encoded_input = encode_input(&attempt.request.input, developer_role_support, allow_multiple_system);
+            let encoded_input = encode_input(
+                &attempt.request.input,
+                developer_role_support,
+                allow_multiple_system,
+            );
             let tools = encode_tools(&attempt.request.tools)
                 .map_err(|error| StreamError::Transport(error.to_string()))?;
             let mut body = sonic_rs::json!({
@@ -1141,7 +1181,9 @@ impl StreamingClient for CodexWsClient {
                                             sse_bytes.extend_from_slice(b"\n\n");
                                             Ok(StreamChunk::Bytes(sse_bytes))
                                         }
-                                        Err(error) => Err(StreamError::Transport(error.to_string())),
+                                        Err(error) => {
+                                            Err(StreamError::Transport(error.to_string()))
+                                        }
                                     }
                                 }
                                 ResponsesStreamEvent::Completed { .. } => Ok(StreamChunk::End),
@@ -1157,9 +1199,7 @@ impl StreamingClient for CodexWsClient {
                     .await;
                 if let Err(error) = result {
                     let err_msg = format_input_index_error(&error.to_string(), &encoded_input);
-                    let _ = sender
-                        .send(Err(StreamError::Transport(err_msg)))
-                        .await;
+                    let _ = sender.send(Err(StreamError::Transport(err_msg))).await;
                 } else {
                     let _ = sender.send(Ok(StreamChunk::End)).await;
                 }
@@ -1337,7 +1377,11 @@ impl StreamingClient for HttpClient {
         Box::pin(async move {
             let url_str = format!("{}/responses", base_url.trim_end_matches('/'));
 
-            let input = encode_input(&attempt.request.input, developer_role_support, allow_multiple_system);
+            let input = encode_input(
+                &attempt.request.input,
+                developer_role_support,
+                allow_multiple_system,
+            );
             let tools = encode_tools(&attempt.request.tools)
                 .map_err(|error| StreamError::Transport(error.to_string()))?;
             let mut body = sonic_rs::json!({
@@ -1553,8 +1597,11 @@ fn format_input_index_error(err_msg: &str, encoded_input: &[sonic_rs::Value]) ->
         if let Some(end_pos) = rest.find(']') {
             if let Ok(idx) = rest[..end_pos].parse::<usize>() {
                 if let Some(item) = encoded_input.get(idx) {
-                    let item_str = sonic_rs::to_string_pretty(item).unwrap_or_else(|_| item.to_string());
-                    return format!("{err_msg}\n\n--> Target input[{idx}] causing error:\n{item_str}");
+                    let item_str =
+                        sonic_rs::to_string_pretty(item).unwrap_or_else(|_| item.to_string());
+                    return format!(
+                        "{err_msg}\n\n--> Target input[{idx}] causing error:\n{item_str}"
+                    );
                 }
             }
         }
@@ -1702,7 +1749,12 @@ async fn resolve_provider_and_transport(
             request_timeout_ms: _,
             stream_idle_timeout_ms,
         } => {
-            let client = Arc::new(HttpClient::new(base_url.clone(), api_key, session_id, capabilities));
+            let client = Arc::new(HttpClient::new(
+                base_url.clone(),
+                api_key,
+                session_id,
+                capabilities,
+            ));
             let config = ChatTransportConfiguration {
                 event_capacity: 128,
                 chunk_timeout: Duration::from_millis(*stream_idle_timeout_ms),
@@ -1718,7 +1770,12 @@ async fn resolve_provider_and_transport(
             request_timeout_ms: _,
             stream_idle_timeout_ms,
         } => {
-            let client = Arc::new(HttpClient::new(base_url.clone(), api_key, session_id, capabilities));
+            let client = Arc::new(HttpClient::new(
+                base_url.clone(),
+                api_key,
+                session_id,
+                capabilities,
+            ));
             let config = TransportConfiguration {
                 event_capacity: 128,
                 chunk_timeout: Duration::from_millis(*stream_idle_timeout_ms),
@@ -1919,16 +1976,27 @@ enum AppAction {
         tier: Option<String>,
     },
     Retry,
-    SetToolAvailability { pattern: String, enabled: bool },
-    SetGoal { instruction: String },
+    SetToolAvailability {
+        pattern: String,
+        enabled: bool,
+    },
+    SetGoal {
+        instruction: String,
+    },
     PauseGoal,
     ResumeGoal,
     ClearGoal,
     ShowGoal,
-    Compact { instruction: String },
-    RetryCompaction { instruction: Option<String> },
+    Compact {
+        instruction: String,
+    },
+    RetryCompaction {
+        instruction: Option<String>,
+    },
     CancelCompaction,
-    ResumeSession { session_id: Option<String> },
+    ResumeSession {
+        session_id: Option<String>,
+    },
     /// Fork current session up to an optional sequence cutpoint and switch to the fork.
     /// `before_compaction` rewinds to just before the last CompactionCheckpoint.
     Rewind {
@@ -1937,6 +2005,13 @@ enum AppAction {
         /// Rewind to before this specific sequence number, if provided.
         before_sequence: Option<u64>,
     },
+    EditMessage(EditMessageAction),
+}
+#[derive(Debug, PartialEq, Eq)]
+enum EditMessageAction {
+    Choose,
+    Replace { sequence: u64, text: String },
+    Delete { sequence: u64 },
 }
 
 type Commands = CommandRegistry<App, AppAction>;
@@ -2071,17 +2146,80 @@ fn rewind(_app: &mut App, mut context: Context<'_>) -> CommandResult<AppAction> 
             before_compaction = true;
         } else if let Some(seq_str) = arg.strip_prefix("before:") {
             before_sequence = Some(seq_str.parse().map_err(|_| {
-                CommandError::Message(
-                    format!("invalid sequence number: {seq_str}").into()
-                )
+                CommandError::Message(format!("invalid sequence number: {seq_str}").into())
             })?);
         } else {
             return Err(CommandError::Message(
-                format!("unknown rewind argument: {arg}").into()
+                format!("unknown rewind argument: {arg}").into(),
             ));
         }
     }
-    Ok(AppAction::Rewind { before_compaction, before_sequence })
+    Ok(AppAction::Rewind {
+        before_compaction,
+        before_sequence,
+    })
+}
+
+fn edit_message(_app: &mut App, context: Context<'_>) -> CommandResult<AppAction> {
+    parse_edit_message_action(context.raw_args).map(AppAction::EditMessage)
+}
+
+fn parse_edit_message_action(raw_args: &str) -> CommandResult<EditMessageAction> {
+    if raw_args.is_empty() {
+        return Ok(EditMessageAction::Choose);
+    }
+
+    let mut words = raw_args.split_whitespace();
+    if words.next() == Some("delete") {
+        let sequence_text = words
+            .next()
+            .ok_or(CommandError::MissingArgument { name: "sequence" })?;
+        let sequence = sequence_text
+            .parse()
+            .map_err(|_| CommandError::InvalidArgument {
+                name: "sequence",
+                value: sequence_text.into(),
+                reason: "expected a persisted transcript sequence number".into(),
+            })?;
+        if let Some(extra) = words.next() {
+            return Err(CommandError::UnexpectedArgument(extra.into()));
+        }
+        return Ok(EditMessageAction::Delete { sequence });
+    }
+
+    let Some(separator) = raw_args.find(char::is_whitespace) else {
+        return Err(CommandError::Message(
+            "missing replacement text; use `/edit <sequence> <text>` to edit or \
+             `/edit delete <sequence>` to remove the message"
+                .into(),
+        ));
+    };
+    let sequence_text = &raw_args[..separator];
+    let sequence = sequence_text
+        .parse()
+        .map_err(|_| CommandError::InvalidArgument {
+            name: "sequence",
+            value: sequence_text.into(),
+            reason: "expected a persisted transcript sequence number".into(),
+        })?;
+    let separator_len = raw_args[separator..]
+        .chars()
+        .next()
+        .map(char::len_utf8)
+        .unwrap_or(0);
+    let text = &raw_args[separator + separator_len..];
+    if text.is_empty() {
+        return Err(CommandError::Message(
+            "replacement text is empty; provide message text or use \
+             `/edit delete <sequence>` to remove the message"
+                .into(),
+        ));
+    }
+
+    Ok(EditMessageAction::Replace {
+        sequence,
+        text: text.to_owned(),
+    })
 }
 
 fn goal(_app: &mut App, mut context: Context<'_>) -> CommandResult<AppAction> {
@@ -2164,10 +2302,7 @@ fn build_commands() -> Result<Commands, Box<dyn std::error::Error>> {
                 .usage("<name> [reasoning] [tier]")
                 .summary("Switch active model settings"),
         )
-        .command(
-            CommandSpec::new("retry", retry)
-                .summary("Retry the current user/tool turn"),
-        )
+        .command(CommandSpec::new("retry", retry).summary("Retry the current user/tool turn"))
         .command(
             CommandSpec::new("tool", tool)
                 .usage("<pattern> <enabled|disable>")
@@ -2178,19 +2313,78 @@ fn build_commands() -> Result<Commands, Box<dyn std::error::Error>> {
                 .usage("[instruction|redo [instruction]|cancel]")
                 .summary("Compact, redo, or cancel session compaction"),
         )
+        .command(CommandSpec::new("goal", goal).usage("<task>").summary(
+            "Set a persisted goal; the agent loop keeps going until the model calls goal complete",
+        ))
         .command(
-            CommandSpec::new("goal", goal)
-                .usage("<task>")
-                .summary("Set a persisted goal; the agent loop keeps going until the model calls goal complete"),
+            CommandSpec::new("edit", edit_message)
+                .usage("[<sequence> <text>|delete <sequence>]")
+                .summary("Edit messages or delete messages and tool calls"),
         )
         .command(
             CommandSpec::new("rewind", rewind)
                 .usage("[compact] [before:<sequence>]")
-                .summary("Fork the current session, optionally rewinding before the last compaction"),
+                .summary(
+                    "Fork the current session, optionally rewinding before the last compaction",
+                ),
         )
         .build()?)
 }
 
+async fn activate_session_fork(
+    new_session_id: harness_session_store::SessionId,
+    transport_session_id: &str,
+    app_state: &mut App,
+    provider_config: &ProviderConfig,
+    runtime: &mut ConversationRuntime,
+    event_tx: &harness_runtime_api::RuntimeEventSender,
+    session_root: &Path,
+    active_generation: &Arc<AtomicU64>,
+    event_sequence: &mut u64,
+) -> Result<(), String> {
+    let active_profile_id =
+        harness_provider::ProviderProfileId::new(app_state.active_profile.as_str());
+    let (model_slug, reasoning_effort, service_tier) = {
+        let selection = runtime.active_model();
+        (
+            selection.model.clone(),
+            selection.reasoning_effort.clone(),
+            selection.service_tier.clone(),
+        )
+    };
+    let next_generation = active_generation.load(Ordering::Acquire) + 1;
+    let (resolved, transport) = resolve_provider_and_transport(
+        provider_config,
+        transport_session_id,
+        &active_profile_id,
+        &model_slug,
+        next_generation,
+        reasoning_effort,
+        service_tier,
+    )
+    .await
+    .map_err(|error| format!("Failed to rebuild transport for fork: {error}"))?;
+
+    runtime
+        .switch_session(new_session_id.clone())
+        .await
+        .map_err(|error| format!("Failed to switch to fork: {error}"))?;
+    runtime.update_ports(transport, resolved.routes.root.clone());
+    runtime.update_compaction_route(resolved.routes.compaction.clone());
+    active_generation.store(next_generation, Ordering::Release);
+    app_state.session_id = new_session_id.as_str().to_owned();
+
+    let envelope = harness_runtime_api::RuntimeEventEnvelope::new(
+        *event_sequence,
+        harness_runtime_api::RuntimeEvent::SessionChanged(new_session_id.as_str().to_owned()),
+    );
+    *event_sequence += 1;
+    event_tx
+        .send(envelope)
+        .await
+        .map_err(|_| "Event channel closed".to_string())?;
+    emit_transcript_replacement(session_root, &new_session_id, event_tx, event_sequence).await
+}
 async fn execute_app_action(
     action: AppAction,
     app_state: &mut App,
@@ -2361,7 +2555,9 @@ async fn execute_app_action(
         AppAction::PauseGoal => {
             let goal_instruction = match runtime.persist_state() {
                 harness_conversation_runtime::PersistState::Active(task)
-                | harness_conversation_runtime::PersistState::Paused(task) => task.instruction.clone(),
+                | harness_conversation_runtime::PersistState::Paused(task) => {
+                    task.instruction.clone()
+                }
                 _ => String::new(),
             };
             runtime
@@ -2380,7 +2576,9 @@ async fn execute_app_action(
         AppAction::ResumeGoal => {
             let goal_instruction = match runtime.persist_state() {
                 harness_conversation_runtime::PersistState::Active(task)
-                | harness_conversation_runtime::PersistState::Paused(task) => task.instruction.clone(),
+                | harness_conversation_runtime::PersistState::Paused(task) => {
+                    task.instruction.clone()
+                }
                 _ => String::new(),
             };
             runtime
@@ -2399,7 +2597,9 @@ async fn execute_app_action(
         AppAction::ClearGoal => {
             let goal_instruction = match runtime.persist_state() {
                 harness_conversation_runtime::PersistState::Active(task)
-                | harness_conversation_runtime::PersistState::Paused(task) => task.instruction.clone(),
+                | harness_conversation_runtime::PersistState::Paused(task) => {
+                    task.instruction.clone()
+                }
                 _ => String::new(),
             };
             runtime
@@ -2466,31 +2666,117 @@ async fn execute_app_action(
             if let Err(e) = runtime.switch_session(target_id.clone()).await {
                 return Err(format!("Failed to switch session: {e}"));
             }
-            let records =
-                read_session_records(session_root, &target_id).map_err(|e| e.to_string())?;
-            let entries: Vec<TranscriptSnapshotEntry> = records
-                .iter()
-                .filter_map(transcript_snapshot_entry)
-                .collect();
-            let page = harness_runtime_api::TranscriptPage {
-                entries,
-                next_before_sequence: None,
-                reached_start: true,
-            };
+            app_state.session_id = target_id.as_str().to_string();
             let envelope = harness_runtime_api::RuntimeEventEnvelope::new(
                 *seq,
-                harness_runtime_api::RuntimeEvent::TranscriptPageLoaded(page),
+                harness_runtime_api::RuntimeEvent::SessionChanged(target_id.as_str().to_string()),
             );
             *seq += 1;
             if event_tx.send(envelope).await.is_err() {
                 return Err("Event channel closed".to_string());
             }
-            app_state.session_id = target_id.as_str().to_string();
+            emit_transcript_replacement(session_root, &target_id, event_tx, seq).await?;
             let msg = format!("Switched to session {}", target_id.as_str());
             emit_text_message("", &msg, runtime, event_tx, seq).await;
             Ok(())
         }
-        AppAction::Rewind { before_compaction, before_sequence } => {
+        AppAction::EditMessage(action) => {
+            if runtime.phase() != &harness_conversation_runtime::ConversationPhase::Idle {
+                return Err(
+                    "Transcript messages can be edited only while no response or tool is active."
+                        .to_string(),
+                );
+            }
+            let current_id = harness_session_store::SessionId::new(app_state.session_id.clone())
+                .map_err(|error| format!("Invalid current session id: {error}"))?;
+            let records = read_session_records(session_root, &current_id)
+                .map_err(|error| format!("Failed to read current session: {error}"))?;
+
+            match action {
+                EditMessageAction::Choose => {
+                    let messages = records
+                        .iter()
+                        .filter_map(editable_message)
+                        .collect::<Vec<_>>();
+                    if messages.is_empty() {
+                        return Err(
+                            "The active session has no persisted user/assistant messages or tool \
+                             calls to edit or delete."
+                                .to_string(),
+                        );
+                    }
+                    let envelope = harness_runtime_api::RuntimeEventEnvelope::new(
+                        *seq,
+                        harness_runtime_api::RuntimeEvent::OpenMessageEditor(messages),
+                    );
+                    *seq += 1;
+                    event_tx
+                        .send(envelope)
+                        .await
+                        .map_err(|_| "Event channel closed".to_string())
+                }
+                EditMessageAction::Replace { sequence, text } => {
+                    let payloads = edit_session_records(&records, sequence, Some(text.as_str()))?;
+                    let new_id = create_session_fork(session_root, &payloads)
+                        .map_err(|error| format!("Failed to create edited session: {error}"))?;
+                    let transport_session_id = new_id.as_str().to_owned();
+                    activate_session_fork(
+                        new_id.clone(),
+                        &transport_session_id,
+                        app_state,
+                        provider_config,
+                        runtime,
+                        event_tx,
+                        session_root,
+                        active_generation,
+                        seq,
+                    )
+                    .await?;
+                    emit_notification(
+                        &format!(
+                            "Edited message #{sequence}. Active fork: {}",
+                            new_id.as_str()
+                        ),
+                        event_tx,
+                        seq,
+                    )
+                    .await;
+                    Ok(())
+                }
+                EditMessageAction::Delete { sequence } => {
+                    let payloads = edit_session_records(&records, sequence, None)?;
+                    let new_id = create_session_fork(session_root, &payloads)
+                        .map_err(|error| format!("Failed to create edited session: {error}"))?;
+                    let transport_session_id = new_id.as_str().to_owned();
+                    activate_session_fork(
+                        new_id.clone(),
+                        &transport_session_id,
+                        app_state,
+                        provider_config,
+                        runtime,
+                        event_tx,
+                        session_root,
+                        active_generation,
+                        seq,
+                    )
+                    .await?;
+                    emit_notification(
+                        &format!(
+                            "Deleted message #{sequence}. Active fork: {}",
+                            new_id.as_str()
+                        ),
+                        event_tx,
+                        seq,
+                    )
+                    .await;
+                    Ok(())
+                }
+            }
+        }
+        AppAction::Rewind {
+            before_compaction,
+            before_sequence,
+        } => {
             // Read all records from the current session.
             let current_session_id_str = app_state.session_id.clone();
             let current_id = harness_session_store::SessionId::new(current_session_id_str.clone())
@@ -2501,12 +2787,14 @@ async fn execute_app_action(
             // Determine the cutpoint.
             let records_to_keep: Vec<&SessionRecord> = if before_compaction {
                 // Find the last CompactionCheckpoint and keep only records before it.
-                let last_compaction_pos = records
-                    .iter()
-                    .rposition(|r| matches!(r.payload, SessionPayload::CompactionCheckpoint { .. }));
+                let last_compaction_pos = records.iter().rposition(|r| {
+                    matches!(r.payload, SessionPayload::CompactionCheckpoint { .. })
+                });
                 match last_compaction_pos {
                     Some(pos) => records[..pos].iter().collect(),
-                    None => return Err("No compaction checkpoint found in current session".to_string()),
+                    None => {
+                        return Err("No compaction checkpoint found in current session".to_string());
+                    }
                 }
             } else if let Some(cutseq) = before_sequence {
                 // Keep records whose sequence is strictly less than cutseq.
@@ -2526,7 +2814,10 @@ async fn execute_app_action(
                             let snippet: String = summary.chars().take(60).collect();
                             turn_options.push(harness_runtime_api::RewindOptionMeta {
                                 sequence: record.sequence,
-                                label: format!("[#{}] ── Compaction: {} ──", record.sequence, snippet),
+                                label: format!(
+                                    "[#{}] ── Compaction: {} ──",
+                                    record.sequence, snippet
+                                ),
                             });
                         }
                         _ => {}
@@ -2546,89 +2837,38 @@ async fn execute_app_action(
                 return Ok(());
             };
 
-            // Create new session file with a fresh ID, re-sequenced from 0.
-            let new_session_id_str = generate_session_id()
-                .map_err(|e| format!("Failed to generate session ID: {e}"))?;
-            let session_dir = session_root.join("sessions");
-            std::fs::create_dir_all(&session_dir)
-                .map_err(|e| format!("Failed to create sessions dir: {e}"))?;
-            let fork_path = session_dir.join(format!("{new_session_id_str}.json"));
-            let serialized: Vec<SerializableRecord> = records_to_keep
-                .iter()
-                .enumerate()
-                .map(|(new_seq, record)| SerializableRecord {
-                    sequence: new_seq as u64,
-                    payload: to_serializable_payload(&record.payload),
-                })
-                .collect();
-            let json = serde_json::to_string_pretty(&serialized)
-                .map_err(|e| format!("Failed to serialize fork: {e}"))?;
-            std::fs::write(&fork_path, json)
-                .map_err(|e| format!("Failed to write fork session: {e}"))?;
-
-            let new_id = harness_session_store::SessionId::new(new_session_id_str.clone())
-                .map_err(|e| format!("Invalid new session id: {e}"))?;
-
-            // Switch the runtime's storage writer to the new session.
-            // The old session file is NOT touched.
-            if let Err(e) = runtime.switch_session(new_id.clone()).await {
-                return Err(format!("Failed to switch to fork: {e}"));
-            }
-
-            // Rebuild the transport using the ORIGINAL session ID as the cache/prefix key,
-            // so the model server's KV cache is still addressable from the fork.
-            let active_profile_id = harness_provider::ProviderProfileId::new(
-                app_state.active_profile.as_str()
-            );
-            let (model_slug, reasoning_effort, service_tier) = {
-                let sel = runtime.active_model();
-                (sel.model.clone(), sel.reasoning_effort.clone(), sel.service_tier.clone())
-            };
-            let next_gen = active_generation.load(Ordering::Acquire) + 1;
-            let (resolved, new_transport) = resolve_provider_and_transport(
+            let rewind_sequence = records_to_keep
+                .last()
+                .map(|record| record.sequence)
+                .unwrap_or(0);
+            let payloads = records_to_keep
+                .into_iter()
+                .map(|record| record.payload.clone())
+                .collect::<Vec<_>>();
+            let new_id = create_session_fork(session_root, &payloads)
+                .map_err(|error| format!("Failed to create rewind fork: {error}"))?;
+            activate_session_fork(
+                new_id.clone(),
+                &current_session_id_str,
+                app_state,
                 provider_config,
-                &current_session_id_str, // <-- original ID as cache key
-                &active_profile_id,
-                &model_slug,
-                next_gen,
-                reasoning_effort,
-                service_tier,
+                runtime,
+                event_tx,
+                session_root,
+                active_generation,
+                seq,
             )
-            .await
-            .map_err(|e| format!("Failed to rebuild transport for fork: {e}"))?;
+            .await?;
 
-            runtime.update_ports(new_transport, resolved.routes.root.clone());
-            runtime.update_compaction_route(resolved.routes.compaction.clone());
-            active_generation.store(next_gen, std::sync::atomic::Ordering::Release);
-
-            // Emit the forked transcript to the TUI.
-            let fork_records = read_session_records(session_root, &new_id)
-                .map_err(|e| format!("Failed to read forked session: {e}"))?;
-            let entries: Vec<TranscriptSnapshotEntry> = fork_records
-                .iter()
-                .filter_map(transcript_snapshot_entry)
-                .collect();
-            let page = harness_runtime_api::TranscriptPage {
-                entries,
-                next_before_sequence: None,
-                reached_start: true,
-            };
-            let envelope = harness_runtime_api::RuntimeEventEnvelope::new(
-                *seq,
-                harness_runtime_api::RuntimeEvent::TranscriptPageLoaded(page),
-            );
-            *seq += 1;
-            if event_tx.send(envelope).await.is_err() {
-                return Err("Event channel closed".to_string());
-            }
-
-            app_state.session_id = new_session_id_str.clone();
-            let msg = format!(
-                "Rewound session before sequence {}. Forked to new session {}",
-                records_to_keep.last().map(|r| r.sequence).unwrap_or(0),
-                new_id.as_str()
-            );
-            emit_text_message("", &msg, runtime, event_tx, seq).await;
+            emit_notification(
+                &format!(
+                    "Rewound session before sequence {rewind_sequence}. Active fork: {}",
+                    new_id.as_str()
+                ),
+                event_tx,
+                seq,
+            )
+            .await;
             Ok(())
         }
         AppAction::SetToolAvailability { pattern, enabled } => {
@@ -2812,11 +3052,7 @@ async fn run_model_attempt(
             }
 
             let effects = runtime
-                .finish_model_attempt(
-                    turn_id,
-                    attempt_id,
-                    outcome,
-                )
+                .finish_model_attempt(turn_id, attempt_id, outcome)
                 .await?;
             return Ok(Some(effects));
         }
@@ -2847,9 +3083,11 @@ async fn run_model_attempt(
                 let is_interrupt = matches!(
                     command,
                     harness_runtime_api::RuntimeCommand::Interrupt { .. }
+                        | harness_runtime_api::RuntimeCommand::SendQueuedSteering
                         | harness_runtime_api::RuntimeCommand::StopRequestLoop
                         | harness_runtime_api::RuntimeCommand::AbortResponse
                 );
+
                 if matches!(
                     &command,
                     harness_runtime_api::RuntimeCommand::Compact { .. }
@@ -2950,9 +3188,12 @@ async fn run_model_attempt(
                 effects.push(retry);
                 (effects, true)
             } else {
-                (runtime
-                    .finish_model_attempt(turn_id, attempt_id, outcome)
-                    .await?, true)
+                (
+                    runtime
+                        .finish_model_attempt(turn_id, attempt_id, outcome)
+                        .await?,
+                    true,
+                )
             }
         } else if let Some(outcome) = compatibility_failure {
             let started = runtime.model_response_started();
@@ -2972,50 +3213,53 @@ async fn run_model_attempt(
                 effects.push(retry);
                 (effects, true)
             } else {
-                (runtime
-                    .finish_model_attempt(turn_id, attempt_id, outcome)
-                    .await?, true)
+                (
+                    runtime
+                        .finish_model_attempt(turn_id, attempt_id, outcome)
+                        .await?,
+                    true,
+                )
             }
         } else {
             match runtime
-            .dispatch_model_event(turn_id, attempt_id, event)
-            .await
-        {
-            Ok(effects) => (effects, terminal),
-            Err(error) => {
-                let failure = harness_model_api::ModelTerminalOutcome::Failed(
-                    harness_model_api::ModelFailure {
-                        kind: harness_model_api::ModelFailureKind::Protocol,
-                        message: format!("model event rejected: {error}"),
-                    },
-                );
-                if compaction_attempt {
-                    let started = runtime.model_response_started();
-                    let failure_message = format!("{failure:?}");
-                    runtime.fail_compaction_attempt();
-                    let effect = if started {
-                        RuntimeEffect::Emit(
-                            harness_runtime_api::RuntimeEvent::ResponseFinished(failure),
-                        )
+                .dispatch_model_event(turn_id, attempt_id, event)
+                .await
+            {
+                Ok(effects) => (effects, terminal),
+                Err(error) => {
+                    let failure = harness_model_api::ModelTerminalOutcome::Failed(
+                        harness_model_api::ModelFailure {
+                            kind: harness_model_api::ModelFailureKind::Protocol,
+                            message: format!("model event rejected: {error}"),
+                        },
+                    );
+                    if compaction_attempt {
+                        let started = runtime.model_response_started();
+                        let failure_message = format!("{failure:?}");
+                        runtime.fail_compaction_attempt();
+                        let effect = if started {
+                            RuntimeEffect::Emit(
+                                harness_runtime_api::RuntimeEvent::ResponseFinished(failure),
+                            )
+                        } else {
+                            RuntimeEffect::Emit(harness_runtime_api::RuntimeEvent::Failure(
+                                harness_runtime_api::RuntimeFailure {
+                                    category: harness_runtime_api::RuntimeFailureCategory::Protocol,
+                                    message: failure_message,
+                                },
+                            ))
+                        };
+                        (vec![effect], true)
                     } else {
-                        RuntimeEffect::Emit(harness_runtime_api::RuntimeEvent::Failure(
-                            harness_runtime_api::RuntimeFailure {
-                                category: harness_runtime_api::RuntimeFailureCategory::Protocol,
-                                message: failure_message,
-                            },
-                        ))
-                    };
-                    (vec![effect], true)
-                } else {
-                    (
-                        runtime
-                            .finish_model_attempt(turn_id, attempt_id, failure)
-                            .await?,
-                        true,
-                    )
+                        (
+                            runtime
+                                .finish_model_attempt(turn_id, attempt_id, failure)
+                                .await?,
+                            true,
+                        )
+                    }
                 }
             }
-        }
         };
 
         for effect in event_effects {
@@ -3081,9 +3325,7 @@ async fn run_model_attempt(
     Ok(Some(deferred))
 }
 
-fn is_custom_tool_compatibility_failure(
-    outcome: &harness_model_api::ModelTerminalOutcome,
-) -> bool {
+fn is_custom_tool_compatibility_failure(outcome: &harness_model_api::ModelTerminalOutcome) -> bool {
     matches!(
         outcome,
         harness_model_api::ModelTerminalOutcome::Failed(failure)
@@ -3177,7 +3419,10 @@ async fn drive_runtime_effects(
                 {
                     return false;
                 }
-                let result = run_model_attempt(runtime, command_rx, commands, turn_id, attempt, route, event_tx, seq).await;
+                let result = run_model_attempt(
+                    runtime, command_rx, commands, turn_id, attempt, route, event_tx, seq,
+                )
+                .await;
                 if !emit_runtime_event(
                     event_tx,
                     seq,
@@ -3195,12 +3440,16 @@ async fn drive_runtime_effects(
                         format!("starting model attempt failed: {error}"),
                     )),
                 }
-            },
+            }
             RuntimeEffect::StartCompaction {
                 compaction_id: _,
                 attempt,
                 route,
-            } => match run_model_attempt(runtime, command_rx, commands, 0, attempt, route, event_tx, seq).await {
+            } => match run_model_attempt(
+                runtime, command_rx, commands, 0, attempt, route, event_tx, seq,
+            )
+            .await
+            {
                 Ok(Some(effects)) => Ok(effects),
                 Ok(None) => return false,
                 Err(error) => Err((
@@ -3240,22 +3489,21 @@ async fn drive_runtime_effects(
                     )
                 })
             }
-            RuntimeEffect::ContinueModel { turn_id: _ } => runtime
-                .start_model_request()
-                .await
-                .map_err(|error| {
+            RuntimeEffect::ContinueModel { turn_id: _ } => {
+                runtime.start_model_request().await.map_err(|error| {
                     (
                         harness_runtime_api::RuntimeFailureCategory::Model,
                         format!("model continuation failed: {error}"),
                     )
-                }),
+                })
+            }
             RuntimeEffect::ExecuteTool {
                 turn_id,
                 call_id,
                 mut request,
             } => {
                 if let harness_tool_api::ToolInput::FunctionJson(json_str) = &request.input {
-                    use sonic_rs::{JsonValueTrait, JsonContainerTrait};
+                    use sonic_rs::{JsonContainerTrait, JsonValueTrait};
                     if let Ok(value) = sonic_rs::from_str::<sonic_rs::Value>(json_str) {
                         let mut current = &value;
                         while let Some(obj) = current.as_object() {
@@ -3267,7 +3515,8 @@ async fn drive_runtime_effects(
                             }
                         }
                         if let Some(s) = current.as_str() {
-                            request.input = harness_tool_api::ToolInput::FunctionJson(s.to_string());
+                            request.input =
+                                harness_tool_api::ToolInput::FunctionJson(s.to_string());
                         }
                     }
                 }
@@ -3279,11 +3528,15 @@ async fn drive_runtime_effects(
                             let message = match &error {
                                 ToolFailure::InvalidInput(msg) => msg.clone(),
                                 ToolFailure::Execution(msg) => msg.clone(),
-                                ToolFailure::TimedOut => "The tool timed out before completing.".to_string(),
+                                ToolFailure::TimedOut => {
+                                    "The tool timed out before completing.".to_string()
+                                }
                                 ToolFailure::Cancelled => "The tool was cancelled.".to_string(),
                             };
-                            format!("The tool reported: {message}\n\nReview the error and retry the tool call with corrected input.")
-                        },
+                            format!(
+                                "The tool reported: {message}\n\nReview the error and retry the tool call with corrected input."
+                            )
+                        }
                     },
                     Err(error) => {
                         return emit_effect_failure(
@@ -3454,7 +3707,16 @@ fn start_conversation_runtime(
                 }
             };
 
-            if !drive_runtime_effects(&mut runtime, &mut command_rx, &commands, effects, &event_tx, &mut seq).await {
+            if !drive_runtime_effects(
+                &mut runtime,
+                &mut command_rx,
+                &commands,
+                effects,
+                &event_tx,
+                &mut seq,
+            )
+            .await
+            {
                 break;
             }
 
@@ -3503,7 +3765,10 @@ fn start_conversation_runtime(
         }
     });
 
-    RuntimeHandle { commands: commands_handle, events }
+    RuntimeHandle {
+        commands: commands_handle,
+        events,
+    }
 }
 
 async fn run_tui(_auth_mode: AuthMode, resume: ResumeSelection) -> CliResult<()> {
@@ -3562,7 +3827,12 @@ async fn run_tui(_auth_mode: AuthMode, resume: ResumeSelection) -> CliResult<()>
                         "default provider profile not found: {default_id}"
                     )))
                 })?;
-                (default_id, default_profile.default_model.clone(), None, None)
+                (
+                    default_id,
+                    default_profile.default_model.clone(),
+                    None,
+                    None,
+                )
             }
         } else {
             let default_id = provider_config.default_profile_id.clone();
@@ -3571,7 +3841,12 @@ async fn run_tui(_auth_mode: AuthMode, resume: ResumeSelection) -> CliResult<()>
                     "default provider profile not found: {default_id}"
                 )))
             })?;
-            (default_id, default_profile.default_model.clone(), None, None)
+            (
+                default_id,
+                default_profile.default_model.clone(),
+                None,
+                None,
+            )
         };
 
     let (resolved_provider, initial_transport) = resolve_provider_and_transport(
@@ -3670,10 +3945,15 @@ async fn run_tui(_auth_mode: AuthMode, resume: ResumeSelection) -> CliResult<()>
         session_root,
     );
 
-    harness_tui_rewrite::run_with_runtime(snapshot, runtime.commands, runtime.events).await?;
+    let final_state =
+        harness_tui_rewrite::run_with_runtime(snapshot, runtime.commands, runtime.events).await?;
 
     let mut stdout = io::stdout();
-    writeln!(stdout, "Resume conversation ID: {session_id_text}")?;
+    writeln!(
+        stdout,
+        "Resume conversation ID: {}",
+        final_state.session_id.as_str()
+    )?;
     stdout.flush()?;
     Ok(())
 }
@@ -3745,7 +4025,7 @@ fn resolve_session_startup(root: &Path, resume: ResumeSelection) -> CliResult<Se
     };
     let initial_transcript_entries = records
         .iter()
-        .filter_map(transcript_snapshot_entry)
+        .filter_map(harness_conversation_runtime::project_transcript_record)
         .collect();
 
     Ok(SessionStartup {
@@ -3760,6 +4040,192 @@ fn resolve_session_id(raw: String) -> CliResult<harness_session_store::SessionId
     }
     harness_session_store::SessionId::new(raw.clone())
         .map_err(|_| CliError::SessionNotFound { id: raw })
+}
+
+fn editable_message(record: &SessionRecord) -> Option<harness_runtime_api::EditableMessage> {
+    let (role, text) = match &record.payload {
+        SessionPayload::InputMessage { text, .. } => {
+            (harness_runtime_api::EditableMessageRole::User, text.clone())
+        }
+        SessionPayload::AssistantMessage { text, .. } => (
+            harness_runtime_api::EditableMessageRole::Assistant,
+            text.clone(),
+        ),
+        SessionPayload::ToolCallAccepted {
+            name,
+            input: SessionToolInput::Freeform(input),
+            ..
+        } => (
+            harness_runtime_api::EditableMessageRole::Tool { name: name.clone() },
+            input.clone(),
+        ),
+        _ => return None,
+    };
+    Some(harness_runtime_api::EditableMessage {
+        sequence: record.sequence,
+        role,
+        text,
+    })
+}
+
+fn edit_session_records(
+    records: &[SessionRecord],
+    target_sequence: u64,
+    replacement: Option<&str>,
+) -> Result<Vec<SessionPayload>, String> {
+    let target = records
+        .iter()
+        .find(|record| record.sequence == target_sequence)
+        .ok_or_else(|| {
+            format!(
+                "No persisted transcript record has sequence {target_sequence}. \
+                 Run `/edit` to choose a transcript entry."
+            )
+        })?;
+    let tool_target = match &target.payload {
+        SessionPayload::InputMessage { .. } | SessionPayload::AssistantMessage { .. } => None,
+        SessionPayload::ToolCallAccepted {
+            turn_id, call_id, ..
+        } if replacement.is_none() => Some((*turn_id, call_id.as_str())),
+        SessionPayload::ToolCallAccepted {
+            input: SessionToolInput::Freeform(_),
+            ..
+        } => None,
+        SessionPayload::ToolCallAccepted { .. } => {
+            return Err(format!(
+                "Transcript record {target_sequence} is not a native freeform tool call, so its \
+                 input cannot be edited. Select a native tool call from `/edit`, or use \
+                 `/edit delete {target_sequence}` to remove this call and its result."
+            ));
+        }
+        _ => {
+            return Err(format!(
+                "Transcript record {target_sequence} is not an editable user message, assistant \
+                 message, or native tool call. Run `/edit` to choose a transcript entry."
+            ));
+        }
+    };
+
+    let mut payloads = Vec::with_capacity(records.len());
+    for record in records {
+        if record.sequence == target_sequence {
+            if let Some(text) = replacement {
+                let payload = match &record.payload {
+                    SessionPayload::InputMessage { turn_id, .. } => SessionPayload::InputMessage {
+                        turn_id: *turn_id,
+                        text: text.to_owned(),
+                    },
+                    SessionPayload::AssistantMessage { turn_id, .. } => {
+                        SessionPayload::AssistantMessage {
+                            turn_id: *turn_id,
+                            text: text.to_owned(),
+                        }
+                    }
+                    SessionPayload::ToolCallAccepted {
+                        turn_id,
+                        call_id,
+                        name,
+                        input: SessionToolInput::Freeform(_),
+                    } => SessionPayload::ToolCallAccepted {
+                        turn_id: *turn_id,
+                        call_id: call_id.clone(),
+                        name: name.clone(),
+                        input: SessionToolInput::Freeform(text.to_owned()),
+                    },
+
+                    _ => unreachable!("target payload was validated as an editable message"),
+                };
+                payloads.push(payload);
+            }
+            continue;
+        }
+
+        let correlated_tool_record = tool_target.is_some_and(|(target_turn_id, target_call_id)| {
+            matches!(
+                &record.payload,
+                SessionPayload::ToolExecutionStarted { turn_id, call_id }
+                    | SessionPayload::ToolExecutionFinished {
+                        turn_id, call_id, ..
+                    }
+                    if *turn_id == target_turn_id && call_id == target_call_id
+            )
+        });
+        if correlated_tool_record {
+            continue;
+        }
+
+        let stale_derived_state = record.sequence > target_sequence
+            && matches!(
+                record.payload,
+                SessionPayload::CompactionCheckpoint { .. }
+                    | SessionPayload::ModelResponseMetadata { .. }
+            );
+        if !stale_derived_state {
+            payloads.push(record.payload.clone());
+        }
+    }
+    Ok(payloads)
+}
+
+fn create_session_fork(
+    root: &Path,
+    payloads: &[SessionPayload],
+) -> CliResult<harness_session_store::SessionId> {
+    let session_id = harness_session_store::SessionId::new(generate_session_id()?)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let session_dir = root.join("sessions");
+    std::fs::create_dir_all(&session_dir)?;
+    let path = session_dir.join(format!("{}.json", session_id.as_str()));
+    let records = payloads
+        .iter()
+        .enumerate()
+        .map(|(index, payload)| {
+            let sequence = u64::try_from(index)
+                .ok()
+                .and_then(|index| index.checked_add(1))
+                .ok_or_else(|| {
+                    CliError::Session(SessionStoreError::InvalidFormat(
+                        "session sequence space is exhausted".to_string(),
+                    ))
+                })?;
+            Ok(SerializableRecord {
+                sequence,
+                payload: to_serializable_payload(payload),
+            })
+        })
+        .collect::<CliResult<Vec<_>>>()?;
+    let json = serde_json::to_string_pretty(&records)
+        .map_err(|error| CliError::Session(SessionStoreError::InvalidFormat(error.to_string())))?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(json.as_bytes())?;
+    file.sync_all()?;
+    Ok(session_id)
+}
+
+async fn emit_transcript_replacement(
+    root: &Path,
+    session_id: &harness_session_store::SessionId,
+    event_tx: &harness_runtime_api::RuntimeEventSender,
+    sequence: &mut u64,
+) -> Result<(), String> {
+    let records = read_session_records(root, session_id)
+        .map_err(|error| format!("Failed to read forked session: {error}"))?;
+    let entries = records
+        .iter()
+        .filter_map(harness_conversation_runtime::project_transcript_record)
+        .collect();
+    let envelope = harness_runtime_api::RuntimeEventEnvelope::new(
+        *sequence,
+        harness_runtime_api::RuntimeEvent::TranscriptReplaced(entries),
+    );
+    *sequence += 1;
+    event_tx
+        .send(envelope)
+        .await
+        .map_err(|_| "Event channel closed".to_string())
 }
 
 fn latest_session_id(root: &Path) -> CliResult<harness_session_store::SessionId> {
@@ -3832,78 +4298,6 @@ fn read_session_records(
         .into_iter()
         .map(|record| from_serializable_record(record, session_id))
         .collect())
-}
-
-pub(crate) fn transcript_snapshot_entry(record: &SessionRecord) -> Option<TranscriptSnapshotEntry> {
-    let payload = match &record.payload {
-        SessionPayload::InputMessage { text, .. } => {
-            harness_runtime_api::TranscriptPayload::Message {
-                role: harness_runtime_api::MessageRole::User,
-                text: text.clone(),
-            }
-        }
-        SessionPayload::AssistantMessage { text, .. } => {
-            harness_runtime_api::TranscriptPayload::Message {
-                role: harness_runtime_api::MessageRole::Assistant,
-                text: text.clone(),
-            }
-        }
-        SessionPayload::Reasoning {
-            content, summary, ..
-        } => {
-            let text = summary.as_deref().or(content.as_deref())?;
-            if text.is_empty() {
-                return None;
-            }
-            harness_runtime_api::TranscriptPayload::Thinking {
-                text: text.to_owned(),
-            }
-        }
-        SessionPayload::Error {
-            category, message, ..
-        } => harness_runtime_api::TranscriptPayload::Error {
-            category: match category {
-                harness_session_store::SessionErrorCategory::Model => {
-                    harness_runtime_api::RuntimeFailureCategory::Model
-                }
-                harness_session_store::SessionErrorCategory::Protocol => {
-                    harness_runtime_api::RuntimeFailureCategory::Protocol
-                }
-                harness_session_store::SessionErrorCategory::Tool => {
-                    harness_runtime_api::RuntimeFailureCategory::Tool
-                }
-                harness_session_store::SessionErrorCategory::Lifecycle => {
-                    harness_runtime_api::RuntimeFailureCategory::Lifecycle
-                }
-            },
-            message: message.clone(),
-        },
-        SessionPayload::ToolExecutionFinished {
-            call_id, output, ..
-        } => harness_runtime_api::TranscriptPayload::ToolResult {
-            call_id: call_id.clone(),
-            output: output.clone(),
-        },
-        SessionPayload::CompactionCheckpoint { summary, .. } => {
-            harness_runtime_api::TranscriptPayload::Thinking {
-                text: summary.clone(),
-            }
-        }
-        SessionPayload::Metadata(_)
-        | SessionPayload::ProviderBinding(_)
-        | SessionPayload::TurnStarted { .. }
-        | SessionPayload::ModelAttemptStarted { .. }
-        | SessionPayload::ToolCallAccepted { .. }
-        | SessionPayload::ToolExecutionStarted { .. }
-        | SessionPayload::TurnFinished { .. }
-        | SessionPayload::ModelResponseMetadata { .. }
-        | SessionPayload::Goal { .. }
-        | SessionPayload::SessionClosed => return None,
-    };
-    Some(TranscriptSnapshotEntry {
-        sequence: Some(record.sequence),
-        payload,
-    })
 }
 
 fn parse_cli_args(args: impl IntoIterator<Item = OsString>) -> CliResult<CliAction> {
@@ -4004,6 +4398,432 @@ fn format_uuid_like(mut bits: u128) -> String {
         (bits >> 48) as u16,
         bits & 0xffff_ffff_ffff_u128
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(sequence: u64, payload: SessionPayload) -> SessionRecord {
+        SessionRecord {
+            session_id: harness_session_store::SessionId::new("test-session").unwrap(),
+            sequence,
+            payload,
+        }
+    }
+
+    #[test]
+    fn edit_command_preserves_exact_replacement_text() {
+        assert_eq!(
+            parse_edit_message_action("12  leading text\nsecond line").unwrap(),
+            EditMessageAction::Replace {
+                sequence: 12,
+                text: " leading text\nsecond line".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_edit_message_action("delete\t12").unwrap(),
+            EditMessageAction::Delete { sequence: 12 }
+        );
+        assert_eq!(
+            parse_edit_message_action("").unwrap(),
+            EditMessageAction::Choose
+        );
+    }
+
+    #[test]
+    fn edit_command_rejects_missing_text_as_an_ambiguous_delete() {
+        let error = parse_edit_message_action("12").unwrap_err();
+        assert!(matches!(error, CommandError::Message(_)));
+    }
+
+    #[test]
+    fn editing_a_message_invalidates_later_derived_context() {
+        let records = vec![
+            record(
+                1,
+                SessionPayload::InputMessage {
+                    turn_id: 1,
+                    text: "first".to_string(),
+                },
+            ),
+            record(
+                2,
+                SessionPayload::ModelResponseMetadata {
+                    turn_id: 1,
+                    attempt_id: 1,
+                    provider: "provider".to_string(),
+                    response_id: "still-valid-prefix".to_string(),
+                },
+            ),
+            record(
+                3,
+                SessionPayload::AssistantMessage {
+                    turn_id: 1,
+                    text: "old answer".to_string(),
+                },
+            ),
+            record(
+                4,
+                SessionPayload::ModelResponseMetadata {
+                    turn_id: 1,
+                    attempt_id: 2,
+                    provider: "provider".to_string(),
+                    response_id: "stale-response".to_string(),
+                },
+            ),
+            record(
+                5,
+                SessionPayload::CompactionCheckpoint {
+                    source_revision: 4,
+                    summary: "stale summary".to_string(),
+                },
+            ),
+            record(
+                6,
+                SessionPayload::InputMessage {
+                    turn_id: 2,
+                    text: "later input".to_string(),
+                },
+            ),
+        ];
+
+        let edited = edit_session_records(&records, 3, Some("new answer\nwith detail")).unwrap();
+
+        assert!(matches!(
+            &edited[2],
+            SessionPayload::AssistantMessage { text, .. }
+                if text == "new answer\nwith detail"
+        ));
+        assert!(edited.iter().any(|payload| matches!(
+            payload,
+            SessionPayload::ModelResponseMetadata { response_id, .. }
+                if response_id == "still-valid-prefix"
+        )));
+        assert!(!edited.iter().any(|payload| matches!(
+            payload,
+            SessionPayload::ModelResponseMetadata { response_id, .. }
+                if response_id == "stale-response"
+        )));
+        assert!(
+            !edited
+                .iter()
+                .any(|payload| matches!(payload, SessionPayload::CompactionCheckpoint { .. }))
+        );
+        assert!(edited.iter().any(|payload| matches!(
+            payload,
+            SessionPayload::InputMessage { text, .. } if text == "later input"
+        )));
+    }
+
+    #[test]
+    fn deleting_a_message_removes_only_that_message_and_stale_context() {
+        let records = vec![
+            record(1, SessionPayload::TurnStarted { turn_id: 1 }),
+            record(
+                2,
+                SessionPayload::InputMessage {
+                    turn_id: 1,
+                    text: "remove me".to_string(),
+                },
+            ),
+            record(
+                3,
+                SessionPayload::AssistantMessage {
+                    turn_id: 1,
+                    text: "retain me".to_string(),
+                },
+            ),
+        ];
+
+        let edited = edit_session_records(&records, 2, None).unwrap();
+
+        assert_eq!(edited.len(), 2);
+        assert!(matches!(edited[0], SessionPayload::TurnStarted { .. }));
+        assert!(matches!(
+            &edited[1],
+            SessionPayload::AssistantMessage { text, .. } if text == "retain me"
+        ));
+    }
+
+    #[test]
+    fn native_tool_editor_keeps_the_name_out_of_editable_input() {
+        let native = record(
+            1,
+            SessionPayload::ToolCallAccepted {
+                turn_id: 7,
+                call_id: "call-native".to_string(),
+                name: "inspect".to_string(),
+                input: SessionToolInput::Freeform("read src/main.rs".to_string()),
+            },
+        );
+        let encoded = record(
+            2,
+            SessionPayload::ToolCallAccepted {
+                turn_id: 7,
+                call_id: "call-encoded".to_string(),
+                name: "compatibility_tool".to_string(),
+                input: SessionToolInput::FunctionJson(r#"{"path":"src/main.rs"}"#.to_string()),
+            },
+        );
+
+        let editable = editable_message(&native).unwrap();
+
+        assert_eq!(editable.text, "read src/main.rs");
+        assert!(matches!(
+            editable.role,
+            harness_runtime_api::EditableMessageRole::Tool { name } if name == "inspect"
+        ));
+        assert!(editable_message(&encoded).is_none());
+    }
+
+    #[test]
+    fn editing_a_native_tool_call_preserves_its_identity_execution_and_result() {
+        let records = vec![
+            record(
+                1,
+                SessionPayload::ToolCallAccepted {
+                    turn_id: 7,
+                    call_id: "call-7".to_string(),
+                    name: "inspect".to_string(),
+                    input: SessionToolInput::Freeform("read old.rs".to_string()),
+                },
+            ),
+            record(
+                2,
+                SessionPayload::ToolExecutionStarted {
+                    turn_id: 7,
+                    call_id: "call-7".to_string(),
+                },
+            ),
+            record(
+                3,
+                SessionPayload::ToolExecutionFinished {
+                    turn_id: 7,
+                    call_id: "call-7".to_string(),
+                    output: "retained tool output".to_string(),
+                },
+            ),
+            record(
+                4,
+                SessionPayload::ModelResponseMetadata {
+                    turn_id: 7,
+                    attempt_id: 2,
+                    provider: "provider".to_string(),
+                    response_id: "stale-response".to_string(),
+                },
+            ),
+        ];
+
+        let edited = edit_session_records(&records, 1, Some("read new.rs")).unwrap();
+
+        assert!(matches!(
+            &edited[0],
+            SessionPayload::ToolCallAccepted {
+                turn_id: 7,
+                call_id,
+                name,
+                input: SessionToolInput::Freeform(input),
+            } if call_id == "call-7" && name == "inspect" && input == "read new.rs"
+        ));
+        assert!(edited.iter().any(|payload| matches!(
+            payload,
+            SessionPayload::ToolExecutionStarted { turn_id: 7, call_id }
+                if call_id == "call-7"
+        )));
+        assert!(edited.iter().any(|payload| matches!(
+            payload,
+            SessionPayload::ToolExecutionFinished {
+                turn_id: 7,
+                call_id,
+                output,
+            } if call_id == "call-7" && output == "retained tool output"
+        )));
+        assert!(
+            !edited
+                .iter()
+                .any(|payload| matches!(payload, SessionPayload::ModelResponseMetadata { .. }))
+        );
+    }
+
+    #[test]
+    fn deleting_a_tool_call_removes_its_execution_and_result() {
+        let records = vec![
+            record(
+                1,
+                SessionPayload::ToolCallAccepted {
+                    turn_id: 7,
+                    call_id: "call-7".to_string(),
+                    name: "inspect".to_string(),
+                    input: SessionToolInput::Freeform("read src/main.rs".to_string()),
+                },
+            ),
+            record(
+                2,
+                SessionPayload::ToolExecutionStarted {
+                    turn_id: 7,
+                    call_id: "call-7".to_string(),
+                },
+            ),
+            record(
+                3,
+                SessionPayload::ToolExecutionFinished {
+                    turn_id: 7,
+                    call_id: "call-7".to_string(),
+                    output: "tool output".to_string(),
+                },
+            ),
+            record(
+                4,
+                SessionPayload::AssistantMessage {
+                    turn_id: 7,
+                    text: "retained response".to_string(),
+                },
+            ),
+            record(
+                5,
+                SessionPayload::ModelResponseMetadata {
+                    turn_id: 7,
+                    attempt_id: 2,
+                    provider: "provider".to_string(),
+                    response_id: "stale-response".to_string(),
+                },
+            ),
+        ];
+
+        let edited = edit_session_records(&records, 1, None).unwrap();
+
+        assert!(!edited.iter().any(|payload| matches!(
+            payload,
+            SessionPayload::ToolCallAccepted { call_id, .. }
+                | SessionPayload::ToolExecutionStarted { call_id, .. }
+                | SessionPayload::ToolExecutionFinished { call_id, .. }
+                if call_id == "call-7"
+        )));
+        assert!(edited.iter().any(|payload| matches!(
+            payload,
+            SessionPayload::AssistantMessage { text, .. } if text == "retained response"
+        )));
+        assert!(
+            !edited
+                .iter()
+                .any(|payload| matches!(payload, SessionPayload::ModelResponseMetadata { .. }))
+        );
+    }
+
+    #[test]
+    fn resumed_session_projects_persisted_tool_name_input_and_result() {
+        let root = std::env::temp_dir().join(format!(
+            "new-harness-tool-resume-test-{}",
+            generate_session_id().unwrap()
+        ));
+        let payloads = vec![
+            SessionPayload::ToolCallAccepted {
+                turn_id: 1,
+                call_id: "call-1".to_string(),
+                name: "inspect".to_string(),
+                input: SessionToolInput::Freeform("read src/main.rs 1-20".to_string()),
+            },
+            SessionPayload::ToolExecutionFinished {
+                turn_id: 1,
+                call_id: "call-1".to_string(),
+                output: "1 bucket fn main() {}".to_string(),
+            },
+        ];
+        let session_id = create_session_fork(&root, &payloads).unwrap();
+
+        let startup = resolve_session_startup(
+            &root,
+            ResumeSelection::SessionId(session_id.as_str().to_string()),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            &startup.initial_transcript_entries[0].payload,
+            harness_runtime_api::TranscriptPayload::ToolCall {
+                call_id,
+                name,
+                input: harness_runtime_api::TranscriptToolInput::Freeform(input),
+            } if call_id == "call-1"
+                && name == "inspect"
+                && input == "read src/main.rs 1-20"
+        ));
+        assert!(matches!(
+            &startup.initial_transcript_entries[1].payload,
+            harness_runtime_api::TranscriptPayload::ToolResult { call_id, output }
+                if call_id == "call-1" && output == "1 bucket fn main() {}"
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resumed_existing_tool_record_keeps_name_and_input_without_guessing_encoding() {
+        let root = std::env::temp_dir().join(format!(
+            "new-harness-existing-tool-resume-test-{}",
+            generate_session_id().unwrap()
+        ));
+        let session_id =
+            harness_session_store::SessionId::new(generate_session_id().unwrap()).unwrap();
+        let session_dir = root.join("sessions");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(
+            session_dir.join(format!("{}.json", session_id.as_str())),
+            r#"[{"sequence":1,"payload":{"ToolCallAccepted":{"turn_id":1,"call_id":"call-old","name":"terminal_open","input":"command: cargo test"}}}]"#,
+        )
+        .unwrap();
+
+        let startup = resolve_session_startup(
+            &root,
+            ResumeSelection::SessionId(session_id.as_str().to_string()),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            &startup.initial_transcript_entries[0].payload,
+            harness_runtime_api::TranscriptPayload::ToolCall {
+                call_id,
+                name,
+                input: harness_runtime_api::TranscriptToolInput::Unspecified(input),
+            } if call_id == "call-old"
+                && name == "terminal_open"
+                && input == "command: cargo test"
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn session_fork_is_written_with_fresh_monotonic_sequences() {
+        let root = std::env::temp_dir().join(format!(
+            "new-harness-edit-test-{}",
+            generate_session_id().unwrap()
+        ));
+        let payloads = vec![
+            SessionPayload::TurnStarted { turn_id: 1 },
+            SessionPayload::InputMessage {
+                turn_id: 1,
+                text: "edited".to_string(),
+            },
+        ];
+
+        let session_id = create_session_fork(&root, &payloads).unwrap();
+        let records = read_session_records(&root, &session_id).unwrap();
+
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.payload.clone())
+                .collect::<Vec<_>>(),
+            payloads
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[cfg(feature = "dhat-heap")]

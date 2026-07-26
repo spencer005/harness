@@ -241,10 +241,7 @@ impl DocumentLimits {
     }
     /// Covers one already viewport-bounded prompt projection without truncation.
     pub(crate) fn prompt_viewport(bytes: usize, lines: usize, _cells: usize) -> Self {
-        Self::new(
-            bytes.max(layout::OMISSION_MARKER_BYTES),
-            lines.max(1),
-        )
+        Self::new(bytes.max(layout::OMISSION_MARKER_BYTES), lines.max(1))
     }
 }
 
@@ -284,9 +281,7 @@ impl DisplayDocument<ControlFree> {
     /// Wraps document directly to `width` terminal cells without pre-bounding limits.
     pub(crate) fn layout(self, width: u16) -> DisplayDocument<LaidOut> {
         let layout = layout::layout_lines(self.storage.0, usize::from(width.max(1)));
-        DisplayDocument {
-            storage: layout,
-        }
+        DisplayDocument { storage: layout }
     }
 
     /// Applies deterministic resource limits and proves the bounded stage.
@@ -319,9 +314,7 @@ impl DisplayDocument<Bounded> {
     /// Wraps the document to `width` terminal cells.
     pub(crate) fn layout(self, width: u16) -> DisplayDocument<LaidOut> {
         let layout = layout::layout_lines(self.storage.0, usize::from(width.max(1)));
-        DisplayDocument {
-            storage: layout,
-        }
+        DisplayDocument { storage: layout }
     }
 }
 

@@ -8,5 +8,4 @@ version.workspace = true
 [dependencies]
 crossfire.workspace = true
 harness-model-api.workspace = true
-harness-tool-api.workspace = true
 tokio.workspace = true

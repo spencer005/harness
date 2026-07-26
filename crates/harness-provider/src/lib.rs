@@ -299,7 +299,13 @@ pub trait ProviderSelectionStore: Send + Sync {
     /// Loads a previously persisted selection, if one exists.
     fn load(
         &self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<ProviderSelection>, ProviderError>> + Send + '_>>;
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Option<ProviderSelection>, ProviderError>>
+                + Send
+                + '_,
+        >,
+    >;
 }
 
 /// Returns an explicit route or a typed unavailability error.

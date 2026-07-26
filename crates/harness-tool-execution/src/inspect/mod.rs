@@ -133,14 +133,18 @@ impl ToolExecutor for Executor {
         request: ToolExecutionRequest,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<ToolResult, ToolFailure>> + Send + '_>>
     {
-        let result = if request.tool.as_str() != NAME || request.route.identifier != NAME {
-            Err(ToolFailure::Execution(
+        if request.tool.as_str() != NAME || request.route.identifier != NAME {
+            return Box::pin(std::future::ready(Err(ToolFailure::Execution(
                 "executor route does not match `inspect`".into(),
-            ))
-        } else {
-            execute(&self.workspace, &request.input)
-        };
-        Box::pin(std::future::ready(result))
+            ))));
+        }
+
+        let workspace = self.workspace.clone();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || execute(&workspace, &request.input))
+                .await
+                .map_err(|error| ToolFailure::Execution(error.to_string()))?
+        })
     }
 }
 
@@ -352,10 +356,7 @@ fn resolve(workspace: &WorkspaceRoot, value: &str) -> Result<(String, PathBuf), 
         let mut msg = format!("inspect: path `{name}` does not exist");
         msg.push_str(&format!("\nDid you mean: `{}`?", correction.suggested));
         if !correction.listing.is_empty() {
-            msg.push_str(&format!(
-                "\nFiles in `{}`:",
-                correction.deepest_prefix,
-            ));
+            msg.push_str(&format!("\nFiles in `{}`:", correction.deepest_prefix,));
             for entry in &correction.listing {
                 msg.push_str(&format!("\n  {entry}"));
             }

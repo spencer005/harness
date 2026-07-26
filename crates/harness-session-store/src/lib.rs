@@ -84,6 +84,26 @@ pub struct SessionRecord {
     pub payload: SessionPayload,
 }
 
+/// Model-facing encoding of a durably accepted tool input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionToolInput {
+    /// Provider-independent freeform input.
+    Freeform(String),
+    /// Serialized function arguments.
+    FunctionJson(String),
+    /// Input persisted before its model-facing encoding was recorded.
+    Unspecified(String),
+}
+
+impl SessionToolInput {
+    /// Returns the exact model-provided input representation.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Freeform(input) | Self::FunctionJson(input) | Self::Unspecified(input) => input,
+        }
+    }
+}
+
 /// Durable session payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionPayload {
@@ -117,7 +137,7 @@ pub enum SessionPayload {
         turn_id: u64,
         call_id: String,
         name: String,
-        input: String,
+        input: SessionToolInput,
     },
     /// Tool execution begins.
     ToolExecutionStarted { turn_id: u64, call_id: String },
@@ -144,10 +164,7 @@ pub enum SessionPayload {
         response_id: String,
     },
     /// Goal state persisted for continuous execution.
-    Goal {
-        instruction: String,
-        state: String,
-    },
+    Goal { instruction: String, state: String },
     /// Session closes.
     SessionClosed,
 }
