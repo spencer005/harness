@@ -35,6 +35,7 @@ const DEFAULT_COLS: u16 = 80;
 const OUTPUT_LIMIT: usize = 1_048_576;
 const DEFAULT_POLL_AFTER: Duration = Duration::from_secs(8);
 const POLL_AFTER_GRACE: Duration = Duration::from_millis(250);
+const NEWER_SESSION_GRACE: i32 = 3;
 #[derive(Default)]
 struct TerminalBuffer {
     bytes: Vec<u8>,
@@ -173,6 +174,7 @@ impl Manager {
             );
             id
         };
+        self.reap_superseded_sessions(id);
         std::thread::sleep(Duration::from_millis(100));
         Ok(format_output(id, &output, None, None))
     }
@@ -231,6 +233,38 @@ impl Manager {
             None,
             status.map(|status| status.exit_code()),
         ))
+    }
+    fn reap_superseded_sessions(&self, newest_id: i32) {
+        let cutoff = newest_id.saturating_sub(NEWER_SESSION_GRACE);
+        let candidates = {
+            let state = self.state.lock().expect("terminal state lock");
+            state
+                .sessions
+                .iter()
+                .filter(|(id, _)| **id <= cutoff)
+                .map(|(id, session)| (*id, Arc::clone(session)))
+                .collect::<Vec<_>>()
+        };
+
+        let finished = candidates
+            .into_iter()
+            .filter_map(|(id, session)| {
+                let mut session = session.try_lock().ok()?;
+                match session.child.try_wait() {
+                    Ok(Some(_)) => Some(id),
+                    Ok(None) | Err(_) => None,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        if finished.is_empty() {
+            return;
+        }
+
+        let mut state = self.state.lock().expect("terminal state lock");
+        for id in finished {
+            state.sessions.remove(&id);
+        }
     }
     fn session(&self, id: i32) -> Result<Arc<Mutex<Session>>, String> {
         self.state

@@ -16,6 +16,7 @@ members = [
     "crates/harness-tool-execution",
     "crates/harness-cli",
     "crates/token_inspector", "crates/harness-session-picker",
+    "crates/codex-native-mcp",
 ]
 resolver = "2"
 
@@ -31,8 +32,14 @@ version = "0.1.0"
 [workspace.dependencies]
 anyhow = "1"
 bytes = "1"
+base64 = "0.22"
 crossfire = { version = "3.1.16", features = ["tokio"] }
+hmac = "0.12"
 crossterm = { version = "0.28", features = ["event-stream"] }
+rand = "0.8"
+sha2 = "0.10"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 fff_search = { package = "fff-search", git = "https://github.com/dmtrkovalenko/fff" }
 memchr = "2"
 harness-responses-api = { path = "crates/harness-responses-api" }
@@ -70,6 +77,7 @@ globset = "0.4"
 object = { version = "0.36", default-features = false, features = ["elf", "read_core", "std"] }
 criterion = "0.5"
 serde = { version = "1", features = ["derive"] }
+similar = "2.7"
 serde_json = "1"
 sonic-rs = "0.5.8"
 thiserror = "2"
