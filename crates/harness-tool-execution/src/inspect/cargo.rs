@@ -4,50 +4,86 @@ use std::{
 };
 
 use serde::Deserialize;
+use harness_tool_api::{
+    InspectCheckRequest, InspectCheckResult, InspectDiagnostic, InspectDiagnosticLevel,
+    InspectJobSuccess, InspectTestFailure, InspectTestRequest, InspectTestResult,
+};
 
-use super::{ShellWord, WorkspaceRoot};
+use super::{InspectCommandOutput, ShellWord, WorkspaceRoot};
 
-pub(crate) fn check(workspace: &WorkspaceRoot, args: &[ShellWord]) -> Result<String, String> {
-    let mut parsed_args = parse_cargo_check_command(args)?;
-    if !parsed_args
+pub(crate) fn prepare_check(args: &[ShellWord]) -> Result<InspectCheckRequest, String> {
+    Ok(InspectCheckRequest {
+        cargo_arguments: parse_cargo_check_command(args)?,
+    })
+}
+
+pub(crate) fn check(
+    workspace: &WorkspaceRoot,
+    request: &InspectCheckRequest,
+) -> Result<InspectCommandOutput, String> {
+    let mut cargo_arguments = request.cargo_arguments.clone();
+    if !cargo_arguments
         .iter()
         .any(|arg| arg.starts_with("--message-format"))
     {
-        parsed_args.push("--message-format=json".to_string());
+        cargo_arguments.push("--message-format=json".to_string());
     }
     let output = Command::new("cargo")
-        .args(&parsed_args)
+        .args(&cargo_arguments)
         .current_dir(workspace.path())
         .output()
         .map_err(|e| format!("failed to execute `cargo check`: {e}"))?;
-
-    let formatted = format_cargo_check_output(
-        output.status,
-        &String::from_utf8_lossy(&output.stdout),
-        &String::from_utf8_lossy(&output.stderr),
-    );
-
-    Ok(formatted)
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let locations = parse_json_diagnostics(&stdout);
+    let model = format_cargo_check_output(output.status, &stdout, &stderr);
+    let diagnostics = locations.iter().map(inspect_diagnostic).collect();
+    Ok(InspectCommandOutput {
+        model: model.clone(),
+        result: InspectJobSuccess::Check(InspectCheckResult {
+            succeeded: output.status.success(),
+            diagnostics,
+            failure: (!output.status.success() && locations.is_empty()).then_some(model),
+        }),
+    })
 }
 
-pub(crate) fn test(workspace: &WorkspaceRoot, args: &[ShellWord]) -> Result<String, String> {
+pub(crate) fn prepare_test(args: &[ShellWord]) -> Result<InspectTestRequest, String> {
     let parsed = parse_cargo_test_command(args)?;
-    let filters = if parsed.filters.is_empty() {
+    Ok(InspectTestRequest {
+        cargo_arguments: parsed.cargo_args,
+        filters: parsed.filters,
+        libtest_arguments: parsed.libtest_args,
+    })
+}
+
+pub(crate) fn test(
+    workspace: &WorkspaceRoot,
+    request: &InspectTestRequest,
+) -> Result<InspectCommandOutput, String> {
+    let filters = if request.filters.is_empty() {
         vec![None]
     } else {
-        parsed.filters.iter().map(Some).collect::<Vec<_>>()
+        request.filters.iter().map(Some).collect::<Vec<_>>()
     };
     let label_filters = filters.len() > 1;
-    let mut formatted = String::new();
+    let mut model = String::new();
+    let mut result = InspectTestResult {
+        passed: 0,
+        failed: 0,
+        ignored: 0,
+        failures: Vec::new(),
+        execution_failure: None,
+    };
 
     for filter in filters {
-        let mut cmd_args = parsed.cargo_args.clone();
+        let mut command_arguments = request.cargo_arguments.clone();
         if let Some(filter) = filter {
-            cmd_args.push(filter.clone());
+            command_arguments.push(filter.clone());
         }
-        cmd_args.push("--".to_string());
-        cmd_args.extend(parsed.libtest_args.iter().cloned());
-        cmd_args.extend([
+        command_arguments.push("--".to_string());
+        command_arguments.extend(request.libtest_arguments.iter().cloned());
+        command_arguments.extend([
             "-Z".to_string(),
             "unstable-options".to_string(),
             "--format".to_string(),
@@ -55,36 +91,67 @@ pub(crate) fn test(workspace: &WorkspaceRoot, args: &[ShellWord]) -> Result<Stri
         ]);
 
         let output = Command::new("cargo")
-            .args(&cmd_args)
+            .args(&command_arguments)
             .env("RUSTC_BOOTSTRAP", "1")
             .current_dir(workspace.path())
             .output()
-            .map_err(|error| format!("{formatted}failed to execute `cargo test`: {error}"))?;
-
+            .map_err(|error| format!("{model}failed to execute `cargo test`: {error}"))?;
         if label_filters {
             let _ = writeln!(
-                formatted,
+                model,
                 "filter {}",
                 filter.expect("multiple test invocations always have filters")
             );
         }
-        formatted.push_str(&format_cargo_test_output(
-            output.status,
-            &String::from_utf8_lossy(&output.stdout),
-            &String::from_utf8_lossy(&output.stderr),
-        ));
-        if !formatted.ends_with('\n') {
-            formatted.push('\n');
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let formatted = format_cargo_test_output(output.status, &stdout, &stderr);
+        model.push_str(&formatted);
+        if !model.ends_with('\n') {
+            model.push('\n');
         }
 
+        let report = parse_libtest_json(&stdout);
+        if let Some(summary) = report.summary {
+            result.passed += summary.passed;
+            result.failed += summary.failed;
+            result.ignored += summary.ignored;
+        }
+        let runtime_failures = rust_test_runtime_failure_sections(&stderr);
+        if !report.failures.is_empty() || !runtime_failures.is_empty() {
+            result.failures.push(InspectTestFailure {
+                name: filter.cloned(),
+                output: format!("{}{}", report.failures, runtime_failures),
+            });
+        }
+        let compile_diagnostics = rust_error_locations(&stderr);
         if !output.status.success()
-            && !rust_error_locations(&String::from_utf8_lossy(&output.stderr)).is_empty()
+            && report.summary.is_none()
+            && result.execution_failure.is_none()
         {
+            result.execution_failure = Some(formatted);
+        }
+        if !output.status.success() && !compile_diagnostics.is_empty() {
             break;
         }
     }
 
-    Ok(formatted)
+    Ok(InspectCommandOutput {
+        model,
+        result: InspectJobSuccess::Test(result),
+    })
+}
+
+fn inspect_diagnostic(location: &RustErrorLocation) -> InspectDiagnostic {
+    InspectDiagnostic {
+        level: InspectDiagnosticLevel::Error,
+        code: Some(location.code.clone()),
+        message: location.summary.clone(),
+        path: Some(location.path.clone()),
+        line: Some(location.line),
+        column: Some(location.column),
+        label: location.label.clone(),
+    }
 }
 
 fn parse_cargo_check_command(args: &[ShellWord]) -> Result<Vec<String>, String> {

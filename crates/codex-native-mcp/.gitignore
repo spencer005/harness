@@ -1,0 +1,3 @@
+/target
+*.key
+.codex-native-mcp-signing.key

@@ -24,6 +24,7 @@ pub(crate) struct TranscriptEntry {
     source_sequence: Option<u64>,
     revision: u64,
     payload: TranscriptPayload,
+    tool_expanded: bool,
 }
 
 impl TranscriptEntry {
@@ -40,6 +41,10 @@ impl TranscriptEntry {
     /// Returns semantic payload.
     pub(crate) fn payload(&self) -> &TranscriptPayload {
         &self.payload
+    }
+    /// Returns whether this tool activity's typed detail is expanded.
+    pub(crate) fn tool_expanded(&self) -> bool {
+        self.tool_expanded
     }
 }
 
@@ -115,23 +120,29 @@ impl TranscriptDocument {
         Ok(self.insert_tail(entry.sequence, entry.payload))
     }
 
-    pub(crate) fn attach_sequence(
+    pub(crate) fn attach_sequences(
         &mut self,
-        id: TranscriptEntryId,
-        sequence: u64,
+        ids: &[TranscriptEntryId],
+        sequences: &[u64],
     ) -> Result<(), crate::transcript::TranscriptError> {
-        if self.sequence_index.contains_key(&sequence) {
-            return Err(crate::transcript::TranscriptError::ConflictingSequence(
-                sequence,
-            ));
+        let mut requested = HashSet::with_capacity(sequences.len());
+        for sequence in sequences {
+            if self.sequence_index.contains_key(sequence) || !requested.insert(*sequence) {
+                return Err(crate::transcript::TranscriptError::ConflictingSequence(
+                    *sequence,
+                ));
+            }
         }
-        let Some(index) = self.index_of(id) else {
-            return Ok(());
-        };
-        let entry = &mut self.entries[index];
-        entry.source_sequence = Some(sequence);
-        self.sequence_index.insert(sequence, id);
-        self.bump_revision();
+        for (id, sequence) in ids.iter().zip(sequences) {
+            let Some(index) = self.index_of(*id) else {
+                continue;
+            };
+            self.entries[index].source_sequence = Some(*sequence);
+            self.sequence_index.insert(*sequence, *id);
+        }
+        if !ids.is_empty() {
+            self.bump_revision();
+        }
         Ok(())
     }
 
@@ -170,6 +181,66 @@ impl TranscriptDocument {
             .expect("transcript entry revision space is not exhausted");
         self.bump_revision();
     }
+    pub(super) fn append_event_text(&mut self, id: TranscriptEntryId, delta: &ExternalText) {
+        let Some(index) = self.index_of(id) else {
+            return;
+        };
+        let entry = &mut self.entries[index];
+        let TranscriptPayload::Event(text) = &mut entry.payload else {
+            return;
+        };
+        text.append(delta);
+        entry.revision = entry
+            .revision
+            .checked_add(1)
+            .expect("transcript entry revision space is not exhausted");
+        self.bump_revision();
+    }
+
+    pub(crate) fn update_tool_activity(
+        &mut self,
+        activity: crate::domain::ToolActivity,
+    ) -> Option<TranscriptEntryId> {
+        let index = self.entries.iter().rposition(|entry| {
+            matches!(
+                &entry.payload,
+                TranscriptPayload::ToolActivity(current)
+                    if current.call_id.as_str() == activity.call_id.as_str()
+            )
+        })?;
+        let entry = &mut self.entries[index];
+        entry.payload = TranscriptPayload::ToolActivity(activity);
+        entry.revision = entry
+            .revision
+            .checked_add(1)
+            .expect("transcript entry revision space is not exhausted");
+        let id = entry.id;
+        self.bump_revision();
+        Some(id)
+    }
+
+    pub(crate) fn toggle_tool_activity(
+        &mut self,
+        id: TranscriptEntryId,
+    ) -> Option<bool> {
+        let index = self.index_of(id)?;
+        if !matches!(
+            self.entries[index].payload,
+            TranscriptPayload::ToolActivity(_)
+        ) {
+            return None;
+        }
+        let entry = &mut self.entries[index];
+        entry.tool_expanded = !entry.tool_expanded;
+        entry.revision = entry
+            .revision
+            .checked_add(1)
+            .expect("transcript entry revision space is not exhausted");
+        let expanded = entry.tool_expanded;
+        self.bump_revision();
+        Some(expanded)
+    }
+
 
     pub(crate) fn novel_page_entries(
         &self,
@@ -198,6 +269,17 @@ impl TranscriptDocument {
         }
         let mut inserted = Vec::with_capacity(entries.len());
         for entry in entries {
+            if let TranscriptPayload::ToolActivity(incoming) = &entry.payload
+                && let Some(existing) = self.entries.iter().find_map(|entry| {
+                    let TranscriptPayload::ToolActivity(current) = &entry.payload else {
+                        return None;
+                    };
+                    (current.call_id.as_str() == incoming.call_id.as_str()).then_some(entry.id)
+                })
+            {
+                self.sequence_index.insert(entry.sequence, existing);
+                continue;
+            }
             let id = self.allocate_id();
             self.sequence_index.insert(entry.sequence, id);
             inserted.push(TranscriptEntry {
@@ -205,6 +287,7 @@ impl TranscriptDocument {
                 source_sequence: Some(entry.sequence),
                 revision: 0,
                 payload: entry.payload,
+                tool_expanded: false,
             });
         }
         self.entries.splice(0..0, inserted);
@@ -224,6 +307,7 @@ impl TranscriptDocument {
             source_sequence,
             revision: 0,
             payload,
+            tool_expanded: false,
         });
         self.id_index.insert(id, index);
         if let Some(sequence) = source_sequence {

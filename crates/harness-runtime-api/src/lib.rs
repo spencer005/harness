@@ -2,6 +2,7 @@
 
 use crossfire::{AsyncRx, MAsyncTx, TrySendError, mpsc::Array};
 use harness_model_api::{ContextLimits, ModelCapabilities, ModelSelection, ModelTerminalOutcome};
+use harness_tool_api::{ToolActivityStatus, ToolInvocation, ToolOutcome};
 
 /// Error returned when a runtime channel cannot accept a message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +35,9 @@ pub type RuntimeReceiver<T> = AsyncRx<Array<T>>;
 pub enum RuntimeCommand {
     /// Submits exact prompt source.
     SubmitPrompt { text: String },
+    /// Executes frontend command text without adding it to model input.
+    ExecuteCommand { text: String },
+
     /// Queues steering text for a later attempt.
     QueueSteering { text: String },
     /// Retries the current turn when its last durable message is retryable.
@@ -50,9 +54,10 @@ pub enum RuntimeCommand {
     StopRequestLoop,
     /// Aborts the active model response immediately.
     AbortResponse,
-    /// Interrupts the active attempt and submits exact user text at its terminal boundary.
+    /// Interrupts an active attempt and submits exact user text at its terminal boundary,
+    /// or submits the text immediately when the runtime is already idle.
     Interrupt { text: String },
-    /// Interrupts the active attempt and submits the queued steering at its terminal boundary.
+    /// Submits queued steering immediately when idle, or at an active attempt's terminal boundary.
     SendQueuedSteering,
 
     /// Changes the selected model.
@@ -75,17 +80,17 @@ pub enum RuntimeCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeEvent {
     /// A transcript entry is appended.
+    /// A previously appended tool activity changes state.
+    ToolActivityChanged(ToolActivity),
     TranscriptAppended(TranscriptSnapshotEntry),
     /// A transcript page is loaded.
     TranscriptPageLoaded(TranscriptPage),
     /// The complete active transcript is replaced after a session switch.
     TranscriptReplaced(Vec<TranscriptSnapshotEntry>),
-    /// Persisted sequences are assigned to the active streamed entries.
+    /// Persisted sequences are assigned to streamed response blocks in display order.
     TranscriptCommitted {
-        /// Sequence assigned to the reasoning entry, when reasoning is persisted.
-        reasoning_sequence: Option<u64>,
-        /// Sequence assigned to the assistant message entry.
-        assistant_sequence: u64,
+        /// Sequences for non-empty reasoning and assistant blocks.
+        sequences: Vec<u64>,
     },
     /// The active session changes.
     SessionChanged(String),
@@ -105,6 +110,8 @@ pub enum RuntimeEvent {
     ResponseStarted,
     /// Assistant text arrives incrementally.
     AssistantTextDelta(String),
+    /// A reasoning output block starts.
+    ReasoningStarted,
     /// Reasoning summary text arrives incrementally.
     ReasoningSummaryDelta(String),
     /// Raw reasoning content arrives incrementally.
@@ -113,8 +120,14 @@ pub enum RuntimeEvent {
     ResponseFinished(ModelTerminalOutcome),
     /// Compaction has started.
     CompactionStarted,
+    /// Compaction summary text arrives incrementally.
+    CompactionDelta(String),
     /// A compaction summary was durably committed.
     CompactionCompleted(String),
+    /// A compaction attempt failed while preserving its source for redo.
+    CompactionFailed(String),
+    /// A staged compaction was cancelled without changing canonical history.
+    CompactionCancelled,
     /// Estimated context-window token usage.
     ContextUsage(ContextUsage),
     /// The root agentic work cycle started.
@@ -157,7 +170,7 @@ pub struct EditableMessage {
     pub sequence: u64,
     /// Supported conversation entry kind shown by the editor.
     pub role: EditableMessageRole,
-    /// Exact current message or native tool input text.
+    /// Exact current message text.
     pub text: String,
 }
 
@@ -168,8 +181,6 @@ pub enum EditableMessageRole {
     User,
     /// Persisted assistant output.
     Assistant,
-    /// Persisted native tool invocation.
-    Tool { name: String },
 }
 
 /// Session metadata payload for the session picker modal.
@@ -230,27 +241,48 @@ impl TranscriptToolInput {
     }
 }
 
+/// One replayable built-in tool activity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolActivity {
+    /// Correlation identifier shared by live updates and persisted replay.
+    pub call_id: String,
+    /// Parsed invocation used by typed compact and detail renderers.
+    pub invocation: ToolInvocation,
+    /// Exact model-provided input retained separately from display data.
+    pub raw_input: TranscriptToolInput,
+    /// Running or completed activity data.
+    pub phase: ToolActivityPhase,
+}
+
+/// Valid lifecycle phases for one tool activity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolActivityPhase {
+    /// The invocation is durable and execution has not completed.
+    Running,
+    /// Execution completed with typed display data and separate model output.
+    Finished {
+        outcome: ToolOutcome,
+        raw_output: String,
+    },
+}
+
+impl ToolActivity {
+    /// Returns the visible five-state activity status.
+    pub fn status(&self) -> ToolActivityStatus {
+        match &self.phase {
+            ToolActivityPhase::Running => ToolActivityStatus::Running,
+            ToolActivityPhase::Finished { outcome, .. } => outcome.status(),
+        }
+    }
+}
+
 /// Transcript payload represented by the frontend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TranscriptPayload {
     /// Message payload.
     Message { role: MessageRole, text: String },
-    /// Tool call payload.
-    ToolCall {
-        /// Correlation identifier.
-        call_id: String,
-        /// Tool name.
-        name: String,
-        /// Input and its model-facing encoding.
-        input: TranscriptToolInput,
-    },
-    /// Tool result payload.
-    ToolResult {
-        /// Correlation identifier.
-        call_id: String,
-        /// Model-visible output.
-        output: String,
-    },
+    /// One persistent built-in tool activity.
+    ToolActivity(ToolActivity),
     /// Plain text payload.
     PlainText(String),
     /// Reasoning content or summary shown as a thinking block.

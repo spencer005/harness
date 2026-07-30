@@ -1,11 +1,15 @@
 //! Provider-independent contracts for tool discovery, invocation, and results.
 
 use std::{
+    borrow::Cow,
     collections::BTreeMap,
     sync::{Arc, RwLock},
 };
 
 use thiserror::Error;
+mod activity;
+
+pub use activity::*;
 
 /// Stable name assigned to a tool.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -92,6 +96,40 @@ impl ToolInput {
             Self::Freeform(input) | Self::FunctionJson(input) => input,
         }
     }
+
+    /// Decodes input for a native freeform executor.
+    ///
+    /// Native calls are returned unchanged. Function compatibility calls must
+    /// contain exactly one string property named `input`.
+    pub fn decode_freeform(&self) -> Result<Cow<'_, str>, InvalidFreeformFunctionInput> {
+        match self {
+            Self::Freeform(input) => Ok(Cow::Borrowed(input)),
+            Self::FunctionJson(arguments) => {
+                let arguments: FreeformFunctionArguments = serde_json::from_str(arguments)
+                    .map_err(|source| InvalidFreeformFunctionInput { source })?;
+                Ok(Cow::Owned(arguments.input))
+            }
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FreeformFunctionArguments {
+    input: String,
+}
+
+/// A function-call wrapper for a native freeform tool is not strict JSON.
+#[derive(Debug, Error)]
+#[error(
+    "function-call arguments for a native freeform tool are invalid: {source}. \
+     The arguments must be strict JSON with exactly one string property named `input`, \
+     for example `{{\"input\":\"pwd\"}}`. Quote both the property name and string value; \
+     do not send `{{input:pwd}}`"
+)]
+pub struct InvalidFreeformFunctionInput {
+    #[source]
+    source: serde_json::Error,
 }
 
 /// Identifier that correlates a tool call with its result.
@@ -127,33 +165,13 @@ pub enum ToolFailure {
     Execution(String),
 }
 
-/// Presentation-specific tool result information.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolPresentation {
-    /// Short label displayed by a frontend.
-    pub label: String,
-    /// Optional structured display payload.
-    pub display: Option<String>,
-}
-
-/// Artifact produced by tool execution.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolArtifact {
-    /// Artifact name.
-    pub name: String,
-    /// Artifact content or locator.
-    pub value: String,
-}
-
 /// Result returned by tool execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolResult {
     /// Output supplied to the model.
     pub model_output: String,
-    /// Optional frontend presentation.
-    pub presentation: Option<ToolPresentation>,
-    /// Artifacts and metadata produced by the tool.
-    pub artifacts: Vec<ToolArtifact>,
+    /// Mandatory structured user-facing outcome.
+    pub outcome: ToolOutcome,
 }
 
 /// Capabilities exposed by a tool.
@@ -178,6 +196,41 @@ pub struct ToolDefinition {
     pub input_schema: ToolInputSchema,
     /// Execution capabilities.
     pub capabilities: ToolCapabilities,
+}
+
+impl ToolDefinition {
+    /// Returns model-facing instructions for representing this tool through a
+    /// JSON/function-call API.
+    ///
+    /// Freeform tools describe the JSON wrapper and repeat their complete
+    /// native contract at the function-description level because some
+    /// compatibility APIs do not preserve nested JSON Schema descriptions.
+    pub fn function_compatibility_description(&self) -> String {
+        let ToolInputSchema::FreeformGrammar { syntax, definition } = &self.input_schema else {
+            return self.description.clone();
+        };
+        let syntax = match syntax {
+            GrammarSyntax::Regex => "regex",
+            GrammarSyntax::Lark => "Lark",
+        };
+
+        format!(
+            "Execute the native `{}` tool through a JSON/function wrapper.\n\n\
+             Native tool instructions:\n{}\n\n\
+             Call this function with exactly one argument named `input`, whose value is a single \
+             JSON string containing the complete raw tool input. The decoded string must obey this \
+             {syntax} grammar:\n{definition}\n\n\
+             Function arguments must remain strict JSON even when emitted inside ChatML/XML tool-call \
+             syntax: double-quote the `input` property name and its string value. For example, use \
+             `{{\"name\":\"{}\",\"arguments\":{{\"input\":\"pwd\"}}}}`, not \
+             `{{name:{},arguments:{{input:pwd}}}}`.\n\n\
+             For multi-line raw inputs, encode line breaks as `\\n` inside the JSON string.",
+            self.name.as_str(),
+            self.description,
+            self.name.as_str(),
+            self.name.as_str(),
+        )
+    }
 }
 
 /// Native tool specification constructed by a tool module.
@@ -364,6 +417,18 @@ impl AvailabilityToolExecutor {
 }
 
 impl ToolExecutor for AvailabilityToolExecutor {
+    fn prepare(&self, request: ToolPreparationRequest) -> Result<ToolInvocation, ToolFailure> {
+        let enabled = self
+            .availability
+            .read()
+            .map(|policy| policy.is_enabled(request.tool.as_str()))
+            .unwrap_or(false);
+        if !enabled {
+            return Err(ToolFailure::Execution("tool is unavailable".to_owned()));
+        }
+        self.inner.prepare(request)
+    }
+
     fn execute(
         &self,
         request: ToolExecutionRequest,
@@ -376,13 +441,9 @@ impl ToolExecutor for AvailabilityToolExecutor {
             .map(|policy| policy.is_enabled(request.tool.as_str()))
             .unwrap_or(false);
         if !enabled {
-            return Box::pin(async {
-                Ok(ToolResult {
-                    model_output: "tool is unavailable.".to_owned(),
-                    presentation: None,
-                    artifacts: Vec::new(),
-                })
-            });
+            return Box::pin(std::future::ready(Err(ToolFailure::Execution(
+                "tool is unavailable".to_owned(),
+            ))));
         }
         self.inner.execute(request)
     }
@@ -472,7 +533,18 @@ pub struct ToolExecutionPolicy {
     pub cancellable: bool,
 }
 
-/// Input passed to an executor route.
+/// Raw input passed to a tool's mandatory preparation boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolPreparationRequest {
+    /// Advertised tool name.
+    pub tool: ToolName,
+    /// Executor route selected when the tool was registered.
+    pub route: ToolExecutorRoute,
+    /// Exact model-provided input.
+    pub input: ToolInput,
+}
+
+/// Prepared request passed to an executor route.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolExecutionRequest {
     /// Execution identity.
@@ -481,15 +553,18 @@ pub struct ToolExecutionRequest {
     pub tool: ToolName,
     /// Executor route selected when the tool was registered.
     pub route: ToolExecutorRoute,
-    /// Tool input.
-    pub input: ToolInput,
+    /// Invocation prepared exactly once before execution.
+    pub invocation: ToolInvocation,
     /// Execution policy.
     pub policy: ToolExecutionPolicy,
 }
 
-/// Provider-independent tool execution port.
+/// Provider-independent tool preparation and execution port.
 pub trait ToolExecutor: Send + Sync {
-    /// Executes one tool request under its explicit policy.
+    /// Parses one model-provided request into its mandatory display and execution form.
+    fn prepare(&self, request: ToolPreparationRequest) -> Result<ToolInvocation, ToolFailure>;
+
+    /// Executes one previously prepared tool request under its explicit policy.
     fn execute(
         &self,
         request: ToolExecutionRequest,

@@ -6,7 +6,7 @@
 mod ansi;
 mod layout;
 
-use std::{marker::PhantomData, ops::Range};
+use std::ops::Range;
 
 pub(crate) use layout::LaidOutLine;
 use ratatui::{
@@ -38,6 +38,12 @@ pub(crate) enum StyleId {
     Error,
     /// Active status text.
     Active,
+    /// Added source line in a filesystem diff.
+    DiffAdded,
+    /// Removed source line in a filesystem diff.
+    DiffRemoved,
+    /// Unchanged source line in a filesystem diff.
+    DiffContext,
     /// Queued steering text.
     Queued,
     /// Selected input text.
@@ -447,6 +453,9 @@ fn ratatui_style(style: StyleId) -> Style {
             .add_modifier(Modifier::DIM),
         StyleId::Error => Style::default().fg(Color::Rgb(218, 112, 112)),
         StyleId::Active => Style::default().fg(Color::Rgb(126, 162, 208)),
+        StyleId::DiffAdded => Style::default().fg(Color::Rgb(118, 188, 138)),
+        StyleId::DiffRemoved => Style::default().fg(Color::Rgb(218, 112, 112)),
+        StyleId::DiffContext => Style::default().fg(Color::Rgb(180, 186, 196)),
         StyleId::Queued => Style::default().fg(Color::Rgb(198, 164, 112)),
         StyleId::AssistantBold | StyleId::Bold => Style::default()
             .fg(Color::Rgb(220, 224, 232))

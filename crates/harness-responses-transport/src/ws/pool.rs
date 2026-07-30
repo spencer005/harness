@@ -131,7 +131,8 @@ impl ResponsesWsPool {
     ///
     /// The body is cloned, stamped with Codex client metadata, and forced to
     /// `generate: false` before transmission. Unauthorized handshakes refresh
-    /// ChatGPT auth once, and retryable transport failures reconnect once.
+    /// ChatGPT auth once, retryable transport failures reconnect once, and HTTP
+    /// 429 and HTTP 500 responses retry without an attempt limit.
     pub async fn prewarm(&self, request: ResponsesStreamRequest) -> Result<(), ResponsesApiError> {
         let mut refreshed = false;
         let mut reconnected = false;
@@ -146,6 +147,7 @@ impl ResponsesWsPool {
                     self.close_idle().await;
                     continue;
                 }
+                Err(err) if err.is_auto_retryable_http() => continue,
                 Err(err) => return Err(err),
             };
             self.start_active_connection(&request.headers).await;
@@ -168,6 +170,11 @@ impl ResponsesWsPool {
                         continue;
                     }
                     return Err(err);
+                }
+                Err(err) if err.is_auto_retryable_http() => {
+                    self.release(connection, &request.headers).await;
+                    self.finish_active_connection(&request.headers).await;
+                    continue;
                 }
                 Err(err) if err.requires_reconnect() && !reconnected => {
                     let _ = connection.close().await;
@@ -216,9 +223,9 @@ impl ResponsesWsPool {
     ///
     /// The pool sends the request over an idle socket when one is available,
     /// otherwise it opens a new socket subject to [`WsPoolConfig`] rate limits.
-    /// Unauthorized requests refresh ChatGPT auth once, retryable pre-response
-    /// transport failures reconnect once, and request-level HTTP error frames
-    /// return the socket to the idle queue when the backend keeps it open.
+    /// Unauthorized requests refresh ChatGPT auth once. Retryable pre-response
+    /// transport failures reconnect once. HTTP 429 and HTTP 500 responses retry
+    /// without an attempt limit, reusing the connection when it remains open.
     pub async fn stream_request<F, Fut>(
         &self,
         request: ResponsesStreamRequest,
@@ -240,6 +247,7 @@ impl ResponsesWsPool {
                     self.close_idle().await;
                     continue;
                 }
+                Err(err) if err.is_auto_retryable_http() => continue,
                 Err(err) => return Err(err),
             };
             self.start_active_connection(&request.headers).await;
@@ -262,6 +270,12 @@ impl ResponsesWsPool {
                     }
                     return Err(err);
                 }
+                Err(err) if err.is_auto_retryable_http() => {
+                    self.release(connection, &request.headers).await;
+                    self.finish_active_connection(&request.headers).await;
+                    continue;
+                }
+
                 Err(err) if err.requires_reconnect() && !reconnected => {
                     let _ = connection.close().await;
                     self.finish_active_connection(&request.headers).await;
@@ -665,4 +679,96 @@ impl ResponsesWsPool {
 
 fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use futures_util::{SinkExt, StreamExt};
+    use harness_responses_api::{
+        CodexHeaders, ResponsesStreamRequest, lean_codex_default_headers,
+    };
+    use http::StatusCode;
+    use sonic_rs::json;
+    use tokio::{net::TcpListener, sync::oneshot};
+    use tokio_tungstenite::{
+        accept_hdr_async,
+        tungstenite::{Message, handshake::server::Request as ServerRequest},
+    };
+
+    use super::*;
+
+    #[tokio::test]
+    async fn request_level_429_and_500_errors_continue_retrying() {
+        for status in [
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (messages_tx, messages_rx) = oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut ws =
+                    accept_hdr_async(stream, |_request: &ServerRequest, response| Ok(response))
+                        .await
+                        .unwrap();
+                let mut messages = Vec::new();
+                const FAILURES_BEFORE_SUCCESS: usize = 3;
+
+                for _ in 0..FAILURES_BEFORE_SUCCESS {
+                    let request = ws.next().await.unwrap().unwrap();
+                    let Message::Text(request) = request else {
+                        panic!("expected request text frame");
+                    };
+                    messages.push(request.to_string());
+                    ws.send(Message::Text(
+                        format!(
+                            r#"{{"type":"error","status":{},"error":{{"message":"retry"}}}}"#,
+                            status.as_u16()
+                        )
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+                }
+
+                let successful_request = ws.next().await.unwrap().unwrap();
+                let Message::Text(successful_request) = successful_request else {
+                    panic!("expected successful request text frame");
+                };
+                messages.push(successful_request.to_string());
+                ws.send(Message::Text(
+                    r#"{"type":"response.completed","response":{"id":"retry"}}"#.into(),
+                ))
+                .await
+                .unwrap();
+                messages_tx.send(messages).unwrap();
+            });
+
+            let pool = ResponsesWsPool::new(
+                ApiProvider::new(format!("ws://{addr}/codex")).unwrap(),
+                Auth::ApiKey("api-token".to_string()),
+                lean_codex_default_headers(),
+                WsPoolConfig {
+                    min_new_connection_interval: Duration::ZERO,
+                    connect_timeout: Duration::from_secs(1),
+                    ..Default::default()
+                },
+            );
+
+            pool.stream_request(
+                ResponsesStreamRequest {
+                    headers: CodexHeaders::for_thread("session", "thread", "thread:0"),
+                    body: json!({"type": "response.create", "model": "gpt-test"}),
+                },
+                |_event| std::future::ready(()),
+            )
+            .await
+            .unwrap();
+
+            let messages = messages_rx.await.unwrap();
+            assert_eq!(messages.len(), 4, "status {status}");
+            server.await.unwrap();
+        }
+    }
 }

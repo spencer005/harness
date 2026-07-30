@@ -1,14 +1,14 @@
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{future::Future, pin::Pin};
 
 use harness_tool_api::{
-    InvalidToolName, ToolCapabilities, ToolExecutionRequest, ToolExecutor, ToolFailure, ToolResult,
-    ToolSpec,
+    InvalidToolName, Prepared, ToolCapabilities, ToolExecutionRequest, ToolExecutor, ToolFailure,
+    ToolInvocation, ToolOutcome, ToolPreparationRequest, ToolResult, ToolSpec,
 };
 
-use super::{Manager, READ_NAME, failure, manager, output};
-use crate::{WorkspaceRoot, inventory::ToolRegistration};
+use super::{Manager, READ_NAME, manager, prepare_read, rejected_result};
+use crate::WorkspaceRoot;
 
-pub const DESCRIPTION: &str = "Read recent output from a running terminal. Use `terminal:` and optional `poll_after:` milliseconds.";
+pub const DESCRIPTION: &str = "Read recent output from a running terminal. Use `terminal:` and an optional `poll_after:` duration; values below 8s are treated as 8s, and the default is 8s.";
 pub const GRAMMAR: &str = include_str!("terminal_read.lark");
 pub struct ReadExecutor {
     manager: Manager,
@@ -21,23 +21,59 @@ impl ReadExecutor {
     }
 }
 impl ToolExecutor for ReadExecutor {
+    fn prepare(&self, request: ToolPreparationRequest) -> Result<ToolInvocation, ToolFailure> {
+        if request.tool.as_str() != READ_NAME || request.route.identifier != READ_NAME {
+            return Err(ToolFailure::Execution(format!(
+                "executor route does not match `{READ_NAME}` for tool {}",
+                request.tool.as_str()
+            )));
+        }
+        let input = match request.input.decode_freeform() {
+            Ok(input) => input,
+            Err(error) => {
+                return Ok(ToolInvocation::TerminalRead(Prepared::Rejected(
+                    harness_tool_api::ToolInputRejection {
+                        message: error.to_string(),
+                    },
+                )));
+            }
+        };
+        Ok(ToolInvocation::TerminalRead(match prepare_read(&input) {
+            Ok(prepared) => Prepared::Ready(prepared),
+            Err(message) => Prepared::Rejected(harness_tool_api::ToolInputRejection { message }),
+        }))
+    }
+
     fn execute(
         &self,
         request: ToolExecutionRequest,
     ) -> Pin<Box<dyn Future<Output = Result<ToolResult, ToolFailure>> + Send + '_>> {
         let manager = self.manager.clone();
-        let input = request.input.as_str().to_owned();
         Box::pin(async move {
-            let result = tokio::task::spawn_blocking(move || manager.read(&input))
+            let prepared = match request.invocation {
+                ToolInvocation::TerminalRead(Prepared::Ready(prepared)) => prepared,
+                ToolInvocation::TerminalRead(Prepared::Rejected(rejection)) => {
+                    return Ok(rejected_result(rejection.message));
+                }
+                invocation => {
+                    return Err(ToolFailure::Execution(format!(
+                        "`{READ_NAME}` received prepared invocation for `{}`",
+                        invocation.tool().name()
+                    )));
+                }
+            };
+            let result = tokio::task::spawn_blocking(move || manager.read(&prepared))
                 .await
-                .map_err(|e| ToolFailure::Execution(e.to_string()))?;
-            match result {
-                Ok(text) => Ok(output(text, READ_NAME)),
-                Err(error) => failure(error),
-            }
+                .map_err(|e| ToolFailure::Execution(e.to_string()))?
+                .map_err(ToolFailure::Execution)?;
+            Ok(ToolResult {
+                model_output: result.model,
+                outcome: ToolOutcome::TerminalRead(result.result),
+            })
         })
     }
 }
+
 pub fn spec() -> Result<ToolSpec, InvalidToolName> {
     Ok(ToolSpec::new(READ_NAME)?
         .description(DESCRIPTION)
@@ -48,7 +84,3 @@ pub fn spec() -> Result<ToolSpec, InvalidToolName> {
             idempotent: true,
         }))
 }
-pub fn registration(workspace: WorkspaceRoot) -> Arc<dyn ToolExecutor> {
-    Arc::new(ReadExecutor::new(workspace))
-}
-::inventory::submit! { ToolRegistration { spec, executor: registration } }

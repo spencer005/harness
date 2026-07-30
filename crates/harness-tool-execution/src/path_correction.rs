@@ -9,7 +9,9 @@
 //! 3. Ranking candidates by edit distance.
 //! 4. Listing directory contents for additional context.
 
-use std::path::Path;
+use std::{collections::BinaryHeap, path::Path};
+
+const DIRECTORY_LISTING_LIMIT: usize = 25;
 
 /// Result of a path correction attempt.
 pub struct Correction {
@@ -17,8 +19,10 @@ pub struct Correction {
     pub suggested: String,
     /// The deepest existing directory prefix (relative to workspace).
     pub deepest_prefix: String,
-    /// Listing of the deepest existing directory for context.
+    /// Sorted entries retained from the deepest existing directory.
     pub listing: Vec<String>,
+    /// Number of additional directory entries omitted from `listing`.
+    pub omitted_entries: usize,
 }
 
 /// If `requested` does not exist under `workspace_root`, attempt to suggest a
@@ -68,8 +72,8 @@ pub fn suggest_correction(workspace_root: &Path, requested: &str) -> Option<Corr
     candidates.dedup();
     candidates.sort_by_key(|(dist, _)| *dist);
 
-    // Collect a simple directory listing of the prefix for context.
-    let listing = list_directory(&abs_prefix, &existing_prefix);
+    // Retain a bounded directory listing for diagnostic context.
+    let (listing, omitted_entries) = list_directory(&abs_prefix, &existing_prefix);
 
     // Prepend the existing prefix to get the full relative path from workspace.
     candidates.into_iter().next().map(|(_, rel)| {
@@ -80,8 +84,13 @@ pub fn suggest_correction(workspace_root: &Path, requested: &str) -> Option<Corr
         };
         Correction {
             suggested,
-            deepest_prefix: existing_prefix,
+            deepest_prefix: if existing_prefix.is_empty() {
+                ".".to_owned()
+            } else {
+                existing_prefix
+            },
             listing,
+            omitted_entries,
         }
     })
 }
@@ -161,34 +170,42 @@ fn walk_files(
     }
 }
 
-/// Generate a simple sorted directory listing.
-fn list_directory(abs_path: &Path, prefix: &str) -> Vec<String> {
+/// Generate a bounded, sorted directory listing and count omitted entries.
+fn list_directory(abs_path: &Path, prefix: &str) -> (Vec<String>, usize) {
     let Ok(entries) = std::fs::read_dir(abs_path) else {
-        return Vec::new();
+        return (Vec::new(), 0);
     };
 
-    let mut listing: Vec<String> = entries
-        .flatten()
-        .filter_map(|entry| {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with('.') {
-                return None;
-            }
-            let path_str = if prefix.is_empty() {
-                name.clone()
-            } else {
-                format!("{prefix}/{name}")
-            };
-            let is_dir = entry.file_type().ok().map(|t| t.is_dir()).unwrap_or(false);
-            Some(if is_dir {
-                format!("{path_str}/")
-            } else {
-                path_str
-            })
-        })
-        .collect();
+    let mut retained = BinaryHeap::new();
+    let mut total = 0usize;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        let path_str = if prefix.is_empty() {
+            name
+        } else {
+            format!("{prefix}/{name}")
+        };
+        let is_dir = entry.file_type().ok().is_some_and(|kind| kind.is_dir());
+        let rendered = if is_dir {
+            format!("{path_str}/")
+        } else {
+            path_str
+        };
+
+        total += 1;
+        retained.push(rendered);
+        if retained.len() > DIRECTORY_LISTING_LIMIT {
+            retained.pop();
+        }
+    }
+
+    let mut listing = retained.into_vec();
     listing.sort();
-    listing
+    let omitted = total.saturating_sub(listing.len());
+    (listing, omitted)
 }
 
 /// Compute Levenshtein distance between two strings.
@@ -267,11 +284,11 @@ mod tests {
         std::fs::write(tmp.join("a.txt"), "").unwrap();
         std::fs::write(tmp.join("b.rs"), "").unwrap();
 
-        let listing = list_directory(&tmp, "");
+        let (listing, omitted) = list_directory(&tmp, "");
         assert!(listing.contains(&"a.txt".to_string()));
         assert!(listing.contains(&"b.rs".to_string()));
         assert!(listing.contains(&"sub/".to_string()));
-
+        assert_eq!(omitted, 0);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -282,9 +299,28 @@ mod tests {
         std::fs::create_dir_all(tmp.join("src")).unwrap();
         std::fs::write(tmp.join("lib.rs"), "").unwrap();
 
-        let listing = list_directory(&tmp, "project/src");
+        let (listing, omitted) = list_directory(&tmp, "project/src");
         assert!(listing.contains(&"project/src/lib.rs".to_string()));
+        assert_eq!(omitted, 0);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 
+    #[test]
+    fn correction_listing_is_bounded_and_reports_omitted_entries() {
+        let tmp = std::env::temp_dir().join(format!("harness-path-bounded-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        for index in 0..40 {
+            std::fs::write(tmp.join(format!("file-{index:02}.txt")), "").unwrap();
+        }
+
+        let correction = suggest_correction(&tmp, "file-99.txt").unwrap();
+
+        assert_eq!(correction.deepest_prefix, ".");
+        assert_eq!(correction.listing.len(), DIRECTORY_LISTING_LIMIT);
+        assert_eq!(correction.omitted_entries, 15);
+        assert_eq!(correction.listing.first().unwrap(), "file-00.txt");
+        assert_eq!(correction.listing.last().unwrap(), "file-24.txt");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

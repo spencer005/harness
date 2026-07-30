@@ -415,6 +415,8 @@ pub enum ModelEvent {
     ReasoningSummaryDelta(String),
     /// Incremental raw reasoning content text.
     ReasoningContentDelta(String),
+    /// A reasoning output item starts.
+    ReasoningStarted,
     /// Completed reasoning item metadata.
     ReasoningItem(ModelReasoning),
     /// Incremental tool input.

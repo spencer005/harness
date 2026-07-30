@@ -34,56 +34,46 @@ impl ExternalText {
     }
 }
 
-/// Invocation encoding used by a tool call.
+/// Model-facing encoding retained separately from typed invocation data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToolInvocationKind {
-    /// Freeform tool input.
+pub enum ToolInputEncoding {
     Freeform,
-    /// JSON/function arguments.
-    Function,
-    /// Persisted input whose original encoding was not recorded.
+    FunctionJson,
     Unspecified,
 }
 
-/// Structured display data for a tool output.
+/// One persistent typed tool activity.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ToolOutputDisplay {
-    /// Source snippets returned by the inspect tool.
-    InspectRead(Vec<InspectReadDisplay>),
+pub struct ToolActivity {
+    /// Runtime correlation identifier.
+    pub call_id: ExternalText,
+    /// Parsed invocation used by compact and detail renderers.
+    pub invocation: harness_tool_api::ToolInvocation,
+    /// Exact model-provided input retained outside typed display data.
+    pub raw_input: ExternalText,
+    /// Encoding of the exact model-provided input.
+    pub raw_input_encoding: ToolInputEncoding,
+    /// Running or completed activity data.
+    pub phase: ToolActivityPhase,
 }
 
-/// One source snippet returned by an inspect read.
+/// Frontend-owned representation of valid tool activity phases.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InspectReadDisplay {
-    /// Untrusted displayed path.
-    pub path: ExternalText,
-    /// First source line represented by `lines`.
-    pub start_line: usize,
-    /// Untrusted source lines.
-    pub lines: Vec<ExternalText>,
-    /// Optional continuation range.
-    pub next: Option<InspectReadNext>,
-}
-
-/// Continuation location for an inspect read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct InspectReadNext {
-    /// First unread source line.
-    pub start_line: usize,
-    /// Suggested continuation line count.
-    pub line_count: usize,
-}
-
-/// Encoding and structured presentation data for a tool output.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ToolOutputKind {
-    /// Freeform output with optional structured transcript display.
-    Freeform {
-        /// Structured display supplied by the runtime.
-        display: Option<ToolOutputDisplay>,
+pub enum ToolActivityPhase {
+    Running,
+    Finished {
+        outcome: harness_tool_api::ToolOutcome,
+        raw_output: ExternalText,
     },
-    /// JSON/function output.
-    Function,
+}
+
+impl ToolActivity {
+    pub fn status(&self) -> harness_tool_api::ToolActivityStatus {
+        match &self.phase {
+            ToolActivityPhase::Running => harness_tool_api::ToolActivityStatus::Running,
+            ToolActivityPhase::Finished { outcome, .. } => outcome.status(),
+        }
+    }
 }
 
 /// Semantic transcript payload independent of terminal presentation.
@@ -107,28 +97,8 @@ pub enum TranscriptPayload {
         /// Original failure detail.
         message: ExternalText,
     },
-    /// Native tool invocation.
-    ToolCall {
-        /// Runtime correlation identifier.
-        call_id: ExternalText,
-        /// Untrusted tool name.
-        name: ExternalText,
-        /// Untrusted tool input.
-        input: ExternalText,
-        /// Invocation encoding.
-        kind: ToolInvocationKind,
-    },
-    /// Native tool result.
-    ToolOutput {
-        /// Runtime correlation identifier.
-        call_id: ExternalText,
-        /// Output returned to the model.
-        output: ExternalText,
-        /// Optional transcript-specific output.
-        display_output: Option<ExternalText>,
-        /// Output encoding and structured presentation data.
-        kind: ToolOutputKind,
-    },
+    /// One persistent typed tool activity.
+    ToolActivity(ToolActivity),
     /// Typed session-close event.
     SessionClosed {
         /// Session close time as Unix milliseconds.
@@ -352,6 +322,8 @@ pub(crate) struct PersistedTranscriptEntry {
 pub(crate) enum DomainEvent {
     /// One transcript entry was appended.
     AppendTranscript(TranscriptSnapshotEntry),
+    /// A previously appended tool activity changes state.
+    ToolActivityChanged(ToolActivity),
     /// One page of older transcript entries was loaded.
     TranscriptPage {
         /// Sequence-numbered displayable entries.
@@ -363,12 +335,10 @@ pub(crate) enum DomainEvent {
     },
     /// Complete replacement transcript after an active-session switch.
     ReplaceTranscript(Vec<TranscriptSnapshotEntry>),
-    /// Persisted sequences are assigned to active streamed entries.
+    /// Persisted sequences are assigned to streamed response blocks in display order.
     TranscriptCommitted {
-        /// Sequence assigned to the reasoning entry, when present.
-        reasoning_sequence: Option<u64>,
-        /// Sequence assigned to the assistant message entry.
-        assistant_sequence: u64,
+        /// Sequences for non-empty thinking and assistant blocks.
+        sequences: Vec<u64>,
     },
     /// The active session changed.
     SessionChanged(ExternalText),
@@ -392,6 +362,8 @@ pub(crate) enum DomainEvent {
     AssistantFirstToken(u64),
     /// Assistant text was appended to the active stream.
     AssistantTextDelta(ExternalText),
+    /// A reasoning output block starts.
+    ThinkingBlockStarted,
     /// Reasoning text was appended to the active thinking block.
     ThinkingDelta(ExternalText),
     /// Assistant streaming completed.
@@ -404,8 +376,14 @@ pub(crate) enum DomainEvent {
     AgentRemoved(AgentId),
     /// A compaction operation started.
     CompactionStarted,
+    /// Compaction summary text was appended to the active compaction stream.
+    CompactionDelta(ExternalText),
     /// A compaction operation completed.
     CompactionCompleted(ExternalText),
+    /// A compaction operation failed while remaining available for redo.
+    CompactionFailed(ExternalText),
+    /// A staged compaction operation was cancelled.
+    CompactionCancelled,
     /// Runtime steering queue state changed.
     SteeringChanged(Option<ExternalText>),
     /// A background activity changed.
@@ -429,6 +407,9 @@ pub(crate) enum DomainEvent {
 pub(crate) enum RuntimeRequest {
     /// Submit a new user or developer prompt.
     SubmitInput { text: String },
+    /// Execute slash-command text outside the conversation input stream.
+    ExecuteCommand { text: String },
+
     /// Queue steering for the current turn.
     QueueSteering { text: String },
     /// Retry the latest durable user or tool turn.

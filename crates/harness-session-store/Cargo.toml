@@ -6,4 +6,5 @@ version.workspace = true
 
 [dependencies]
 thiserror.workspace = true
+harness-tool-api.workspace = true
 

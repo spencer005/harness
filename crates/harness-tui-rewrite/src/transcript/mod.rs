@@ -22,12 +22,20 @@ pub(crate) enum TranscriptError {
     DeltaOutsideStream,
     StreamAlreadyActive,
     CompletionOutsideStream,
+    CompactionStreamAlreadyActive,
+    CompactionDeltaOutsideStream,
+    CompactionCompletionOutsideStream,
     ConflictingSequence(u64),
+    StreamCommitEntryCount {
+        streamed: usize,
+        persisted: usize,
+    },
     PageCursorDidNotAdvance {
         requested_before: Option<u64>,
         next_before_sequence: Option<u64>,
     },
     PageContainsNoNewEntries,
+    ToolActivityNotFound(String),
 }
 
 impl std::fmt::Display for TranscriptError {
@@ -54,6 +62,18 @@ impl std::fmt::Display for TranscriptError {
                  The runtime must emit `ResponseStarted` before it can be completed.\n\
                  Ensure the model adapter does not emit duplicate completions or omit starts."
             ),
+            Self::CompactionStreamAlreadyActive => write!(
+                f,
+                "received `CompactionStarted` while a compaction stream was already active"
+            ),
+            Self::CompactionDeltaOutsideStream => write!(
+                f,
+                "received `CompactionDelta` while no compaction stream was active"
+            ),
+            Self::CompactionCompletionOutsideStream => write!(
+                f,
+                "received a compaction terminal event while no compaction stream was active"
+            ),
             Self::ConflictingSequence(seq) => write!(
                 f,
                 "received a transcript payload claiming sequence {}, which is already present.\n\
@@ -61,6 +81,17 @@ impl std::fmt::Display for TranscriptError {
                  The runtime must assign a new unique sequence number to every persisted entry.\n\
                  Ensure the storage backend correctly increments the session sequence.",
                 seq
+            ),
+            Self::StreamCommitEntryCount {
+                streamed,
+                persisted,
+            } => write!(
+                f,
+                "received {} persisted response sequences for {} streamed transcript blocks.\n\
+                 This is invalid because every non-empty streamed block must map to exactly one durable record.\n\
+                 The runtime must preserve response-block order and emit one sequence per displayed block.\n\
+                 Ensure response persistence and transcript streaming use the same block boundaries.",
+                persisted, streamed
             ),
             Self::PageCursorDidNotAdvance {
                 requested_before,
@@ -80,6 +111,10 @@ impl std::fmt::Display for TranscriptError {
                  This is invalid because a page must expose older history if it did not reach the start.\n\
                  The runtime must return entries strictly older than the requested sequence bound.\n\
                  Ensure the storage backend correctly implements the sequence inequality."
+            ),
+            Self::ToolActivityNotFound(call_id) => write!(
+                f,
+                "received an update for tool activity `{call_id}`, but no matching activity exists"
             ),
         }
     }
@@ -134,19 +169,33 @@ enum ViewportState {
     Anchored(TranscriptViewportAnchor),
 }
 
-/// Runtime assistant-stream state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AssistantStream {
-    Idle,
-    Active { entry: Option<TranscriptEntryId> },
+enum StreamBlockKind {
+    Assistant,
+    Thinking,
 }
 
-/// Runtime reasoning-summary stream state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ThinkingStream {
-    Idle,
-    Active { entry: Option<TranscriptEntryId> },
+#[derive(Debug, Clone, Copy)]
+struct StreamBlock {
+    kind: StreamBlockKind,
+    entry: TranscriptEntryId,
 }
+
+/// Ordered state for one streamed response.
+#[derive(Debug)]
+enum ResponseStream {
+    Idle,
+    Active {
+        current: Option<StreamBlock>,
+        entries: Vec<TranscriptEntryId>,
+    },
+}
+#[derive(Debug, Clone, Copy)]
+struct CompactionStream {
+    entry: TranscriptEntryId,
+    has_output: bool,
+}
+
 
 /// Persisted history request state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,6 +217,8 @@ pub(crate) enum TranscriptViewportLine {
         line: LaidOutLine,
         /// Selected local byte range applied by the backend.
         selection: Option<Range<usize>>,
+        /// Whether the first two cells expose this tool entry's disclosure control.
+        tool_disclosure: bool,
     },
     /// Synthetic non-selectable separator between entries.
     Separator,
@@ -198,6 +249,22 @@ impl TranscriptViewport {
                 byte,
             })
     }
+    /// Resolves a click on a tool disclosure marker to its stable entry.
+    pub(crate) fn tool_disclosure_at(
+        &self,
+        row: usize,
+        cell: usize,
+    ) -> Option<TranscriptEntryId> {
+        let TranscriptViewportLine::Entry {
+            entry,
+            tool_disclosure: true,
+            ..
+        } = self.lines.get(row)?
+        else {
+            return None;
+        };
+        (cell < 2).then_some(*entry)
+    }
 }
 
 /// Transcript aggregate with exclusive ownership of every transcript concern.
@@ -207,8 +274,8 @@ pub(crate) struct Transcript {
     layout: TranscriptLayoutCache,
     viewport: ViewportState,
     selection: Option<TranscriptSelection>,
-    stream: AssistantStream,
-    thinking: ThinkingStream,
+    stream: ResponseStream,
+    compaction: Option<CompactionStream>,
     page_request: PageRequestState,
     before_sequence: Option<u64>,
 }
@@ -226,11 +293,14 @@ impl Transcript {
             viewport: ViewportState::FollowingTail,
             selection: None,
             stream: if response_streaming {
-                AssistantStream::Active { entry: None }
+                ResponseStream::Active {
+                    current: None,
+                    entries: Vec::new(),
+                }
             } else {
-                AssistantStream::Idle
+                ResponseStream::Idle
             },
-            thinking: ThinkingStream::Idle,
+            compaction: None,
             page_request: PageRequestState::Idle,
             before_sequence,
         })
@@ -257,11 +327,13 @@ impl Transcript {
     }
 
     pub(crate) fn begin_response_stream(&mut self) -> Result<(), TranscriptError> {
-        if self.stream != AssistantStream::Idle {
+        if !matches!(self.stream, ResponseStream::Idle) {
             return Err(TranscriptError::StreamAlreadyActive);
         }
-        self.stream = AssistantStream::Active { entry: None };
-        self.thinking = ThinkingStream::Active { entry: None };
+        self.stream = ResponseStream::Active {
+            current: None,
+            entries: Vec::new(),
+        };
         Ok(())
     }
 
@@ -269,41 +341,85 @@ impl Transcript {
         &mut self,
         delta: crate::domain::ExternalText,
     ) -> Result<(), TranscriptError> {
-        let entry = match self.stream {
-            AssistantStream::Active { entry: Some(entry) } => {
-                self.document.append_assistant_text(entry, &delta);
-                entry
+        if delta.as_str().is_empty() {
+            return match self.stream {
+                ResponseStream::Active { .. } => Ok(()),
+                ResponseStream::Idle => Err(TranscriptError::DeltaOutsideStream),
+            };
+        }
+        let entry = match &mut self.stream {
+            ResponseStream::Active {
+                current:
+                    Some(StreamBlock {
+                        kind: StreamBlockKind::Assistant,
+                        entry,
+                    }),
+                ..
+            } => {
+                self.document.append_assistant_text(*entry, &delta);
+                *entry
             }
-            AssistantStream::Active { entry: None } => {
+            ResponseStream::Active { current, entries } => {
                 let entry = self.document.push(TranscriptPayload::Message {
                     role: crate::domain::MessageRole::Assistant,
                     text: delta,
                 });
-                self.stream = AssistantStream::Active { entry: Some(entry) };
+                *current = Some(StreamBlock {
+                    kind: StreamBlockKind::Assistant,
+                    entry,
+                });
+                entries.push(entry);
                 entry
             }
-            AssistantStream::Idle => return Err(TranscriptError::DeltaOutsideStream),
+            ResponseStream::Idle => return Err(TranscriptError::DeltaOutsideStream),
         };
         self.layout.invalidate_entry(entry);
         self.after_tail_mutation();
         Ok(())
     }
 
+    pub(crate) fn start_thinking_block(&mut self) -> Result<(), TranscriptError> {
+        match &mut self.stream {
+            ResponseStream::Active { current, .. } => {
+                *current = None;
+                Ok(())
+            }
+            ResponseStream::Idle => Err(TranscriptError::DeltaOutsideStream),
+        }
+    }
+
     pub(crate) fn append_thinking_delta(
         &mut self,
         delta: crate::domain::ExternalText,
     ) -> Result<(), TranscriptError> {
-        let entry = match self.thinking {
-            ThinkingStream::Active { entry: Some(entry) } => {
-                self.document.append_thinking_text(entry, &delta);
-                entry
+        if delta.as_str().is_empty() {
+            return match self.stream {
+                ResponseStream::Active { .. } => Ok(()),
+                ResponseStream::Idle => Err(TranscriptError::DeltaOutsideStream),
+            };
+        }
+        let entry = match &mut self.stream {
+            ResponseStream::Active {
+                current:
+                    Some(StreamBlock {
+                        kind: StreamBlockKind::Thinking,
+                        entry,
+                    }),
+                ..
+            } => {
+                self.document.append_thinking_text(*entry, &delta);
+                *entry
             }
-            ThinkingStream::Active { entry: None } => {
+            ResponseStream::Active { current, entries } => {
                 let entry = self.document.push(TranscriptPayload::Thinking(delta));
-                self.thinking = ThinkingStream::Active { entry: Some(entry) };
+                *current = Some(StreamBlock {
+                    kind: StreamBlockKind::Thinking,
+                    entry,
+                });
+                entries.push(entry);
                 entry
             }
-            ThinkingStream::Idle => return Err(TranscriptError::DeltaOutsideStream),
+            ResponseStream::Idle => return Err(TranscriptError::DeltaOutsideStream),
         };
         self.layout.invalidate_entry(entry);
         self.after_tail_mutation();
@@ -311,13 +427,64 @@ impl Transcript {
     }
 
     pub(crate) fn complete_response_stream(&mut self) -> Result<(), TranscriptError> {
-        if self.stream == AssistantStream::Idle {
+        if matches!(self.stream, ResponseStream::Idle) {
             return Err(TranscriptError::CompletionOutsideStream);
         }
-        self.stream = AssistantStream::Idle;
-        self.thinking = ThinkingStream::Idle;
+        self.stream = ResponseStream::Idle;
         Ok(())
     }
+    pub(crate) fn begin_compaction_stream(&mut self) -> Result<(), TranscriptError> {
+        if self.compaction.is_some() {
+            return Err(TranscriptError::CompactionStreamAlreadyActive);
+        }
+        let entry = self
+            .document
+            .push(TranscriptPayload::Event(crate::domain::ExternalText::new(
+                "compact: ".to_owned(),
+            )));
+        self.compaction = Some(CompactionStream {
+            entry,
+            has_output: false,
+        });
+        self.after_tail_mutation();
+        Ok(())
+    }
+
+    pub(crate) fn append_compaction_delta(
+        &mut self,
+        delta: crate::domain::ExternalText,
+    ) -> Result<(), TranscriptError> {
+        let Some(compaction) = self.compaction.as_mut() else {
+            return Err(TranscriptError::CompactionDeltaOutsideStream);
+        };
+        if delta.as_str().is_empty() {
+            return Ok(());
+        }
+        compaction.has_output = true;
+        let entry = compaction.entry;
+        self.document.append_event_text(entry, &delta);
+        self.layout.invalidate_entry(entry);
+        self.after_tail_mutation();
+        Ok(())
+    }
+
+    pub(crate) fn finish_compaction_stream(
+        &mut self,
+        fallback: crate::domain::ExternalText,
+    ) -> Result<(), TranscriptError> {
+        let compaction = self
+            .compaction
+            .take()
+            .ok_or(TranscriptError::CompactionCompletionOutsideStream)?;
+        if !compaction.has_output && !fallback.as_str().is_empty() {
+            self.document
+                .append_event_text(compaction.entry, &fallback);
+            self.layout.invalidate_entry(compaction.entry);
+            self.after_tail_mutation();
+        }
+        Ok(())
+    }
+
 
     /// Appends one semantic transcript payload without persisted identity.
     pub(crate) fn append(&mut self, payload: TranscriptPayload) -> TranscriptEntryId {
@@ -334,24 +501,46 @@ impl Transcript {
         self.after_tail_mutation();
         Ok(id)
     }
-
-    pub(crate) fn reconcile_commit(
+    pub(crate) fn update_tool_activity(
         &mut self,
-        reasoning_sequence: Option<u64>,
-        assistant_sequence: u64,
+        activity: crate::domain::ToolActivity,
     ) -> Result<(), TranscriptError> {
-        let mut attached = false;
-        if let Some(sequence) = reasoning_sequence
-            && let ThinkingStream::Active { entry: Some(id) } = self.thinking
-        {
-            self.document.attach_sequence(id, sequence)?;
-            attached = true;
+        let call_id = activity.call_id.as_str().to_owned();
+        let entry = self
+            .document
+            .update_tool_activity(activity)
+            .ok_or(TranscriptError::ToolActivityNotFound(call_id))?;
+        self.layout.invalidate_entry(entry);
+        self.after_tail_mutation();
+        Ok(())
+    }
+
+    pub(crate) fn toggle_tool_activity(
+        &mut self,
+        entry: TranscriptEntryId,
+    ) -> bool {
+        if self.document.toggle_tool_activity(entry).is_none() {
+            return false;
         }
-        if let AssistantStream::Active { entry: Some(id) } = self.stream {
-            self.document.attach_sequence(id, assistant_sequence)?;
-            attached = true;
+        self.selection = None;
+        self.layout.invalidate_entry(entry);
+        self.after_tail_mutation();
+        true
+    }
+
+
+    pub(crate) fn reconcile_commit(&mut self, sequences: Vec<u64>) -> Result<(), TranscriptError> {
+        let ResponseStream::Active { entries, .. } = &self.stream else {
+            return Err(TranscriptError::CompletionOutsideStream);
+        };
+        if entries.len() != sequences.len() {
+            return Err(TranscriptError::StreamCommitEntryCount {
+                streamed: entries.len(),
+                persisted: sequences.len(),
+            });
         }
-        if attached {
+        self.document.attach_sequences(entries, &sequences)?;
+        if !entries.is_empty() {
             self.layout.invalidate_document();
         }
         Ok(())
@@ -396,8 +585,7 @@ impl Transcript {
             self.layout = TranscriptLayoutCache::default();
             self.viewport = ViewportState::FollowingTail;
             self.selection = None;
-            self.stream = AssistantStream::Idle;
-            self.thinking = ThinkingStream::Idle;
+            self.stream = ResponseStream::Idle;
             self.page_request = PageRequestState::ReachedStart;
             self.before_sequence = None;
             return Ok(());
@@ -531,11 +719,22 @@ impl Transcript {
                         .entry_line(entry, line_index)
                         .expect("layout reference resolves to a cached entry line")
                         .clone();
+                    let tool_disclosure = line_index == 0
+                        && matches!(
+                            self.document.entry(entry).map(|entry| entry.payload()),
+                            Some(TranscriptPayload::ToolActivity(activity))
+                                if !matches!(
+                                    activity.invocation.tool(),
+                                    harness_tool_api::BuiltInTool::Inspect
+                                        | harness_tool_api::BuiltInTool::EditFile
+                                )
+                        );
                     let selection = self.selection_range_for_entry(entry);
                     lines.push(TranscriptViewportLine::Entry {
                         entry,
                         line,
                         selection,
+                        tool_disclosure,
                     });
                 }
             }
@@ -696,6 +895,46 @@ mod tests {
         TranscriptPayload::Message {
             role: MessageRole::Assistant,
             text: ExternalText::new(text),
+        }
+    }
+    #[test]
+    fn direct_tool_activities_do_not_expose_disclosure_hit_targets() {
+        let inspect = TranscriptPayload::ToolActivity(crate::domain::ToolActivity {
+            call_id: ExternalText::new("call-inspect"),
+            invocation: harness_tool_api::ToolInvocation::Inspect(
+                harness_tool_api::Prepared::Ready(harness_tool_api::InspectRequest {
+                    jobs: vec![harness_tool_api::InspectJobRequest::Pwd],
+                }),
+            ),
+            raw_input: ExternalText::new("pwd"),
+            raw_input_encoding: crate::domain::ToolInputEncoding::Freeform,
+            phase: crate::domain::ToolActivityPhase::Running,
+        });
+        let edit = TranscriptPayload::ToolActivity(crate::domain::ToolActivity {
+            call_id: ExternalText::new("call-edit"),
+            invocation: harness_tool_api::ToolInvocation::EditFile(
+                harness_tool_api::Prepared::Ready(harness_tool_api::EditFileRequest {
+                    operations: vec![harness_tool_api::EditOperation::Remove {
+                        path: "stale.txt".to_owned(),
+                    }],
+                }),
+            ),
+            raw_input: ExternalText::new("remove stale.txt"),
+            raw_input_encoding: crate::domain::ToolInputEncoding::Freeform,
+            phase: crate::domain::ToolActivityPhase::Running,
+        });
+
+        for payload in [inspect, edit] {
+            let mut transcript = Transcript::import(
+                vec![TranscriptSnapshotEntry {
+                    sequence: None,
+                    payload,
+                }],
+                false,
+            )
+            .unwrap();
+            let viewport = transcript.viewport(80, 10);
+            assert!(viewport.tool_disclosure_at(0, 0).is_none());
         }
     }
 
@@ -919,6 +1158,65 @@ mod tests {
         );
         let wider = transcript.viewport(8, 1);
         assert!(viewport_first_line_text(&wider).contains('g'));
+    }
+
+    #[test]
+    fn older_accepted_record_coalesces_into_visible_finished_activity() {
+        let invocation = harness_tool_api::ToolInvocation::Goal(
+            harness_tool_api::Prepared::Ready(harness_tool_api::GoalRequest),
+        );
+        let mut transcript = Transcript::import(
+            vec![TranscriptSnapshotEntry {
+                sequence: Some(2),
+                payload: TranscriptPayload::ToolActivity(crate::domain::ToolActivity {
+                    call_id: ExternalText::new("call-1"),
+                    invocation: invocation.clone(),
+                    raw_input: ExternalText::new("complete"),
+                    raw_input_encoding: crate::domain::ToolInputEncoding::Freeform,
+                    phase: crate::domain::ToolActivityPhase::Finished {
+                        outcome: harness_tool_api::ToolOutcome::Goal(
+                            harness_tool_api::GoalResult,
+                        ),
+                        raw_output: ExternalText::new("Goal completed."),
+                    },
+                }),
+            }],
+            false,
+        )
+        .unwrap();
+        let finished_entry = transcript.entries().next().unwrap().id();
+        assert!(transcript.toggle_tool_activity(finished_entry));
+
+        transcript.scroll_to_top(80, 20);
+        assert!(transcript.request_older_page(80, 20).is_some());
+        transcript
+            .apply_page(
+                vec![PersistedTranscriptEntry {
+                    sequence: 1,
+                    payload: TranscriptPayload::ToolActivity(crate::domain::ToolActivity {
+                        call_id: ExternalText::new("call-1"),
+                        invocation,
+                        raw_input: ExternalText::new("complete"),
+                        raw_input_encoding: crate::domain::ToolInputEncoding::Freeform,
+                        phase: crate::domain::ToolActivityPhase::Running,
+                    }),
+                }],
+                None,
+                true,
+            )
+            .unwrap();
+
+        let entries = transcript.entries().collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id(), finished_entry);
+        assert!(entries[0].tool_expanded());
+        assert!(matches!(
+            entries[0].payload(),
+            TranscriptPayload::ToolActivity(crate::domain::ToolActivity {
+                phase: crate::domain::ToolActivityPhase::Finished { .. },
+                ..
+            })
+        ));
     }
 
     #[test]

@@ -17,7 +17,7 @@ use crate::{
     domain::{DomainEvent, ExternalText},
     input::{HorizontalUnit, InputFragment, RawInput, VerticalDirection},
     terminal::TerminalSession,
-    view::{PreparedFrame, prepare},
+    view::PreparedFrame,
 };
 
 /// Maximum mailbox events reduced between terminal frame preparations.
@@ -40,8 +40,7 @@ pub async fn run_with_runtime(
 
         while !application.should_exit() {
             let now = std::time::Instant::now();
-            let frame = prepare(&mut application, terminal.area()?, now);
-            terminal.draw(&frame)?;
+            let frame = terminal.draw(&mut application, now)?;
             let next_visual_change = application.next_visual_change_in(now);
 
             let effects = tokio::select! {
@@ -79,8 +78,7 @@ pub async fn run_with_runtime(
 
             // Immediately render updated state if runtime events altered the application
             let post_now = std::time::Instant::now();
-            let post_frame = prepare(&mut application, terminal.area()?, post_now);
-            terminal.draw(&post_frame)?;
+            terminal.draw(&mut application, post_now)?;
         }
     }
 
@@ -338,6 +336,8 @@ fn route_mouse_event(
                     top_line,
                     thumb_offset,
                 })
+            } else if let Some(entry) = frame.transcript_tool_disclosure(pos) {
+                Some(UserCommand::ToggleToolActivity { entry })
             } else if let Some(position) = frame.prompt_position(pos) {
                 Some(UserCommand::BeginPromptSelection { position })
             } else if frame.transcript_contains(pos) {
@@ -522,6 +522,7 @@ async fn execute_effects(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::view::prepare;
 
     #[test]
     fn pasted_control_text_is_preserved_for_editor_insertion() {
@@ -608,6 +609,71 @@ mod tests {
             active_activity_ids: Vec::new(),
         })
         .unwrap()
+    }
+
+    #[test]
+    fn disclosure_marker_click_toggles_tool_detail_without_starting_selection() {
+        let mut application = Application::import(crate::domain::InitialState {
+            session_id: crate::domain::ExternalText::new("session"),
+            thread_title: crate::domain::ExternalText::new("thread"),
+            provider: None,
+            model: crate::domain::ModelState {
+                model: crate::domain::ExternalText::new("model"),
+                reasoning_effort: None,
+                service_tier: None,
+            },
+            developer_mode: false,
+            response_streaming: false,
+            last_ttft_ms: None,
+            transcript: vec![crate::domain::TranscriptSnapshotEntry {
+                sequence: Some(1),
+                payload: crate::domain::TranscriptPayload::ToolActivity(
+                    crate::domain::ToolActivity {
+                        call_id: crate::domain::ExternalText::new("call-1"),
+                        invocation: harness_tool_api::ToolInvocation::Goal(
+                            harness_tool_api::Prepared::Ready(harness_tool_api::GoalRequest),
+                        ),
+                        raw_input: crate::domain::ExternalText::new("complete"),
+                        raw_input_encoding: crate::domain::ToolInputEncoding::Freeform,
+                        phase: crate::domain::ToolActivityPhase::Running,
+                    },
+                ),
+            }],
+            prompt: String::new(),
+            prompt_cursor: 0,
+            queued_steering: None,
+            agents: Vec::new(),
+            active_activity_ids: Vec::new(),
+        })
+        .unwrap();
+        let frame = prepare(
+            &mut application,
+            ratatui::layout::Rect::new(0, 0, 80, 24),
+            std::time::Instant::now(),
+        );
+        let transcript = frame.areas().transcript_content;
+        let press = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: transcript.x,
+            row: transcript.y,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        let command = route_mouse_event(press, &frame, MouseCapture::None)
+            .expect("tool disclosure press routes");
+        assert!(matches!(command, UserCommand::ToggleToolActivity { .. }));
+        application.handle_user_command(command);
+
+        assert!(
+            application
+                .transcript_mut()
+                .entries()
+                .next()
+                .expect("tool entry remains present")
+                .tool_expanded()
+        );
+        assert_eq!(application.mouse_capture(), MouseCapture::None);
+        assert!(!application.has_transcript_selection());
     }
 
     #[test]

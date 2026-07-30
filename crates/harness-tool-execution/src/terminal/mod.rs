@@ -8,7 +8,10 @@ use std::{
     time::Duration,
 };
 
-use harness_tool_api::{ToolFailure, ToolPresentation, ToolResult};
+use harness_tool_api::{
+    TerminalOpenRequest, TerminalProcessState, TerminalReadRequest, TerminalResult,
+    TerminalWriteRequest, ToolExecutionFailure, ToolFailureCategory, ToolOutcome, ToolResult,
+};
 use portable_pty::{Child, CommandBuilder, PtySize, native_pty_system};
 
 use crate::WorkspaceRoot;
@@ -16,9 +19,13 @@ use crate::WorkspaceRoot;
 mod open;
 mod read;
 mod write;
+mod screen;
 pub use open::OpenExecutor;
 pub use read::ReadExecutor;
 pub use write::WriteExecutor;
+pub use open::spec as open_spec;
+pub use read::spec as read_spec;
+pub use write::spec as write_spec;
 
 pub const OPEN_NAME: &str = "terminal_open";
 pub const WRITE_NAME: &str = "terminal_write";
@@ -26,11 +33,50 @@ pub const READ_NAME: &str = "terminal_read";
 const DEFAULT_ROWS: u16 = 24;
 const DEFAULT_COLS: u16 = 80;
 const OUTPUT_LIMIT: usize = 1_048_576;
+const DEFAULT_POLL_AFTER: Duration = Duration::from_secs(8);
+const POLL_AFTER_GRACE: Duration = Duration::from_millis(250);
+#[derive(Default)]
+struct TerminalBuffer {
+    bytes: Vec<u8>,
+    first_offset: u64,
+    next_offset: u64,
+    model_cursor: u64,
+    model_snapshot: String,
+    model_first_offset: u64,
+}
+
+impl TerminalBuffer {
+    fn push(&mut self, chunk: &[u8]) {
+        self.bytes.extend_from_slice(chunk);
+        self.next_offset = self.next_offset.saturating_add(chunk.len() as u64);
+        if self.bytes.len() > OUTPUT_LIMIT {
+            let dropped = self.bytes.len() - OUTPUT_LIMIT;
+            self.bytes.drain(..dropped);
+            self.first_offset = self.first_offset.saturating_add(dropped as u64);
+        }
+    }
+
+    fn consume_model_delta(&mut self) -> (String, u64) {
+        let omitted = self.first_offset.saturating_sub(self.model_cursor);
+        let rendered = screen::render(&self.bytes);
+        let reset = self.first_offset != self.model_first_offset;
+        let delta = screen::delta(&self.model_snapshot, &rendered, reset);
+        self.model_snapshot = rendered;
+        self.model_first_offset = self.first_offset;
+        self.model_cursor = self.next_offset;
+        (delta, omitted)
+    }
+}
+
+pub(crate) struct TerminalCommandOutput {
+    pub(crate) model: String,
+    pub(crate) result: TerminalResult,
+}
 
 struct Session {
     child: Box<dyn Child + Send + Sync>,
     writer: Box<dyn Write + Send>,
-    output: Arc<Mutex<Vec<u8>>>,
+    output: Arc<Mutex<TerminalBuffer>>,
 }
 struct State {
     next_id: i32,
@@ -56,19 +102,15 @@ pub(crate) fn manager(workspace: &WorkspaceRoot) -> Manager {
 }
 
 impl Manager {
-    pub(crate) fn open(&self, workspace: &WorkspaceRoot, input: &str) -> Result<String, String> {
-        let (fields, command) = open_parts(input)?;
-        let rows = parse_dimension(fields.get("rows"), "rows", DEFAULT_ROWS)?;
-        let cols = parse_dimension(fields.get("cols"), "cols", DEFAULT_COLS)?;
-        let workdir = fields
-            .get("workdir")
-            .map(|value| {
-                if value.is_empty() {
-                    workspace.path().to_owned()
-                } else {
-                    workspace.path().join(value)
-                }
-            })
+    pub(crate) fn open(
+        &self,
+        workspace: &WorkspaceRoot,
+        request: &TerminalOpenRequest,
+    ) -> Result<TerminalCommandOutput, String> {
+        let workdir = request
+            .workdir
+            .as_deref()
+            .map(|value| workspace.path().join(value))
             .unwrap_or_else(|| workspace.path().to_owned());
         if !workdir.is_dir() {
             return Err(format!(
@@ -78,15 +120,15 @@ impl Manager {
         }
         let pair = native_pty_system()
             .openpty(PtySize {
-                rows,
-                cols,
+                rows: request.rows,
+                cols: request.cols,
                 pixel_width: 0,
                 pixel_height: 0,
             })
             .map_err(|e| format!("failed to open terminal pty: {e}"))?;
         let mut builder = CommandBuilder::new("/bin/bash");
         builder.arg("-lc");
-        builder.arg(command);
+        builder.arg(&request.command);
         builder.cwd(&workdir);
         let child = pair
             .slave
@@ -100,7 +142,7 @@ impl Manager {
             .master
             .try_clone_reader()
             .map_err(|e| format!("failed to open terminal output: {e}"))?;
-        let output = Arc::new(Mutex::new(Vec::new()));
+        let output = Arc::new(Mutex::new(TerminalBuffer::default()));
         let sink = Arc::clone(&output);
         std::thread::spawn(move || {
             let mut chunk = [0_u8; 8192];
@@ -112,11 +154,7 @@ impl Manager {
                     break;
                 };
                 let mut output = sink.lock().expect("terminal output lock");
-                output.extend_from_slice(&chunk[..size]);
-                if output.len() > OUTPUT_LIMIT {
-                    let drop = output.len() - OUTPUT_LIMIT;
-                    output.drain(..drop);
-                }
+                output.push(&chunk[..size]);
             }
         });
         drop(pair.slave);
@@ -138,9 +176,11 @@ impl Manager {
         std::thread::sleep(Duration::from_millis(100));
         Ok(format_output(id, &output, None, None))
     }
-    pub(crate) fn write(&self, input: &str) -> Result<String, String> {
-        let (fields, value) = write_parts(input)?;
-        let id = parse_id(fields.get("terminal"), WRITE_NAME)?;
+    pub(crate) fn write(
+        &self,
+        request: &TerminalWriteRequest,
+    ) -> Result<TerminalCommandOutput, String> {
+        let id = request.terminal_id;
         let session = self.session(id)?;
         let mut session = session.lock().expect("terminal session lock");
         if let Some(status) = session
@@ -154,32 +194,29 @@ impl Manager {
             return Ok(format_output(
                 id,
                 &output,
-                Some(&value),
+                Some(&request.input),
                 Some(status.exit_code()),
             ));
         }
         session
             .writer
-            .write_all(value.as_bytes())
+            .write_all(request.input.as_bytes())
             .and_then(|_| session.writer.flush())
             .map_err(|e| format!("failed to write terminal {id}: {e}"))?;
         let output = Arc::clone(&session.output);
         drop(session);
         std::thread::sleep(Duration::from_millis(100));
-        Ok(format_output(id, &output, Some(&value), None))
+        Ok(format_output(id, &output, Some(&request.input), None))
     }
-    pub(crate) fn read(&self, input: &str) -> Result<String, String> {
-        let fields = read_parts(input)?;
-        let id = parse_id(fields.get("terminal"), READ_NAME)?;
+    pub(crate) fn read(
+        &self,
+        request: &TerminalReadRequest,
+    ) -> Result<TerminalCommandOutput, String> {
+        let id = request.terminal_id;
         let session = self.session(id)?;
         let mut session = session.lock().expect("terminal session lock");
-        let poll = fields
-            .get("poll_after")
-            .map(|value| parse_duration(value))
-            .transpose()?
-            .unwrap_or(Duration::from_millis(100));
         let output = Arc::clone(&session.output);
-        std::thread::sleep(poll);
+        std::thread::sleep(Duration::from_millis(request.poll_after_ms));
         let status = session
             .child
             .try_wait()
@@ -213,64 +250,61 @@ impl Manager {
     }
 }
 
-pub(crate) fn output(text: String, label: &str) -> ToolResult {
+pub(crate) fn rejected_result(message: String) -> ToolResult {
     ToolResult {
-        model_output: text.clone(),
-        presentation: Some(ToolPresentation {
-            label: label.to_owned(),
-            display: Some(text),
+        model_output: message.clone(),
+        outcome: ToolOutcome::Failed(ToolExecutionFailure {
+            category: ToolFailureCategory::InvalidInput,
+            message,
         }),
-        artifacts: Vec::new(),
     }
-}
-pub(crate) fn failure(error: String) -> Result<ToolResult, ToolFailure> {
-    Err(ToolFailure::InvalidInput(error))
 }
 fn format_output(
     id: i32,
-    output: &Arc<Mutex<Vec<u8>>>,
+    output: &Arc<Mutex<TerminalBuffer>>,
     input: Option<&str>,
     exit: Option<u32>,
-) -> String {
-    let bytes = output.lock().expect("terminal output lock").clone();
-    let mut text = String::from_utf8_lossy(&bytes).into_owned();
-    if let Some(input) = input {
-        text.push_str(&format!("echoed input: {input}"));
+) -> TerminalCommandOutput {
+    let (delta, unread_omitted, retained, historical_omitted) = {
+        let mut output = output.lock().expect("terminal output lock");
+        let (delta, unread_omitted) = output.consume_model_delta();
+        (
+            delta,
+            unread_omitted,
+            output.bytes.clone(),
+            output.first_offset,
+        )
+    };
+
+    let mut model = format!("terminal: {id}\n");
+    if unread_omitted > 0 {
+        model.push_str(&format!(
+            "[terminal output truncated: {unread_omitted} unread bytes omitted]\n"
+        ));
     }
-    let mut result = format!("terminal: {id}\n{text}");
-    if let Some(exit) = exit {
-        result.push_str(&format!("exit code: {exit}\n"));
+    model.push_str(&delta);
+    append_command_status(&mut model, input, exit);
+
+    TerminalCommandOutput {
+        model,
+        result: TerminalResult {
+            terminal_id: id,
+            output: screen::render(&retained),
+            earlier_output_omitted: historical_omitted,
+            state: exit.map_or(TerminalProcessState::Running, |code| {
+                TerminalProcessState::Exited { code }
+            }),
+        },
     }
-    result
 }
-fn fields(input: &str, tool: &str) -> Result<HashMap<String, String>, String> {
-    let mut fields = HashMap::new();
-    let mut current = None;
-    for line in input.lines() {
-        if let Some((key, value)) = line.split_once(':') {
-            let key = key.trim();
-            if !matches!(
-                key,
-                "workdir" | "rows" | "cols" | "command" | "terminal" | "input" | "poll_after"
-            ) {
-                return Err(format!(
-                    "failed to parse `{tool}` input: unknown field `{key}`"
-                ));
-            }
-            current = Some(key.to_owned());
-            fields.insert(key.to_owned(), value.trim_start().to_owned());
-        } else if let Some(key) = current.as_ref() {
-            fields.entry(key.clone()).and_modify(|value| {
-                value.push('\n');
-                value.push_str(line);
-            });
-        } else if !line.trim().is_empty() {
-            return Err(format!(
-                "failed to parse `{tool}` input: expected `key: value`"
-            ));
-        }
+
+fn append_command_status(output: &mut String, input: Option<&str>, exit: Option<u32>) {
+    if let Some(input) = input {
+        output.push_str(&format!("echoed input: {input}"));
     }
-    Ok(fields)
+    if let Some(exit) = exit {
+        output.push_str(&format!("exit code: {exit}\n"));
+    }
 }
 fn parse_dimension(value: Option<&String>, name: &str, default: u16) -> Result<u16, String> {
     value
@@ -296,7 +330,7 @@ fn parse_id(value: Option<&String>, tool: &str) -> Result<i32, String> {
         .map_err(|_| format!("failed to parse `{tool}` input: terminal must be an integer"))
 }
 
-fn open_parts(input: &str) -> Result<(HashMap<String, String>, String), String> {
+pub(crate) fn prepare_open(input: &str) -> Result<TerminalOpenRequest, String> {
     let marker = "command:";
     let Some(index) = input.find(marker) else {
         return Err("failed to parse `terminal_open` input: command is required".into());
@@ -308,10 +342,15 @@ fn open_parts(input: &str) -> Result<(HashMap<String, String>, String), String> 
     if command.trim().is_empty() {
         return Err("failed to parse `terminal_open` input: command is required".into());
     }
-    Ok((fields, command))
+    Ok(TerminalOpenRequest {
+        command,
+        workdir: fields.get("workdir").cloned().filter(|value| !value.is_empty()),
+        rows: parse_dimension(fields.get("rows"), "rows", DEFAULT_ROWS)?,
+        cols: parse_dimension(fields.get("cols"), "cols", DEFAULT_COLS)?,
+    })
 }
 
-fn write_parts(input: &str) -> Result<(HashMap<String, String>, String), String> {
+pub(crate) fn prepare_write(input: &str) -> Result<TerminalWriteRequest, String> {
     let marker = "input:";
     let Some(index) = input.find(marker) else {
         return Err("failed to parse `terminal_write` input: input is required".into());
@@ -320,11 +359,23 @@ fn write_parts(input: &str) -> Result<(HashMap<String, String>, String), String>
     let value = input[index + marker.len()..]
         .trim_start_matches([' ', '\n', '\r'])
         .to_string();
-    Ok((fields, value))
+    Ok(TerminalWriteRequest {
+        terminal_id: parse_id(fields.get("terminal"), WRITE_NAME)?,
+        input: value,
+    })
 }
 
-fn read_parts(input: &str) -> Result<HashMap<String, String>, String> {
-    header_fields(input, READ_NAME)
+pub(crate) fn prepare_read(input: &str) -> Result<TerminalReadRequest, String> {
+    let fields = header_fields(input, READ_NAME)?;
+    let poll = fields
+        .get("poll_after")
+        .map(|value| parse_poll_after(value))
+        .transpose()?
+        .unwrap_or(DEFAULT_POLL_AFTER);
+    Ok(TerminalReadRequest {
+        terminal_id: parse_id(fields.get("terminal"), READ_NAME)?,
+        poll_after_ms: poll.as_millis().min(u128::from(u64::MAX)) as u64,
+    })
 }
 
 fn header_fields(input: &str, tool: &str) -> Result<HashMap<String, String>, String> {
@@ -353,7 +404,7 @@ fn header_fields(input: &str, tool: &str) -> Result<HashMap<String, String>, Str
     Ok(fields)
 }
 
-fn parse_duration(value: &str) -> Result<Duration, String> {
+fn parse_poll_after(value: &str) -> Result<Duration, String> {
     let value = value.trim();
     let (number, multiplier) = if let Some(value) = value.strip_suffix("ms") {
         (value, 1)
@@ -367,5 +418,8 @@ fn parse_duration(value: &str) -> Result<Duration, String> {
     let number = number
         .parse::<u64>()
         .map_err(|_| "poll_after must be a duration such as 250ms or 30s".to_string())?;
-    Ok(Duration::from_millis(number.saturating_mul(multiplier)))
+    let requested = Duration::from_millis(number.saturating_mul(multiplier));
+    Ok(requested
+        .max(DEFAULT_POLL_AFTER)
+        .saturating_add(POLL_AFTER_GRACE))
 }

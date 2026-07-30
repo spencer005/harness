@@ -4,6 +4,7 @@ mod commands;
 mod picker;
 
 use std::{
+    collections::VecDeque,
     env,
     ffi::OsString,
     fmt::Write as _,
@@ -40,7 +41,8 @@ use harness_provider::{
 };
 use harness_responses_api::{
     ApiProvider, Auth, AuthError, ChatGptAuthTokens, CodexHeaders, ManagedChatGptAuth,
-    ResponsesApiError, ResponsesStreamEvent, ResponsesStreamRequest, lean_codex_default_headers,
+    ResponsesApiError, ResponsesStreamEvent, ResponsesStreamRequest, is_auto_retryable_http_status,
+    lean_codex_default_headers,
 };
 use harness_responses_protocol::{encode_input, encode_tools};
 use harness_responses_transport::{
@@ -54,9 +56,7 @@ use harness_session_store::{
     SessionPayload, SessionReader, SessionRecord, SessionStore, SessionStoreError,
     SessionToolInput, SessionWriter,
 };
-use harness_tool_api::{
-    AvailabilityToolExecutor, ToolAvailability, ToolExecutor, ToolFailure, ToolRegistry,
-};
+use harness_tool_api::{AvailabilityToolExecutor, ToolAvailability, ToolExecutor, ToolRegistry};
 use harness_tool_execution::{ToolInventory, WorkspaceRoot};
 use harness_tui_rewrite::domain::{
     ExternalText, InitialState, ModelState, ProviderKind, ProviderState, ProviderTransport,
@@ -113,17 +113,16 @@ pub(crate) enum SerializablePayload {
     ToolCallAccepted {
         turn_id: u64,
         call_id: String,
-        name: String,
-        input: SerializableToolInput,
-    },
-    ToolExecutionStarted {
-        turn_id: u64,
-        call_id: String,
+        invocation: harness_tool_api::ToolInvocation,
+        raw_input: SerializableToolInput,
     },
     ToolExecutionFinished {
         turn_id: u64,
         call_id: String,
-        output: String,
+        invocation: harness_tool_api::ToolInvocation,
+        outcome: harness_tool_api::ToolOutcome,
+        raw_input: SerializableToolInput,
+        raw_output: String,
     },
     TurnFinished {
         turn_id: u64,
@@ -138,6 +137,9 @@ pub(crate) enum SerializablePayload {
         attempt_id: u64,
         provider: String,
         response_id: String,
+    },
+    PreviousResponseInvalidated {
+        turn_id: u64,
     },
     Goal {
         instruction: String,
@@ -240,38 +242,28 @@ fn to_serializable_payload(payload: &SessionPayload) -> SerializablePayload {
         SessionPayload::ToolCallAccepted {
             turn_id,
             call_id,
-            name,
-            input,
+            invocation,
+            raw_input,
         } => SerializablePayload::ToolCallAccepted {
             turn_id: *turn_id,
             call_id: call_id.clone(),
-            name: name.clone(),
-            input: match input {
-                SessionToolInput::Freeform(input) => SerializableToolInput::Encoded(
-                    SerializableEncodedToolInput::Freeform(input.clone()),
-                ),
-                SessionToolInput::FunctionJson(input) => SerializableToolInput::Encoded(
-                    SerializableEncodedToolInput::FunctionJson(input.clone()),
-                ),
-                SessionToolInput::Unspecified(input) => {
-                    SerializableToolInput::Unspecified(input.clone())
-                }
-            },
+            invocation: invocation.clone(),
+            raw_input: serialize_tool_input(raw_input),
         },
-        SessionPayload::ToolExecutionStarted { turn_id, call_id } => {
-            SerializablePayload::ToolExecutionStarted {
-                turn_id: *turn_id,
-                call_id: call_id.clone(),
-            }
-        }
         SessionPayload::ToolExecutionFinished {
             turn_id,
             call_id,
-            output,
+            invocation,
+            outcome,
+            raw_input,
+            raw_output,
         } => SerializablePayload::ToolExecutionFinished {
             turn_id: *turn_id,
             call_id: call_id.clone(),
-            output: output.clone(),
+            invocation: invocation.clone(),
+            outcome: outcome.clone(),
+            raw_input: serialize_tool_input(raw_input),
+            raw_output: raw_output.clone(),
         },
         SessionPayload::TurnFinished { turn_id, outcome } => SerializablePayload::TurnFinished {
             turn_id: *turn_id,
@@ -312,6 +304,9 @@ fn to_serializable_payload(payload: &SessionPayload) -> SerializablePayload {
             provider: provider.clone(),
             response_id: response_id.clone(),
         },
+        SessionPayload::PreviousResponseInvalidated { turn_id } => {
+            SerializablePayload::PreviousResponseInvalidated { turn_id: *turn_id }
+        }
         SessionPayload::Goal { instruction, state } => SerializablePayload::Goal {
             instruction: instruction.clone(),
             state: state.clone(),
@@ -381,33 +376,28 @@ fn from_serializable_payload(sp: SerializablePayload) -> SessionPayload {
         SerializablePayload::ToolCallAccepted {
             turn_id,
             call_id,
-            name,
-            input,
+            invocation,
+            raw_input,
         } => SessionPayload::ToolCallAccepted {
             turn_id,
             call_id,
-            name,
-            input: match input {
-                SerializableToolInput::Encoded(SerializableEncodedToolInput::Freeform(input)) => {
-                    SessionToolInput::Freeform(input)
-                }
-                SerializableToolInput::Encoded(SerializableEncodedToolInput::FunctionJson(
-                    input,
-                )) => SessionToolInput::FunctionJson(input),
-                SerializableToolInput::Unspecified(input) => SessionToolInput::Unspecified(input),
-            },
+            invocation,
+            raw_input: deserialize_tool_input(raw_input),
         },
-        SerializablePayload::ToolExecutionStarted { turn_id, call_id } => {
-            SessionPayload::ToolExecutionStarted { turn_id, call_id }
-        }
         SerializablePayload::ToolExecutionFinished {
             turn_id,
             call_id,
-            output,
+            invocation,
+            outcome,
+            raw_input,
+            raw_output,
         } => SessionPayload::ToolExecutionFinished {
             turn_id,
             call_id,
-            output,
+            invocation,
+            outcome,
+            raw_input: deserialize_tool_input(raw_input),
+            raw_output,
         },
         SerializablePayload::TurnFinished { turn_id, outcome } => SessionPayload::TurnFinished {
             turn_id,
@@ -442,6 +432,9 @@ fn from_serializable_payload(sp: SerializablePayload) -> SessionPayload {
             provider,
             response_id,
         },
+        SerializablePayload::PreviousResponseInvalidated { turn_id } => {
+            SessionPayload::PreviousResponseInvalidated { turn_id }
+        }
         SerializablePayload::Goal { instruction, state } => {
             SessionPayload::Goal { instruction, state }
         }
@@ -456,6 +449,32 @@ fn to_serializable_record(record: &SessionRecord) -> SerializableRecord {
     }
 }
 
+fn serialize_tool_input(input: &SessionToolInput) -> SerializableToolInput {
+    match input {
+        SessionToolInput::Freeform(input) => {
+            SerializableToolInput::Encoded(SerializableEncodedToolInput::Freeform(input.clone()))
+        }
+        SessionToolInput::FunctionJson(input) => SerializableToolInput::Encoded(
+            SerializableEncodedToolInput::FunctionJson(input.clone()),
+        ),
+        SessionToolInput::Unspecified(input) => {
+            SerializableToolInput::Unspecified(input.clone())
+        }
+    }
+}
+
+fn deserialize_tool_input(input: SerializableToolInput) -> SessionToolInput {
+    match input {
+        SerializableToolInput::Encoded(SerializableEncodedToolInput::Freeform(input)) => {
+            SessionToolInput::Freeform(input)
+        }
+        SerializableToolInput::Encoded(SerializableEncodedToolInput::FunctionJson(input)) => {
+            SessionToolInput::FunctionJson(input)
+        }
+        SerializableToolInput::Unspecified(input) => SessionToolInput::Unspecified(input),
+    }
+}
+
 fn from_serializable_record(
     sr: SerializableRecord,
     session_id: &harness_session_store::SessionId,
@@ -465,6 +484,93 @@ fn from_serializable_record(
         sequence: sr.sequence,
         payload: from_serializable_payload(sr.payload),
     }
+}
+
+fn deserialize_session_records(content: &str) -> Result<Vec<SerializableRecord>, SessionStoreError> {
+    let mut records = serde_json::from_str::<Vec<serde_json::Value>>(content)
+        .map_err(|error| SessionStoreError::InvalidFormat(error.to_string()))?;
+    upgrade_legacy_session_records(&mut records)?;
+    serde_json::from_value(serde_json::Value::Array(records))
+        .map_err(|error| SessionStoreError::InvalidFormat(error.to_string()))
+}
+
+fn upgrade_legacy_session_records(
+    records: &mut Vec<serde_json::Value>,
+) -> Result<(), SessionStoreError> {
+    use harness_tool_api::{BuiltInTool, ToolExecutionFailure, ToolFailureCategory, ToolInvocation, ToolOutcome};
+
+    let mut accepted = std::collections::BTreeMap::new();
+    records.retain_mut(|record| {
+        let Some(payload) = record.get_mut("payload").and_then(serde_json::Value::as_object_mut)
+        else {
+            return true;
+        };
+
+        if payload.contains_key("ToolExecutionStarted") {
+            return false;
+        }
+
+        if let Some(fields) = payload
+            .get_mut("ToolCallAccepted")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            let turn_id = fields.get("turn_id").and_then(serde_json::Value::as_u64);
+            let call_id = fields
+                .get("call_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            if !fields.contains_key("invocation") {
+                let Some(name) = fields.remove("name").and_then(|value| value.as_str().map(str::to_owned)) else {
+                    return true;
+                };
+                let Some(tool) = BuiltInTool::from_name(&name) else {
+                    return true;
+                };
+                let invocation = ToolInvocation::rejected(
+                    tool,
+                    "loaded from a legacy session without parsed invocation data".to_string(),
+                );
+                fields.insert("invocation".to_string(), serde_json::to_value(&invocation).unwrap());
+                if let Some(input) = fields.remove("input") {
+                    fields.insert("raw_input".to_string(), input);
+                }
+            }
+            if let (Some(turn_id), Some(call_id), Some(invocation), Some(raw_input)) = (
+                turn_id,
+                call_id,
+                fields.get("invocation").cloned(),
+                fields.get("raw_input").cloned(),
+            ) {
+                accepted.insert((turn_id, call_id), (invocation, raw_input));
+            }
+        }
+
+        if let Some(fields) = payload
+            .get_mut("ToolExecutionFinished")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            if !fields.contains_key("invocation") {
+                let key = fields
+                    .get("turn_id")
+                    .and_then(serde_json::Value::as_u64)
+                    .zip(fields.get("call_id").and_then(serde_json::Value::as_str))
+                    .map(|(turn_id, call_id)| (turn_id, call_id.to_owned()));
+                if let Some((invocation, raw_input)) = key.and_then(|key| accepted.get(&key).cloned()) {
+                    fields.insert("invocation".to_string(), invocation);
+                    fields.insert("raw_input".to_string(), raw_input);
+                    let raw_output = fields.remove("output").unwrap_or(serde_json::Value::String(String::new()));
+                    fields.insert("raw_output".to_string(), raw_output);
+                    let outcome = ToolOutcome::Failed(ToolExecutionFailure {
+                        category: ToolFailureCategory::Execution,
+                        message: "legacy session contains no structured tool outcome".to_string(),
+                    });
+                    fields.insert("outcome".to_string(), serde_json::to_value(outcome).unwrap());
+                }
+            }
+        }
+        true
+    });
+    Ok(())
 }
 
 struct FileSessionStore {
@@ -497,8 +603,7 @@ impl SessionStore for FileSessionStore {
                 let content = tokio::fs::read_to_string(&path)
                     .await
                     .map_err(SessionStoreError::Io)?;
-                let loaded = serde_json::from_str::<Vec<SerializableRecord>>(&content)
-                    .map_err(|error| SessionStoreError::InvalidFormat(error.to_string()))?;
+                let loaded = deserialize_session_records(&content)?;
                 for sr in loaded {
                     records.push(from_serializable_record(sr, &session_id));
                 }
@@ -551,8 +656,7 @@ impl SessionReader for FileSessionReader {
         }
 
         let content = std::fs::read_to_string(&path).map_err(SessionStoreError::Io)?;
-        let loaded = serde_json::from_str::<Vec<SerializableRecord>>(&content)
-            .map_err(|e| SessionStoreError::InvalidFormat(e.to_string()))?;
+        let loaded = deserialize_session_records(&content)?;
 
         let mut records = Vec::new();
         for sr in loaded {
@@ -704,19 +808,21 @@ impl RealModelRequestBuilder {
                 SessionPayload::CompactionCheckpoint { summary, .. } => add(summary),
                 SessionPayload::ToolCallAccepted {
                     call_id,
-                    name,
-                    input,
+                    invocation,
+                    raw_input,
                     ..
                 } => {
                     add(call_id);
-                    add(name);
-                    add(input.as_str());
+                    add(invocation.tool().name());
+                    add(raw_input.as_str());
                 }
                 SessionPayload::ToolExecutionFinished {
-                    call_id, output, ..
+                    call_id,
+                    raw_output,
+                    ..
                 } => {
                     add(call_id);
-                    add(output);
+                    add(raw_output);
                 }
                 _ => {}
             }
@@ -769,15 +875,17 @@ impl ModelRequestBuilder for RealModelRequestBuilder {
             }),
         };
 
+        let last_response_boundary = history.iter().rposition(|payload| {
+            matches!(
+                payload,
+                SessionPayload::CompactionCheckpoint { .. }
+                    | SessionPayload::PreviousResponseInvalidated { .. }
+            )
+        });
         let last_response_meta = if self.store {
-            let last_compaction_pos = history.iter().rposition(|payload| {
-                matches!(payload, SessionPayload::CompactionCheckpoint { .. })
-            });
             history.iter().enumerate().rev().find_map(|(idx, payload)| {
-                if let Some(comp_pos) = last_compaction_pos {
-                    if idx < comp_pos {
-                        return None;
-                    }
+                if last_response_boundary.is_some_and(|boundary| idx < boundary) {
+                    return None;
                 }
                 if let SessionPayload::ModelResponseMetadata {
                     provider,
@@ -794,7 +902,6 @@ impl ModelRequestBuilder for RealModelRequestBuilder {
         } else {
             None
         };
-
         let last_compaction_pos = history
             .iter()
             .rposition(|payload| matches!(payload, SessionPayload::CompactionCheckpoint { .. }));
@@ -816,6 +923,7 @@ impl ModelRequestBuilder for RealModelRequestBuilder {
                 text: self.base_instructions.clone(),
             });
         }
+        let mut call_is_in_previous_response = previous_response_id.is_some();
         for payload in history_slice {
             match payload {
                 SessionPayload::InputMessage { text, .. } => {
@@ -849,52 +957,53 @@ impl ModelRequestBuilder for RealModelRequestBuilder {
                         text: format!("Conversation summary after compaction:\n\n{summary}"),
                     });
                 }
+                SessionPayload::ModelAttemptStarted { .. } => {
+                    call_is_in_previous_response = false;
+                }
                 SessionPayload::ToolCallAccepted {
                     call_id,
-                    name,
-                    input: tool_input,
+                    invocation,
+                    raw_input,
                     ..
                 } => {
-                    if uses_freeform_encoding(name, tool_input) {
+                    if call_is_in_previous_response {
+                        continue;
+                    }
+                    let name = invocation.tool().name();
+                    if uses_freeform_encoding(name, raw_input) {
                         input.push(ModelInput::FreeformToolCall {
                             call_id: call_id.clone(),
-                            name: name.clone(),
-                            input: tool_input.as_str().to_owned(),
+                            name: name.to_owned(),
+                            input: raw_input.as_str().to_owned(),
                         });
                     } else {
                         input.push(ModelInput::AssistantToolCall {
                             call_id: call_id.clone(),
-                            name: name.clone(),
-                            arguments: tool_input.as_str().to_owned(),
+                            name: name.to_owned(),
+                            arguments: raw_input.as_str().to_owned(),
                         });
                     }
                 }
                 SessionPayload::ToolExecutionFinished {
-                    call_id, output, ..
+                    call_id,
+                    invocation,
+                    raw_input,
+                    raw_output,
+                    ..
                 } => {
-                    if history.iter().any(|payload| {
-                        matches!(
-                            payload,
-                            SessionPayload::ToolCallAccepted {
-                                call_id: prior_call_id,
-                                name: prior_name,
-                                input: prior_input,
-                                ..
-                            } if prior_call_id == call_id
-                                && uses_freeform_encoding(prior_name, prior_input)
-                        )
-                    }) {
+                    if uses_freeform_encoding(invocation.tool().name(), raw_input) {
                         input.push(ModelInput::FreeformToolResult {
                             call_id: call_id.clone(),
-                            output: output.clone(),
+                            output: raw_output.clone(),
                         });
                     } else {
                         input.push(ModelInput::ToolResult {
                             call_id: call_id.clone(),
-                            output: output.clone(),
+                            output: raw_output.clone(),
                         });
                     }
                 }
+                SessionPayload::PreviousResponseInvalidated { .. } => {}
                 _ => {}
             }
         }
@@ -963,19 +1072,17 @@ impl ModelRequestBuilder for RealModelRequestBuilder {
             .iter()
             .map(|tool| {
                 let mut tool = tool.clone();
-                if let harness_tool_api::ToolInputSchema::FreeformGrammar {
-                    syntax,
-                    definition,
-                } = &tool.input_schema
-                {
+                if matches!(
+                    &tool.input_schema,
+                    harness_tool_api::ToolInputSchema::FreeformGrammar { .. }
+                ) {
+                    tool.description = tool.function_compatibility_description();
                     let schema = sonic_rs::json!({
                         "type": "object",
                         "properties": {
                             "input": {
                                 "type": "string",
-                                "description": format!(
-                                    "Exact freeform tool input. Grammar syntax: {syntax:?}. Native tool instructions:\n{definition}"
-                                )
+                                "description": "Complete raw tool input, passed as one JSON string exactly as specified by the function description."
                             }
                         },
                         "required": ["input"],
@@ -1275,36 +1382,41 @@ impl ChatStreamingClient for HttpClient {
 
         Box::pin(async move {
             let url_str = format!("{}/chat/completions", base_url.trim_end_matches('/'));
-            let body_bytes =
-                sonic_rs::to_vec(&body).map_err(|e| ChatStreamError::Transport(e.to_string()))?;
+            let body_bytes = bytes::Bytes::from(
+                sonic_rs::to_vec(&body)
+                    .map_err(|e| ChatStreamError::Transport(e.to_string()))?,
+            );
 
-            let mut req = http::Request::post(url_str).header("content-type", "application/json");
+            loop {
+                let mut req =
+                    http::Request::post(&url_str).header("content-type", "application/json");
 
-            if let Some(key) = &api_key {
-                req = req.header("authorization", format!("Bearer {key}"));
-            }
+                if let Some(key) = &api_key {
+                    req = req.header("authorization", format!("Bearer {key}"));
+                }
 
-            let req = req
-                .body(http_body_util::Full::new(bytes::Bytes::from(body_bytes)))
-                .map_err(|e| ChatStreamError::Transport(e.to_string()))?;
+                let req = req
+                    .body(http_body_util::Full::new(body_bytes.clone()))
+                    .map_err(|e| ChatStreamError::Transport(e.to_string()))?;
 
-            let resp = hyper_client
-                .request(req)
-                .await
-                .map_err(|e| ChatStreamError::Transport(e.to_string()))?;
-
-            let status = resp.status();
-            if !status.is_success() {
-                let err_bytes = http_body_util::BodyExt::collect(resp.into_body())
+                let resp = hyper_client
+                    .request(req)
                     .await
-                    .map(|c| c.to_bytes())
-                    .unwrap_or_default();
-                let err_msg = String::from_utf8_lossy(&err_bytes).to_string();
-                if status == http::StatusCode::UNAUTHORIZED {
-                    return Err(ChatStreamError::Authentication(err_msg));
-                } else if status == http::StatusCode::TOO_MANY_REQUESTS {
-                    return Err(ChatStreamError::RateLimited(err_msg));
-                } else {
+                    .map_err(|e| ChatStreamError::Transport(e.to_string()))?;
+
+                let status = resp.status();
+                if !status.is_success() {
+                    let err_bytes = http_body_util::BodyExt::collect(resp.into_body())
+                        .await
+                        .map(|c| c.to_bytes())
+                        .unwrap_or_default();
+                    let err_msg = String::from_utf8_lossy(&err_bytes).to_string();
+                    if is_auto_retryable_http_status(status) {
+                        continue;
+                    }
+                    if status == http::StatusCode::UNAUTHORIZED {
+                        return Err(ChatStreamError::Authentication(err_msg));
+                    }
                     let formatted_err = if err_msg.trim().is_empty() {
                         format!("HTTP status {status}")
                     } else {
@@ -1312,31 +1424,34 @@ impl ChatStreamingClient for HttpClient {
                     };
                     return Err(ChatStreamError::ProviderRejected(formatted_err));
                 }
-            }
 
-            let body = resp.into_body();
-            let stream = futures_util::stream::unfold(Some(body), |state| async move {
-                let mut body = state?;
+                let body = resp.into_body();
+                let stream = futures_util::stream::unfold(Some(body), |state| async move {
+                    let mut body = state?;
 
-                match body.frame().await {
-                    Some(Ok(frame)) => {
-                        if let Some(data) = frame.data_ref()
-                            && !data.is_empty()
-                        {
-                            return Some((Ok(ChatStreamChunk::Bytes(data.to_vec())), Some(body)));
+                    match body.frame().await {
+                        Some(Ok(frame)) => {
+                            if let Some(data) = frame.data_ref()
+                                && !data.is_empty()
+                            {
+                                return Some((
+                                    Ok(ChatStreamChunk::Bytes(data.to_vec())),
+                                    Some(body),
+                                ));
+                            }
+                            Some((Ok(ChatStreamChunk::Bytes(Vec::new())), Some(body)))
                         }
-                        Some((Ok(ChatStreamChunk::Bytes(Vec::new())), Some(body)))
+                        Some(Err(err)) => {
+                            Some((Err(ChatStreamError::Transport(err.to_string())), None))
+                        }
+                        None => Some((Ok(ChatStreamChunk::End), None)),
                     }
-                    Some(Err(err)) => {
-                        Some((Err(ChatStreamError::Transport(err.to_string())), None))
-                    }
-                    None => Some((Ok(ChatStreamChunk::End), None)),
-                }
-            });
-            Ok(Box::pin(stream)
-                as Pin<
-                    Box<dyn Stream<Item = Result<ChatStreamChunk, ChatStreamError>> + Send>,
-                >)
+                });
+                return Ok(Box::pin(stream)
+                    as Pin<
+                        Box<dyn Stream<Item = Result<ChatStreamChunk, ChatStreamError>> + Send>,
+                    >);
+            }
         })
     }
 }
@@ -1397,72 +1512,79 @@ impl StreamingClient for HttpClient {
                 }
             }
             add_selection_options(&mut body, &attempt.request.selection, &session_id);
-            let body_bytes =
-                sonic_rs::to_vec(&body).map_err(|e| StreamError::Transport(e.to_string()))?;
+            let body_bytes = bytes::Bytes::from(
+                sonic_rs::to_vec(&body).map_err(|e| StreamError::Transport(e.to_string()))?,
+            );
 
-            let mut req = http::Request::post(url_str).header("content-type", "application/json");
+            loop {
+                let mut req =
+                    http::Request::post(&url_str).header("content-type", "application/json");
 
-            if let Some(key) = &api_key {
-                req = req.header("authorization", format!("Bearer {key}"));
-            }
-
-            let req = req
-                .body(http_body_util::Full::new(bytes::Bytes::from(body_bytes)))
-                .map_err(|e| StreamError::Transport(e.to_string()))?;
-
-            let resp = hyper_client
-                .request(req)
-                .await
-                .map_err(|e| StreamError::Transport(e.to_string()))?;
-
-            let status = resp.status();
-            if !status.is_success() {
-                let err_bytes = http_body_util::BodyExt::collect(resp.into_body())
-                    .await
-                    .map(|c| c.to_bytes())
-                    .unwrap_or_default();
-                let err_msg = String::from_utf8_lossy(&err_bytes);
-                let formatted_err = format!("HTTP status {status}: {err_msg}");
-                let detailed_err = format_input_index_error(&formatted_err, &input);
-                return Err(StreamError::Transport(detailed_err));
-            }
-
-            let content_type = resp
-                .headers()
-                .get(http::header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or_default();
-            if !content_type
-                .split(';')
-                .next()
-                .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"))
-            {
-                return Err(StreamError::Transport(format!(
-                    "OpenResponses streaming response has invalid content type: {content_type}"
-                )));
-            }
-
-            let body = resp.into_body();
-            let stream = futures_util::stream::unfold(Some(body), |state| async move {
-                let mut body = state?;
-
-                match body.frame().await {
-                    Some(Ok(frame)) => {
-                        if let Some(data) = frame.data_ref()
-                            && !data.is_empty()
-                        {
-                            return Some((Ok(StreamChunk::Bytes(data.to_vec())), Some(body)));
-                        }
-                        Some((Ok(StreamChunk::Bytes(Vec::new())), Some(body)))
-                    }
-                    Some(Err(err)) => Some((Err(StreamError::Transport(err.to_string())), None)),
-                    None => Some((Ok(StreamChunk::End), None)),
+                if let Some(key) = &api_key {
+                    req = req.header("authorization", format!("Bearer {key}"));
                 }
-            });
-            Ok(Box::pin(stream)
-                as Pin<
-                    Box<dyn Stream<Item = Result<StreamChunk, StreamError>> + Send>,
-                >)
+
+                let req = req
+                    .body(http_body_util::Full::new(body_bytes.clone()))
+                    .map_err(|e| StreamError::Transport(e.to_string()))?;
+
+                let resp = hyper_client
+                    .request(req)
+                    .await
+                    .map_err(|e| StreamError::Transport(e.to_string()))?;
+
+                let status = resp.status();
+                if !status.is_success() {
+                    let err_bytes = http_body_util::BodyExt::collect(resp.into_body())
+                        .await
+                        .map(|c| c.to_bytes())
+                        .unwrap_or_default();
+                    if is_auto_retryable_http_status(status) {
+                        continue;
+                    }
+                    let err_msg = String::from_utf8_lossy(&err_bytes);
+                    let formatted_err = format!("HTTP status {status}: {err_msg}");
+                    let detailed_err = format_input_index_error(&formatted_err, &input);
+                    return Err(StreamError::Transport(detailed_err));
+                }
+
+                let content_type = resp
+                    .headers()
+                    .get(http::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default();
+                if !content_type
+                    .split(';')
+                    .next()
+                    .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"))
+                {
+                    return Err(StreamError::Transport(format!(
+                        "OpenResponses streaming response has invalid content type: {content_type}"
+                    )));
+                }
+
+                let body = resp.into_body();
+                let stream = futures_util::stream::unfold(Some(body), |state| async move {
+                    let mut body = state?;
+
+                    match body.frame().await {
+                        Some(Ok(frame)) => {
+                            if let Some(data) = frame.data_ref()
+                                && !data.is_empty()
+                            {
+                                return Some((Ok(StreamChunk::Bytes(data.to_vec())), Some(body)));
+                            }
+                            Some((Ok(StreamChunk::Bytes(Vec::new())), Some(body)))
+                        }
+                        Some(Err(err)) => {
+                            Some((Err(StreamError::Transport(err.to_string())), None))
+                        }
+                        None => Some((Ok(StreamChunk::End), None)),
+                    }
+                });
+                return Ok(Box::pin(stream)
+                    as Pin<Box<dyn Stream<Item = Result<StreamChunk, StreamError>> + Send>>);
+            }
         })
     }
 }
@@ -1679,10 +1801,10 @@ async fn resolve_provider_and_transport(
 
     let capabilities = harness_model_api::ModelCapabilities {
         tool_calls: model_config.supports_tools,
-        freeform_tool_input: !matches!(
+        freeform_tool_input: profile.supports_freeform_tool_input.unwrap_or(!matches!(
             &profile.driver,
             ProviderDriverConfig::ChatCompletion { .. }
-        ),
+        )),
         streaming: true,
         developer_role_support: dev_role_support,
         allow_multiple_system_messages: allow_multiple_system,
@@ -2369,7 +2491,11 @@ async fn activate_session_fork(
         .switch_session(new_session_id.clone())
         .await
         .map_err(|error| format!("Failed to switch to fork: {error}"))?;
-    runtime.update_ports(transport, resolved.routes.root.clone());
+    runtime.update_ports(
+        transport,
+        resolved.routes.root.clone(),
+        resolved.capabilities.freeform_tool_input,
+    );
     runtime.update_compaction_route(resolved.routes.compaction.clone());
     active_generation.store(next_generation, Ordering::Release);
     app_state.session_id = new_session_id.as_str().to_owned();
@@ -2392,6 +2518,9 @@ async fn execute_app_action(
     runtime: &mut ConversationRuntime,
     command_rx: &mut harness_runtime_api::RuntimeCommandReceiver,
     commands: &harness_runtime_api::RuntimeCommandSender,
+    deferred_commands: &mut VecDeque<harness_runtime_api::RuntimeCommand>,
+    suspended_effects: &mut Option<Vec<RuntimeEffect>>,
+
     event_tx: &harness_runtime_api::RuntimeEventSender,
     session_root: &Path,
     active_generation: &Arc<AtomicU64>,
@@ -2445,7 +2574,11 @@ async fn execute_app_action(
             .await
             .map_err(|e| format!("Failed to switch provider: {e}"))?;
 
-            runtime.update_ports(new_transport, resolved.routes.root.clone());
+            runtime.update_ports(
+                new_transport,
+                resolved.routes.root.clone(),
+                resolved.capabilities.freeform_tool_input,
+            );
             runtime.update_compaction_route(resolved.routes.compaction.clone());
 
             let provider_id = harness_model_api::ProviderId::new(profile_id.as_str())
@@ -2521,7 +2654,18 @@ async fn execute_app_action(
                 .dispatch_command(harness_runtime_api::RuntimeCommand::Retry)
                 .await
                 .map_err(|error| format!("Failed to retry turn: {error}"))?;
-            if !drive_runtime_effects(runtime, command_rx, commands, effects, event_tx, seq).await {
+            if !drive_runtime_effects(
+                runtime,
+                command_rx,
+                commands,
+                deferred_commands,
+                suspended_effects,
+                effects,
+                event_tx,
+                seq,
+            )
+            .await
+            {
                 return Err("Runtime event channel closed".to_string());
             }
             Ok(())
@@ -2547,7 +2691,18 @@ async fn execute_app_action(
                 })
                 .await
                 .map_err(|error| format!("Failed to submit goal prompt: {error}"))?;
-            if !drive_runtime_effects(runtime, command_rx, commands, effects, event_tx, seq).await {
+            if !drive_runtime_effects(
+                runtime,
+                command_rx,
+                commands,
+                deferred_commands,
+                suspended_effects,
+                effects,
+                event_tx,
+                seq,
+            )
+            .await
+            {
                 return Err("Runtime event channel closed".to_string());
             }
             Ok(())
@@ -2632,6 +2787,12 @@ async fn execute_app_action(
             Ok(())
         }
         AppAction::ResumeSession { session_id } => {
+            if runtime.phase() != &harness_conversation_runtime::ConversationPhase::Idle {
+                return Err(
+                    "Sessions can be resumed only while no response or tool is active."
+                        .to_string(),
+                );
+            }
             let target_id = match session_id.as_deref() {
                 None | Some("pick") | Some("") => {
                     let sessions = picker::list_sessions(session_root)
@@ -2700,8 +2861,8 @@ async fn execute_app_action(
                         .collect::<Vec<_>>();
                     if messages.is_empty() {
                         return Err(
-                            "The active session has no persisted user/assistant messages or tool \
-                             calls to edit or delete."
+                            "The active session has no persisted user or assistant messages to \
+                             edit."
                                 .to_string(),
                         );
                     }
@@ -2777,6 +2938,12 @@ async fn execute_app_action(
             before_compaction,
             before_sequence,
         } => {
+            if runtime.phase() != &harness_conversation_runtime::ConversationPhase::Idle {
+                return Err(
+                    "A session can be rewound only while no response or tool is active."
+                        .to_string(),
+                );
+            }
             // Read all records from the current session.
             let current_session_id_str = app_state.session_id.clone();
             let current_id = harness_session_store::SessionId::new(current_session_id_str.clone())
@@ -2886,7 +3053,18 @@ async fn execute_app_action(
                 .dispatch_command(harness_runtime_api::RuntimeCommand::Compact { instruction })
                 .await
                 .map_err(|error| format!("Failed to start compaction: {error}"))?;
-            if !drive_runtime_effects(runtime, command_rx, commands, effects, event_tx, seq).await {
+            if !drive_runtime_effects(
+                runtime,
+                command_rx,
+                commands,
+                deferred_commands,
+                suspended_effects,
+                effects,
+                event_tx,
+                seq,
+            )
+            .await
+            {
                 return Err("Runtime event channel closed".to_string());
             }
             Ok(())
@@ -2898,7 +3076,18 @@ async fn execute_app_action(
                 })
                 .await
                 .map_err(|error| format!("Failed to redo compaction: {error}"))?;
-            if !drive_runtime_effects(runtime, command_rx, commands, effects, event_tx, seq).await {
+            if !drive_runtime_effects(
+                runtime,
+                command_rx,
+                commands,
+                deferred_commands,
+                suspended_effects,
+                effects,
+                event_tx,
+                seq,
+            )
+            .await
+            {
                 return Err("Runtime event channel closed".to_string());
             }
             Ok(())
@@ -2941,7 +3130,11 @@ async fn execute_app_action(
             .await
             .map_err(|e| format!("Failed to switch model: {e}"))?;
 
-            runtime.update_ports(new_transport, resolved.routes.root.clone());
+            runtime.update_ports(
+                new_transport,
+                resolved.routes.root.clone(),
+                resolved.capabilities.freeform_tool_input,
+            );
             runtime.update_compaction_route(resolved.routes.compaction.clone());
 
             let provider_id = harness_model_api::ProviderId::new(profile_id.as_str())
@@ -2997,11 +3190,11 @@ async fn execute_app_action(
         }
     }
 }
-
 async fn run_model_attempt(
     runtime: &mut ConversationRuntime,
     command_rx: &mut harness_runtime_api::RuntimeCommandReceiver,
     commands: &harness_runtime_api::RuntimeCommandSender,
+    deferred_commands: &mut VecDeque<harness_runtime_api::RuntimeCommand>,
     turn_id: u64,
     attempt: Arc<ModelAttempt>,
     route: ResolvedModelRoute,
@@ -3009,6 +3202,7 @@ async fn run_model_attempt(
     seq: &mut u64,
 ) -> Result<Option<Vec<RuntimeEffect>>, RuntimeError> {
     let attempt_id = attempt.attempt_id.0;
+    let used_previous_response = attempt.request.previous_response_id.is_some();
     let compaction_attempt = runtime.compaction_attempt_active();
     ConversationRuntime::build_active_attempt(turn_id, Arc::clone(&attempt), route)?;
 
@@ -3017,18 +3211,30 @@ async fn run_model_attempt(
         Ok(handle) => handle,
         Err(error) => {
             if compaction_attempt {
-                runtime.fail_compaction_attempt();
-                return Ok(Some(vec![RuntimeEffect::Emit(
-                    harness_runtime_api::RuntimeEvent::Failure(
-                        harness_runtime_api::RuntimeFailure {
-                            category: harness_runtime_api::RuntimeFailureCategory::Model,
-                            message: format!("{error:?}"),
-                        },
-                    ),
-                )]));
+                let effects = runtime
+                    .fail_compaction_attempt(
+                        harness_runtime_api::RuntimeFailureCategory::Model,
+                        error.message.clone(),
+                    )
+                    .await?;
+                return Ok(Some(effects));
             }
 
             let outcome = harness_model_api::ModelTerminalOutcome::Failed(error);
+            if used_previous_response && requires_full_context_retry(&outcome) {
+                if let Some(retry) = runtime.retry_with_full_context(turn_id, attempt_id)? {
+                    return Ok(Some(vec![
+                        RuntimeEffect::Emit(harness_runtime_api::RuntimeEvent::Failure(
+                            harness_runtime_api::RuntimeFailure {
+                                category: harness_runtime_api::RuntimeFailureCategory::Model,
+                                message: "The provider rejected the cached response continuation; retrying with full context.".to_string(),
+                            },
+                        )),
+                        retry,
+                    ]));
+                }
+            }
+
             if is_custom_tool_compatibility_failure(&outcome) {
                 if let Some(retry) = runtime.retry_with_compatibility(turn_id, attempt_id)? {
                     return Ok(Some(vec![
@@ -3058,6 +3264,7 @@ async fn run_model_attempt(
         }
     };
 
+
     let mut deferred = Vec::new();
     loop {
         // Race the command channel against the event stream so that an
@@ -3069,6 +3276,7 @@ async fn run_model_attempt(
             Closed,
         }
         let gate = tokio::select! {
+            biased;
             cmd = command_rx.recv() => match cmd {
                 Ok(cmd) => Gate::Command(cmd),
                 Err(_) => Gate::Closed,
@@ -3078,16 +3286,25 @@ async fn run_model_attempt(
                 None => Gate::Closed,
             },
         };
+
         let event = match gate {
             Gate::Command(command) => {
+                if matches!(
+                    &command,
+                    harness_runtime_api::RuntimeCommand::ExecuteCommand { .. }
+                ) {
+                    deferred_commands.push_back(command);
+                    continue;
+                }
+
                 let is_interrupt = matches!(
                     command,
                     harness_runtime_api::RuntimeCommand::Interrupt { .. }
                         | harness_runtime_api::RuntimeCommand::SendQueuedSteering
+                        | harness_runtime_api::RuntimeCommand::CancelCompaction
                         | harness_runtime_api::RuntimeCommand::StopRequestLoop
                         | harness_runtime_api::RuntimeCommand::AbortResponse
                 );
-
                 if matches!(
                     &command,
                     harness_runtime_api::RuntimeCommand::Compact { .. }
@@ -3129,20 +3346,37 @@ async fn run_model_attempt(
                 // StopRequestLoop just sets the stop-requested flag so the
                 // turn ends at the next continuation — don't cancel the
                 // transport, let the current response finish naturally.
-                let needs_cancel = !matches!(
+                let may_cancel = !matches!(
                     command,
                     harness_runtime_api::RuntimeCommand::StopRequestLoop
                 );
-                if let Err(error) = runtime.dispatch_command(command).await {
-                    emit_runtime_failure(
-                        event_tx,
-                        seq,
-                        harness_runtime_api::RuntimeFailureCategory::Command,
-                        format!("runtime command failed: {error}"),
-                    )
-                    .await;
+                match runtime.dispatch_command(command).await {
+                    Ok(effects) => {
+                        for effect in effects {
+                            match effect {
+                                RuntimeEffect::Emit(event) => {
+                                    let envelope =
+                                        harness_runtime_api::RuntimeEventEnvelope::new(*seq, event);
+                                    *seq += 1;
+                                    if event_tx.send(envelope).await.is_err() {
+                                        return Ok(None);
+                                    }
+                                }
+                                effect => deferred.push(effect),
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        emit_runtime_failure(
+                            event_tx,
+                            seq,
+                            harness_runtime_api::RuntimeFailureCategory::Command,
+                            format!("runtime command failed: {error}"),
+                        )
+                        .await;
+                    }
                 }
-                if needs_cancel {
+                if may_cancel && runtime.model_cancellation_requested() {
                     handle.cancel(harness_model_api::ModelCancellation {
                         reason: "user interrupt".to_owned(),
                     });
@@ -3153,9 +3387,11 @@ async fn run_model_attempt(
             Gate::Event(event) => event,
             Gate::Closed => break,
         };
-        let prev_not_found_failure = match &event {
+        let full_context_failure = match &event {
             harness_model_api::ModelEvent::Terminal(outcome)
-                if !compaction_attempt && is_previous_response_not_found_failure(outcome) =>
+                if used_previous_response
+                    && !compaction_attempt
+                    && requires_full_context_retry(outcome) =>
             {
                 Some(outcome.clone())
             }
@@ -3170,7 +3406,7 @@ async fn run_model_attempt(
             _ => None,
         };
         let terminal = matches!(&event, harness_model_api::ModelEvent::Terminal(_));
-        let (event_effects, stop) = if let Some(outcome) = prev_not_found_failure {
+        let (event_effects, stop) = if let Some(outcome) = full_context_failure {
             let started = runtime.model_response_started();
             if let Some(retry) = runtime.retry_with_full_context(turn_id, attempt_id)? {
                 let mut effects = Vec::new();
@@ -3182,7 +3418,7 @@ async fn run_model_attempt(
                 effects.push(RuntimeEffect::Emit(harness_runtime_api::RuntimeEvent::Failure(
                     harness_runtime_api::RuntimeFailure {
                         category: harness_runtime_api::RuntimeFailureCategory::Model,
-                        message: "The cached previous_response_id was not found by the provider; retrying with full context.".to_string(),
+                        message: "The provider rejected the cached response continuation; retrying with full context.".to_string(),
                     },
                 )));
                 effects.push(retry);
@@ -3234,22 +3470,16 @@ async fn run_model_attempt(
                         },
                     );
                     if compaction_attempt {
-                        let started = runtime.model_response_started();
-                        let failure_message = format!("{failure:?}");
-                        runtime.fail_compaction_attempt();
-                        let effect = if started {
-                            RuntimeEffect::Emit(
-                                harness_runtime_api::RuntimeEvent::ResponseFinished(failure),
-                            )
-                        } else {
-                            RuntimeEffect::Emit(harness_runtime_api::RuntimeEvent::Failure(
-                                harness_runtime_api::RuntimeFailure {
-                                    category: harness_runtime_api::RuntimeFailureCategory::Protocol,
-                                    message: failure_message,
-                                },
-                            ))
-                        };
-                        (vec![effect], true)
+                        let message = format!("model event rejected: {error}");
+                        (
+                            runtime
+                                .fail_compaction_attempt(
+                                    harness_runtime_api::RuntimeFailureCategory::Protocol,
+                                    message,
+                                )
+                                .await?,
+                            true,
+                        )
                     } else {
                         (
                             runtime
@@ -3305,18 +3535,13 @@ async fn run_model_attempt(
             message: "model stream ended before a terminal event".to_string(),
         });
     if compaction_attempt {
-        let started = runtime.model_response_started();
-        let failure_message = format!("{failure:?}");
-        runtime.fail_compaction_attempt();
-        let event = if started {
-            harness_runtime_api::RuntimeEvent::ResponseFinished(failure)
-        } else {
-            harness_runtime_api::RuntimeEvent::Failure(harness_runtime_api::RuntimeFailure {
-                category: harness_runtime_api::RuntimeFailureCategory::Protocol,
-                message: failure_message,
-            })
-        };
-        return Ok(Some(vec![RuntimeEffect::Emit(event)]));
+        let effects = runtime
+            .fail_compaction_attempt(
+                harness_runtime_api::RuntimeFailureCategory::Protocol,
+                "model stream ended before a terminal event".to_string(),
+            )
+            .await?;
+        return Ok(Some(effects));
     }
     let effects = runtime
         .finish_model_attempt(turn_id, attempt_id, failure)
@@ -3337,9 +3562,7 @@ fn is_custom_tool_compatibility_failure(outcome: &harness_model_api::ModelTermin
     )
 }
 
-fn is_previous_response_not_found_failure(
-    outcome: &harness_model_api::ModelTerminalOutcome,
-) -> bool {
+fn requires_full_context_retry(outcome: &harness_model_api::ModelTerminalOutcome) -> bool {
     matches!(
         outcome,
         harness_model_api::ModelTerminalOutcome::Failed(failure)
@@ -3366,12 +3589,15 @@ async fn drive_runtime_effects(
     runtime: &mut ConversationRuntime,
     command_rx: &mut harness_runtime_api::RuntimeCommandReceiver,
     commands: &harness_runtime_api::RuntimeCommandSender,
+    deferred_commands: &mut VecDeque<harness_runtime_api::RuntimeCommand>,
+    suspended_effects: &mut Option<Vec<RuntimeEffect>>,
     effects: Vec<RuntimeEffect>,
     event_tx: &harness_runtime_api::RuntimeEventSender,
     seq: &mut u64,
 ) -> bool {
     let mut pending = Vec::new();
     enqueue_runtime_effects(&mut pending, effects);
+
 
     while let Some(effect) = pending.pop() {
         let result = match effect {
@@ -3420,7 +3646,15 @@ async fn drive_runtime_effects(
                     return false;
                 }
                 let result = run_model_attempt(
-                    runtime, command_rx, commands, turn_id, attempt, route, event_tx, seq,
+                    runtime,
+                    command_rx,
+                    commands,
+                    deferred_commands,
+                    turn_id,
+                    attempt,
+                    route,
+                    event_tx,
+                    seq,
                 )
                 .await;
                 if !emit_runtime_event(
@@ -3441,34 +3675,68 @@ async fn drive_runtime_effects(
                     )),
                 }
             }
+
             RuntimeEffect::StartCompaction {
                 compaction_id: _,
                 attempt,
                 route,
             } => match run_model_attempt(
-                runtime, command_rx, commands, 0, attempt, route, event_tx, seq,
+                runtime,
+                command_rx,
+                commands,
+                deferred_commands,
+                0,
+                attempt,
+                route,
+                event_tx,
+                seq,
             )
             .await
             {
                 Ok(Some(effects)) => Ok(effects),
                 Ok(None) => return false,
-                Err(error) => Err((
-                    harness_runtime_api::RuntimeFailureCategory::Model,
-                    format!("starting compaction failed: {error}"),
-                )),
+                Err(error) => {
+                    let message = format!("starting compaction failed: {error}");
+                    runtime
+                        .fail_compaction_attempt(
+                            harness_runtime_api::RuntimeFailureCategory::Model,
+                            message.clone(),
+                        )
+                        .await
+                        .map_err(|cleanup_error| {
+                            (
+                                harness_runtime_api::RuntimeFailureCategory::Lifecycle,
+                                format!("{message}; compaction cleanup failed: {cleanup_error}"),
+                            )
+                        })
+                }
             },
-            RuntimeEffect::CommitCompaction {
-                compaction_id,
-                summary,
-            } => runtime
-                .commit_compaction(compaction_id, summary)
-                .await
-                .map_err(|error| {
-                    (
-                        harness_runtime_api::RuntimeFailureCategory::Session,
-                        format!("compaction commit failed: {error}"),
-                    )
-                }),
+
+            RuntimeEffect::CommitCompaction { compaction_id } => {
+                match runtime.commit_compaction(compaction_id).await {
+                    Ok(effects) => Ok(effects),
+                    Err(error) => {
+                        let message = format!("compaction commit failed: {error}");
+                        Ok(vec![
+                            RuntimeEffect::Emit(
+                                harness_runtime_api::RuntimeEvent::CompactionFailed(
+                                    message.clone(),
+                                ),
+                            ),
+                            RuntimeEffect::Emit(
+                                harness_runtime_api::RuntimeEvent::AgenticLoopCompleted,
+                            ),
+                            RuntimeEffect::Emit(harness_runtime_api::RuntimeEvent::Failure(
+                                harness_runtime_api::RuntimeFailure {
+                                    category:
+                                        harness_runtime_api::RuntimeFailureCategory::Session,
+                                    message,
+                                },
+                            )),
+                        ])
+                    }
+                }
+            }
             RuntimeEffect::CommitAssistant {
                 turn_id,
                 attempt_id,
@@ -3500,44 +3768,11 @@ async fn drive_runtime_effects(
             RuntimeEffect::ExecuteTool {
                 turn_id,
                 call_id,
-                mut request,
+                request,
             } => {
-                if let harness_tool_api::ToolInput::FunctionJson(json_str) = &request.input {
-                    use sonic_rs::{JsonContainerTrait, JsonValueTrait};
-                    if let Ok(value) = sonic_rs::from_str::<sonic_rs::Value>(json_str) {
-                        let mut current = &value;
-                        while let Some(obj) = current.as_object() {
-                            if obj.len() == 1 {
-                                let (_, val) = obj.iter().next().unwrap();
-                                current = val;
-                            } else {
-                                break;
-                            }
-                        }
-                        if let Some(s) = current.as_str() {
-                            request.input =
-                                harness_tool_api::ToolInput::FunctionJson(s.to_string());
-                        }
-                    }
-                }
                 let execution_id = request.execution_id.0;
-                let output = match runtime.tool_executor() {
-                    Ok(executor) => match executor.execute(request).await {
-                        Ok(result) => result.model_output,
-                        Err(error) => {
-                            let message = match &error {
-                                ToolFailure::InvalidInput(msg) => msg.clone(),
-                                ToolFailure::Execution(msg) => msg.clone(),
-                                ToolFailure::TimedOut => {
-                                    "The tool timed out before completing.".to_string()
-                                }
-                                ToolFailure::Cancelled => "The tool was cancelled.".to_string(),
-                            };
-                            format!(
-                                "The tool reported: {message}\n\nReview the error and retry the tool call with corrected input."
-                            )
-                        }
-                    },
+                let result = match runtime.tool_executor() {
+                    Ok(executor) => executor.execute(request).await,
                     Err(error) => {
                         return emit_effect_failure(
                             event_tx,
@@ -3549,7 +3784,7 @@ async fn drive_runtime_effects(
                     }
                 };
                 runtime
-                    .commit_tool_result(turn_id, execution_id, call_id, output)
+                    .commit_tool_result(turn_id, execution_id, call_id, result)
                     .await
                     .map_err(|error| {
                         (
@@ -3574,7 +3809,17 @@ async fn drive_runtime_effects(
         };
 
         match result {
-            Ok(next) => enqueue_runtime_effects(&mut pending, next),
+            Ok(next) => {
+                enqueue_runtime_effects(&mut pending, next);
+                if !deferred_commands.is_empty() {
+                    let mut suspended = pending.into_iter().rev().collect::<Vec<_>>();
+                    if let Some(existing) = suspended_effects.take() {
+                        suspended.extend(existing);
+                    }
+                    *suspended_effects = Some(suspended);
+                    return true;
+                }
+            }
             Err((category, message)) => {
                 return emit_effect_failure(event_tx, seq, category, message).await;
             }
@@ -3597,6 +3842,7 @@ async fn emit_effect_failure(
 fn start_conversation_runtime(
     session_id: harness_session_store::SessionId,
     model: ModelSelection,
+    freeform_tool_input: bool,
     ports: RuntimePorts,
     provider_config: ProviderConfig,
     active_generation: Arc<AtomicU64>,
@@ -3609,6 +3855,7 @@ fn start_conversation_runtime(
         let mut runtime = ConversationRuntime::new(RuntimeConfiguration {
             session_id,
             model,
+            freeform_tool_input,
             ports,
         });
         let mut seq = 1;
@@ -3653,13 +3900,37 @@ fn start_conversation_runtime(
                 return;
             }
         };
+        let mut deferred_commands = VecDeque::new();
+        let mut suspended_effects = None;
 
-        while let Ok(cmd) = command_rx.recv().await {
+        loop {
+            let cmd = if let Some(command) = deferred_commands.pop_front() {
+                command
+            } else if let Some(effects) = suspended_effects.take() {
+                if !drive_runtime_effects(
+                    &mut runtime,
+                    &mut command_rx,
+                    &commands,
+                    &mut deferred_commands,
+                    &mut suspended_effects,
+                    effects,
+                    &event_tx,
+                    &mut seq,
+                )
+                .await
+                {
+                    break;
+                }
+                continue;
+            } else {
+                let Ok(command) = command_rx.recv().await else {
+                    break;
+                };
+                command
+            };
             let is_shutdown = matches!(&cmd, harness_runtime_api::RuntimeCommand::Shutdown);
 
-            if let harness_runtime_api::RuntimeCommand::SubmitPrompt { text } = &cmd
-                && text.starts_with('/')
-            {
+            if let harness_runtime_api::RuntimeCommand::ExecuteCommand { text } = &cmd {
                 let result = match registry.dispatch(&mut app_state, text) {
                     Ok(Dispatch::Ran(action)) => {
                         execute_app_action(
@@ -3669,6 +3940,8 @@ fn start_conversation_runtime(
                             &mut runtime,
                             &mut command_rx,
                             &commands,
+                            &mut deferred_commands,
+                            &mut suspended_effects,
                             &event_tx,
                             &session_root,
                             &active_generation,
@@ -3677,7 +3950,10 @@ fn start_conversation_runtime(
                         )
                         .await
                     }
-                    Ok(Dispatch::NotCommand) => Ok(()),
+                    Ok(Dispatch::NotCommand) => Err(
+                        "failed to execute command: command text must begin with `/`; submit ordinary text as a prompt"
+                            .to_string(),
+                    ),
                     Err(error) => Err(error.to_string()),
                 };
 
@@ -3711,6 +3987,8 @@ fn start_conversation_runtime(
                 &mut runtime,
                 &mut command_rx,
                 &commands,
+                &mut deferred_commands,
+                &mut suspended_effects,
                 effects,
                 &event_tx,
                 &mut seq,
@@ -3939,6 +4217,7 @@ async fn run_tui(_auth_mode: AuthMode, resume: ResumeSelection) -> CliResult<()>
     let runtime = start_conversation_runtime(
         session_id,
         resolved_provider.selected_model.clone(),
+        resolved_provider.capabilities.freeform_tool_input,
         ports,
         provider_config,
         active_generation,
@@ -4023,10 +4302,8 @@ fn resolve_session_startup(root: &Path, resume: ResumeSelection) -> CliResult<Se
     } else {
         read_session_records(root, &session_id)?
     };
-    let initial_transcript_entries = records
-        .iter()
-        .filter_map(harness_conversation_runtime::project_transcript_record)
-        .collect();
+    let initial_transcript_entries =
+        harness_conversation_runtime::project_transcript_records(&records);
 
     Ok(SessionStartup {
         session_id,
@@ -4050,14 +4327,6 @@ fn editable_message(record: &SessionRecord) -> Option<harness_runtime_api::Edita
         SessionPayload::AssistantMessage { text, .. } => (
             harness_runtime_api::EditableMessageRole::Assistant,
             text.clone(),
-        ),
-        SessionPayload::ToolCallAccepted {
-            name,
-            input: SessionToolInput::Freeform(input),
-            ..
-        } => (
-            harness_runtime_api::EditableMessageRole::Tool { name: name.clone() },
-            input.clone(),
         ),
         _ => return None,
     };
@@ -4087,21 +4356,17 @@ fn edit_session_records(
         SessionPayload::ToolCallAccepted {
             turn_id, call_id, ..
         } if replacement.is_none() => Some((*turn_id, call_id.as_str())),
-        SessionPayload::ToolCallAccepted {
-            input: SessionToolInput::Freeform(_),
-            ..
-        } => None,
         SessionPayload::ToolCallAccepted { .. } => {
             return Err(format!(
-                "Transcript record {target_sequence} is not a native freeform tool call, so its \
-                 input cannot be edited. Select a native tool call from `/edit`, or use \
-                 `/edit delete {target_sequence}` to remove this call and its result."
+                "Transcript record {target_sequence} is a tool activity. Typed tool invocations \
+                 cannot be edited as raw text. Use `/edit delete {target_sequence}` to remove the \
+                 call and its result."
             ));
         }
         _ => {
             return Err(format!(
-                "Transcript record {target_sequence} is not an editable user message, assistant \
-                 message, or native tool call. Run `/edit` to choose a transcript entry."
+                "Transcript record {target_sequence} is not an editable user or assistant \
+                 message. Run `/edit` to choose a transcript entry."
             ));
         }
     };
@@ -4121,18 +4386,6 @@ fn edit_session_records(
                             text: text.to_owned(),
                         }
                     }
-                    SessionPayload::ToolCallAccepted {
-                        turn_id,
-                        call_id,
-                        name,
-                        input: SessionToolInput::Freeform(_),
-                    } => SessionPayload::ToolCallAccepted {
-                        turn_id: *turn_id,
-                        call_id: call_id.clone(),
-                        name: name.clone(),
-                        input: SessionToolInput::Freeform(text.to_owned()),
-                    },
-
                     _ => unreachable!("target payload was validated as an editable message"),
                 };
                 payloads.push(payload);
@@ -4143,10 +4396,9 @@ fn edit_session_records(
         let correlated_tool_record = tool_target.is_some_and(|(target_turn_id, target_call_id)| {
             matches!(
                 &record.payload,
-                SessionPayload::ToolExecutionStarted { turn_id, call_id }
-                    | SessionPayload::ToolExecutionFinished {
-                        turn_id, call_id, ..
-                    }
+                SessionPayload::ToolExecutionFinished {
+                    turn_id, call_id, ..
+                }
                     if *turn_id == target_turn_id && call_id == target_call_id
             )
         });
@@ -4213,10 +4465,7 @@ async fn emit_transcript_replacement(
 ) -> Result<(), String> {
     let records = read_session_records(root, session_id)
         .map_err(|error| format!("Failed to read forked session: {error}"))?;
-    let entries = records
-        .iter()
-        .filter_map(harness_conversation_runtime::project_transcript_record)
-        .collect();
+    let entries = harness_conversation_runtime::project_transcript_records(&records);
     let envelope = harness_runtime_api::RuntimeEventEnvelope::new(
         *sequence,
         harness_runtime_api::RuntimeEvent::TranscriptReplaced(entries),
@@ -4289,11 +4538,7 @@ fn read_session_records(
         });
     }
     let content = std::fs::read_to_string(&path).map_err(|source| CliError::Io { source })?;
-    let loaded = serde_json::from_str::<Vec<SerializableRecord>>(&content).map_err(|error| {
-        CliError::Session(harness_session_store::SessionStoreError::InvalidFormat(
-            error.to_string(),
-        ))
-    })?;
+    let loaded = deserialize_session_records(&content).map_err(CliError::Session)?;
     Ok(loaded
         .into_iter()
         .map(|record| from_serializable_record(record, session_id))
@@ -4403,6 +4648,172 @@ fn format_uuid_like(mut bits: u128) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::convert::Infallible;
+
+    use futures_util::StreamExt;
+    use http_body_util::Full;
+    use hyper::service::service_fn;
+    use hyper_util::rt::TokioIo;
+
+    #[test]
+    fn legacy_tool_records_are_upgraded_when_loading_a_session() {
+        let content = serde_json::json!([
+            {
+                "sequence": 1,
+                "payload": { "ToolCallAccepted": {
+                    "turn_id": 7,
+                    "call_id": "call-1",
+                    "name": "inspect",
+                    "input": { "Freeform": "pwd" }
+                }}
+            },
+            {
+                "sequence": 2,
+                "payload": { "ToolExecutionStarted": {
+                    "turn_id": 7,
+                    "call_id": "call-1"
+                }}
+            },
+            {
+                "sequence": 3,
+                "payload": { "ToolExecutionFinished": {
+                    "turn_id": 7,
+                    "call_id": "call-1",
+                    "output": "/workspace"
+                }}
+            }
+        ]).to_string();
+
+        let records = deserialize_session_records(&content).unwrap();
+        assert_eq!(records.len(), 2);
+        let session_id = harness_session_store::SessionId::new("legacy").unwrap();
+        let accepted = from_serializable_record(records[0].clone(), &session_id);
+        let finished = from_serializable_record(records[1].clone(), &session_id);
+
+        assert!(matches!(accepted.payload, SessionPayload::ToolCallAccepted {
+            raw_input: SessionToolInput::Freeform(ref input), ..
+        } if input == "pwd"));
+        assert!(matches!(finished.payload, SessionPayload::ToolExecutionFinished {
+            raw_output: ref output,
+            outcome: harness_tool_api::ToolOutcome::Failed(_),
+            ..
+        } if output == "/workspace"));
+    }
+
+    async fn retrying_http_server(
+        status: http::StatusCode,
+        failures_before_success: usize,
+    ) -> (String, tokio::task::JoinHandle<usize>) {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut request_count = 0;
+            while request_count <= failures_before_success {
+                let (stream, _) = listener.accept().await.unwrap();
+                request_count += 1;
+                let request_number = request_count;
+                hyper::server::conn::http1::Builder::new()
+                    .serve_connection(
+                        TokioIo::new(stream),
+                        service_fn(move |_request| async move {
+                            let response = if request_number <= failures_before_success {
+                                http::Response::builder()
+                                    .status(status)
+                                    .header(http::header::CONNECTION, "close")
+                                    .body(Full::new(bytes::Bytes::from_static(b"retry")))
+                                    .unwrap()
+                            } else {
+                                http::Response::builder()
+                                    .status(http::StatusCode::OK)
+                                    .header(http::header::CONTENT_TYPE, "text/event-stream")
+                                    .header(http::header::CONNECTION, "close")
+                                    .body(Full::new(bytes::Bytes::from_static(b"data: {}\n\n")))
+                                    .unwrap()
+                            };
+                            Ok::<_, Infallible>(response)
+                        }),
+                    )
+                    .await
+                    .unwrap();
+            }
+            request_count
+        });
+        (format!("http://{addr}"), server)
+    }
+
+    fn http_responses_attempt() -> Arc<ModelAttempt> {
+        let selection = ModelSelection::new(
+            harness_model_api::ProviderId::new("test-provider").unwrap(),
+            "test-model",
+            None,
+            None,
+        );
+        Arc::new(ModelAttempt::initial(
+            Arc::new(ModelRequest {
+                request_id: ModelRequestId(1),
+                context_usage: None,
+                provider_generation: ProviderGeneration(1),
+                history_revision: 0,
+                selection,
+                input: Arc::from([]),
+                tools: Arc::from([]),
+                previous_response_id: None,
+            }),
+            harness_model_api::ModelAttemptId(1),
+        ))
+    }
+
+    #[tokio::test]
+    async fn http_provider_clients_continue_retrying_429_and_500() {
+        const FAILURES_BEFORE_SUCCESS: usize = 3;
+
+        for status in [
+            http::StatusCode::TOO_MANY_REQUESTS,
+            http::StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            let (base_url, server) =
+                retrying_http_server(status, FAILURES_BEFORE_SUCCESS).await;
+            let client = HttpClient::new(
+                base_url,
+                None,
+                "test-session",
+                harness_model_api::ModelCapabilities::default(),
+            );
+            let mut stream = ChatStreamingClient::start(
+                &client,
+                sonic_rs::json!({"model": "test-model", "stream": true}),
+            )
+            .await
+            .unwrap();
+            assert!(stream.next().await.is_some());
+            assert_eq!(
+                server.await.unwrap(),
+                FAILURES_BEFORE_SUCCESS + 1,
+                "chat completions status {status}"
+            );
+
+            let (base_url, server) =
+                retrying_http_server(status, FAILURES_BEFORE_SUCCESS).await;
+            let client = HttpClient::new(
+                base_url,
+                None,
+                "test-session",
+                harness_model_api::ModelCapabilities::default(),
+            );
+            let mut stream = StreamingClient::start(&client, http_responses_attempt())
+                .await
+                .unwrap();
+            assert!(stream.next().await.is_some());
+            assert_eq!(
+                server.await.unwrap(),
+                FAILURES_BEFORE_SUCCESS + 1,
+                "Responses status {status}"
+            );
+
+        }
+    }
 
     fn record(sequence: u64, payload: SessionPayload) -> SessionRecord {
         SessionRecord {
@@ -4410,6 +4821,263 @@ mod tests {
             sequence,
             payload,
         }
+    }
+    fn inspect_invocation(path: &str) -> harness_tool_api::ToolInvocation {
+        harness_tool_api::ToolInvocation::Inspect(harness_tool_api::Prepared::Ready(
+            harness_tool_api::InspectRequest {
+                jobs: vec![harness_tool_api::InspectJobRequest::Read(
+                    harness_tool_api::InspectReadRequest {
+                        path: path.to_owned(),
+                        ranges: vec![harness_tool_api::LineRange {
+                            start_line: 1,
+                            line_count: 20,
+                        }],
+                    },
+                )],
+            },
+        ))
+    }
+
+    fn inspect_outcome(path: &str, lines: &[&str]) -> harness_tool_api::ToolOutcome {
+        harness_tool_api::ToolOutcome::Inspect(harness_tool_api::InspectResult {
+            jobs: vec![harness_tool_api::InspectJobOutcome::Succeeded(
+                harness_tool_api::InspectJobSuccess::Read(harness_tool_api::InspectReadResult {
+                    excerpts: vec![harness_tool_api::SourceExcerpt {
+                        path: path.to_owned(),
+                        start_line: 1,
+                        lines: lines.iter().map(|line| (*line).to_owned()).collect(),
+                        next: None,
+                    }],
+                }),
+            )],
+        })
+    }
+
+    struct CommandGateRequestBuilder;
+
+    impl ModelRequestBuilder for CommandGateRequestBuilder {
+        fn build(
+            &self,
+            revision: u64,
+            selection: &ModelSelection,
+            provider_generation: ProviderGeneration,
+            history: &[SessionPayload],
+            steering: &[String],
+        ) -> Result<Arc<ModelRequest>, RuntimeError> {
+            let mut input = history
+                .iter()
+                .filter_map(|payload| match payload {
+                    SessionPayload::InputMessage { text, .. } => Some(ModelInput::Message {
+                        role: ModelMessageRole::User,
+                        text: text.clone(),
+                    }),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            input.extend(steering.iter().map(|text| ModelInput::Message {
+                role: ModelMessageRole::User,
+                text: text.clone(),
+            }));
+            Ok(Arc::new(ModelRequest {
+                request_id: ModelRequestId(revision),
+                context_usage: None,
+                provider_generation,
+                history_revision: revision,
+                selection: selection.clone(),
+                input: input.into(),
+                tools: Arc::from([]),
+                previous_response_id: None,
+            }))
+        }
+    }
+
+    struct ControlledAttemptHandle {
+        release: Option<tokio::sync::oneshot::Receiver<()>>,
+        events: tokio::sync::mpsc::UnboundedReceiver<harness_model_api::ModelEvent>,
+        cancellations: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ModelAttemptHandle for ControlledAttemptHandle {
+        fn cancel(&mut self, _reason: harness_model_api::ModelCancellation) {
+            self.cancellations.fetch_add(1, Ordering::Relaxed);
+        }
+        fn next_event(
+            &mut self,
+        ) -> Pin<Box<dyn Future<Output = Option<harness_model_api::ModelEvent>> + Send + '_>>
+        {
+            Box::pin(async move {
+                if let Some(release) = self.release.as_mut() {
+                    let _ = release.await;
+                    self.release = None;
+                }
+                self.events.recv().await
+            })
+        }
+    }
+
+    struct ControlledTransport {
+        handle: std::sync::Mutex<Option<ControlledAttemptHandle>>,
+    }
+
+    impl ModelTransport for ControlledTransport {
+        fn start(
+            &self,
+            _attempt: Arc<ModelAttempt>,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<Box<dyn ModelAttemptHandle>, ModelFailure>> + Send + '_,
+            >,
+        > {
+            Box::pin(async move {
+                self.handle
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .map(|handle| Box::new(handle) as Box<dyn ModelAttemptHandle>)
+                    .ok_or_else(|| ModelFailure {
+                        kind: harness_model_api::ModelFailureKind::Protocol,
+                        message: "controlled transport handle already taken".to_string(),
+                    })
+            })
+        }
+
+        fn shutdown(&self) -> Pin<Box<dyn Future<Output = Result<(), ModelFailure>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn slash_command_received_during_a_model_attempt_never_becomes_steering() {
+        let root = std::env::temp_dir().join(format!(
+            "new-harness-command-gate-test-{}",
+            generate_session_id().unwrap()
+        ));
+        let session_id = harness_session_store::SessionId::new("command-gate").unwrap();
+        let provider = harness_model_api::ProviderId::new("test-provider").unwrap();
+        let selection = ModelSelection::new(provider.clone(), "test-model", None, None);
+        let route = ResolvedModelRoute::new(
+            provider,
+            ProviderGeneration(1),
+            "test-route",
+            selection.clone(),
+        )
+        .unwrap();
+        let cancellations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (model_event_tx, model_event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let transport: Arc<dyn ModelTransport> = Arc::new(ControlledTransport {
+            handle: std::sync::Mutex::new(Some(ControlledAttemptHandle {
+                release: Some(release_rx),
+                events: model_event_rx,
+                cancellations: Arc::clone(&cancellations),
+            })),
+        });
+        let mut runtime = ConversationRuntime::new(RuntimeConfiguration {
+            session_id,
+            model: selection,
+            freeform_tool_input: true,
+            ports: RuntimePorts {
+                session_store: Arc::new(FileSessionStore { root: root.clone() }),
+                tool_registry: ToolRegistry::new(),
+                tool_executor: None,
+                model_transport: transport,
+                request_builder: Arc::new(CommandGateRequestBuilder),
+                model_route: route.clone(),
+                compaction_route: route,
+                tool_availability: Arc::new(RwLock::new(ToolAvailability::new())),
+            },
+        });
+        runtime.begin_startup().await.unwrap();
+        runtime.mark_ready().unwrap();
+        let effects = runtime
+            .dispatch_command(harness_runtime_api::RuntimeCommand::SubmitPrompt {
+                text: "initial prompt".to_string(),
+            })
+            .await
+            .unwrap();
+        let (commands, mut runtime_events, event_tx, mut command_rx) = channel_pair(64);
+        let command_submitter = commands.clone();
+        let mut deferred_commands = VecDeque::new();
+        let mut suspended_effects = None;
+        let mut event_sequence = 1;
+
+        let drive = drive_runtime_effects(
+            &mut runtime,
+            &mut command_rx,
+            &commands,
+            &mut deferred_commands,
+            &mut suspended_effects,
+            effects,
+            &event_tx,
+            &mut event_sequence,
+        );
+        let feed = async move {
+            command_submitter
+                .send(harness_runtime_api::RuntimeCommand::SendQueuedSteering)
+                .await
+                .unwrap();
+            tokio::task::yield_now().await;
+            command_submitter
+                .send(harness_runtime_api::RuntimeCommand::ExecuteCommand {
+                    text: "/model next-model high".to_string(),
+                })
+                .await
+                .unwrap();
+            tokio::task::yield_now().await;
+            release_tx.send(()).unwrap();
+            model_event_tx
+                .send(harness_model_api::ModelEvent::Started)
+                .unwrap();
+            model_event_tx
+                .send(harness_model_api::ModelEvent::AssistantTextDelta(
+                    "done".to_string(),
+                ))
+                .unwrap();
+            model_event_tx
+                .send(harness_model_api::ModelEvent::Terminal(
+                    harness_model_api::ModelTerminalOutcome::Completed(
+                        harness_model_api::ModelCompletion {
+                            text: "done".to_string(),
+                            usage: None,
+                        },
+                    ),
+                ))
+                .unwrap();
+        };
+        let (drove, ()) = tokio::join!(drive, feed);
+
+        assert!(drove);
+        assert_eq!(cancellations.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            deferred_commands.pop_front(),
+            Some(harness_runtime_api::RuntimeCommand::ExecuteCommand {
+                text: "/model next-model high".to_string(),
+            })
+        );
+        assert!(suspended_effects.is_some());
+        assert!(runtime.queued_steering().is_empty());
+        assert!(!runtime.canonical_history().iter().any(|payload| matches!(
+            payload,
+            SessionPayload::InputMessage { text, .. } if text.starts_with("/model")
+        )));
+        while let Some(envelope) = runtime_events.try_recv().unwrap() {
+            assert!(!matches!(
+                &envelope.event,
+                harness_runtime_api::RuntimeEvent::SteeringChanged(Some(text))
+                    if text.contains("/model")
+            ));
+            assert!(!matches!(
+                &envelope.event,
+                harness_runtime_api::RuntimeEvent::Failure(
+                    harness_runtime_api::RuntimeFailure {
+                        category: harness_runtime_api::RuntimeFailureCategory::Command,
+                        ..
+                    }
+                )
+            ));
+        }
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -4547,146 +5215,61 @@ mod tests {
     }
 
     #[test]
-    fn native_tool_editor_keeps_the_name_out_of_editable_input() {
-        let native = record(
+    fn tool_activities_are_not_editable_as_raw_messages() {
+        let tool_call = record(
             1,
             SessionPayload::ToolCallAccepted {
                 turn_id: 7,
-                call_id: "call-native".to_string(),
-                name: "inspect".to_string(),
-                input: SessionToolInput::Freeform("read src/main.rs".to_string()),
-            },
-        );
-        let encoded = record(
-            2,
-            SessionPayload::ToolCallAccepted {
-                turn_id: 7,
-                call_id: "call-encoded".to_string(),
-                name: "compatibility_tool".to_string(),
-                input: SessionToolInput::FunctionJson(r#"{"path":"src/main.rs"}"#.to_string()),
+                call_id: "call-7".to_owned(),
+                invocation: inspect_invocation("src/main.rs"),
+                raw_input: SessionToolInput::Freeform("read src/main.rs".to_owned()),
             },
         );
 
-        let editable = editable_message(&native).unwrap();
-
-        assert_eq!(editable.text, "read src/main.rs");
-        assert!(matches!(
-            editable.role,
-            harness_runtime_api::EditableMessageRole::Tool { name } if name == "inspect"
-        ));
-        assert!(editable_message(&encoded).is_none());
+        assert!(editable_message(&tool_call).is_none());
+        let error = edit_session_records(&[tool_call], 1, Some("read other.rs")).unwrap_err();
+        assert!(error.contains("Typed tool invocations cannot be edited as raw text"));
     }
 
     #[test]
-    fn editing_a_native_tool_call_preserves_its_identity_execution_and_result() {
+    fn deleting_a_tool_call_removes_its_finished_activity() {
+        let invocation = inspect_invocation("src/main.rs");
+        let raw_input = SessionToolInput::Freeform("read src/main.rs".to_owned());
         let records = vec![
             record(
                 1,
                 SessionPayload::ToolCallAccepted {
                     turn_id: 7,
-                    call_id: "call-7".to_string(),
-                    name: "inspect".to_string(),
-                    input: SessionToolInput::Freeform("read old.rs".to_string()),
+                    call_id: "call-7".to_owned(),
+                    invocation: invocation.clone(),
+                    raw_input: raw_input.clone(),
                 },
             ),
             record(
                 2,
-                SessionPayload::ToolExecutionStarted {
+                SessionPayload::ToolExecutionFinished {
                     turn_id: 7,
-                    call_id: "call-7".to_string(),
+                    call_id: "call-7".to_owned(),
+                    invocation,
+                    outcome: inspect_outcome("src/main.rs", &["fn main() {}"]),
+                    raw_input,
+                    raw_output: "1 bucket fn main() {}".to_owned(),
                 },
             ),
             record(
                 3,
-                SessionPayload::ToolExecutionFinished {
-                    turn_id: 7,
-                    call_id: "call-7".to_string(),
-                    output: "retained tool output".to_string(),
-                },
-            ),
-            record(
-                4,
-                SessionPayload::ModelResponseMetadata {
-                    turn_id: 7,
-                    attempt_id: 2,
-                    provider: "provider".to_string(),
-                    response_id: "stale-response".to_string(),
-                },
-            ),
-        ];
-
-        let edited = edit_session_records(&records, 1, Some("read new.rs")).unwrap();
-
-        assert!(matches!(
-            &edited[0],
-            SessionPayload::ToolCallAccepted {
-                turn_id: 7,
-                call_id,
-                name,
-                input: SessionToolInput::Freeform(input),
-            } if call_id == "call-7" && name == "inspect" && input == "read new.rs"
-        ));
-        assert!(edited.iter().any(|payload| matches!(
-            payload,
-            SessionPayload::ToolExecutionStarted { turn_id: 7, call_id }
-                if call_id == "call-7"
-        )));
-        assert!(edited.iter().any(|payload| matches!(
-            payload,
-            SessionPayload::ToolExecutionFinished {
-                turn_id: 7,
-                call_id,
-                output,
-            } if call_id == "call-7" && output == "retained tool output"
-        )));
-        assert!(
-            !edited
-                .iter()
-                .any(|payload| matches!(payload, SessionPayload::ModelResponseMetadata { .. }))
-        );
-    }
-
-    #[test]
-    fn deleting_a_tool_call_removes_its_execution_and_result() {
-        let records = vec![
-            record(
-                1,
-                SessionPayload::ToolCallAccepted {
-                    turn_id: 7,
-                    call_id: "call-7".to_string(),
-                    name: "inspect".to_string(),
-                    input: SessionToolInput::Freeform("read src/main.rs".to_string()),
-                },
-            ),
-            record(
-                2,
-                SessionPayload::ToolExecutionStarted {
-                    turn_id: 7,
-                    call_id: "call-7".to_string(),
-                },
-            ),
-            record(
-                3,
-                SessionPayload::ToolExecutionFinished {
-                    turn_id: 7,
-                    call_id: "call-7".to_string(),
-                    output: "tool output".to_string(),
-                },
-            ),
-            record(
-                4,
                 SessionPayload::AssistantMessage {
                     turn_id: 7,
-                    text: "retained response".to_string(),
+                    text: "retained response".to_owned(),
                 },
             ),
             record(
-                5,
+                4,
                 SessionPayload::ModelResponseMetadata {
                     turn_id: 7,
                     attempt_id: 2,
-                    provider: "provider".to_string(),
-                    response_id: "stale-response".to_string(),
+                    provider: "provider".to_owned(),
+                    response_id: "stale-response".to_owned(),
                 },
             ),
         ];
@@ -4696,7 +5279,6 @@ mod tests {
         assert!(!edited.iter().any(|payload| matches!(
             payload,
             SessionPayload::ToolCallAccepted { call_id, .. }
-                | SessionPayload::ToolExecutionStarted { call_id, .. }
                 | SessionPayload::ToolExecutionFinished { call_id, .. }
                 if call_id == "call-7"
         )));
@@ -4712,82 +5294,97 @@ mod tests {
     }
 
     #[test]
-    fn resumed_session_projects_persisted_tool_name_input_and_result() {
+    fn resumed_session_coalesces_accepted_and_finished_tool_activity() {
         let root = std::env::temp_dir().join(format!(
             "new-harness-tool-resume-test-{}",
             generate_session_id().unwrap()
         ));
+        let invocation = inspect_invocation("src/main.rs");
+        let raw_input = SessionToolInput::Freeform("read src/main.rs 1-20".to_owned());
         let payloads = vec![
             SessionPayload::ToolCallAccepted {
                 turn_id: 1,
-                call_id: "call-1".to_string(),
-                name: "inspect".to_string(),
-                input: SessionToolInput::Freeform("read src/main.rs 1-20".to_string()),
+                call_id: "call-1".to_owned(),
+                invocation: invocation.clone(),
+                raw_input: raw_input.clone(),
             },
             SessionPayload::ToolExecutionFinished {
                 turn_id: 1,
-                call_id: "call-1".to_string(),
-                output: "1 bucket fn main() {}".to_string(),
+                call_id: "call-1".to_owned(),
+                invocation,
+                outcome: inspect_outcome("src/main.rs", &["fn main() {}"]),
+                raw_input,
+                raw_output: "1 bucket fn main() {}".to_owned(),
             },
         ];
         let session_id = create_session_fork(&root, &payloads).unwrap();
 
         let startup = resolve_session_startup(
             &root,
-            ResumeSelection::SessionId(session_id.as_str().to_string()),
+            ResumeSelection::SessionId(session_id.as_str().to_owned()),
         )
         .unwrap();
 
+        assert_eq!(startup.initial_transcript_entries.len(), 1);
+        let harness_runtime_api::TranscriptPayload::ToolActivity(activity) =
+            &startup.initial_transcript_entries[0].payload
+        else {
+            panic!("finished tool activity is replayed");
+        };
+        assert_eq!(activity.call_id, "call-1");
         assert!(matches!(
-            &startup.initial_transcript_entries[0].payload,
-            harness_runtime_api::TranscriptPayload::ToolCall {
-                call_id,
-                name,
-                input: harness_runtime_api::TranscriptToolInput::Freeform(input),
-            } if call_id == "call-1"
-                && name == "inspect"
-                && input == "read src/main.rs 1-20"
+            activity.invocation,
+            harness_tool_api::ToolInvocation::Inspect(harness_tool_api::Prepared::Ready(_))
         ));
-        assert!(matches!(
-            &startup.initial_transcript_entries[1].payload,
-            harness_runtime_api::TranscriptPayload::ToolResult { call_id, output }
-                if call_id == "call-1" && output == "1 bucket fn main() {}"
-        ));
+        let harness_runtime_api::ToolActivityPhase::Finished {
+            outcome,
+            raw_output,
+        } = &activity.phase
+        else {
+            panic!("newest tool state is replayed");
+        };
+        assert!(matches!(outcome, harness_tool_api::ToolOutcome::Inspect(_)));
+        assert_eq!(raw_output, "1 bucket fn main() {}");
+
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn resumed_existing_tool_record_keeps_name_and_input_without_guessing_encoding() {
+    fn resumed_finished_only_page_renders_without_an_accepted_record() {
         let root = std::env::temp_dir().join(format!(
-            "new-harness-existing-tool-resume-test-{}",
+            "new-harness-finished-tool-resume-test-{}",
             generate_session_id().unwrap()
         ));
-        let session_id =
-            harness_session_store::SessionId::new(generate_session_id().unwrap()).unwrap();
-        let session_dir = root.join("sessions");
-        std::fs::create_dir_all(&session_dir).unwrap();
-        std::fs::write(
-            session_dir.join(format!("{}.json", session_id.as_str())),
-            r#"[{"sequence":1,"payload":{"ToolCallAccepted":{"turn_id":1,"call_id":"call-old","name":"terminal_open","input":"command: cargo test"}}}]"#,
-        )
-        .unwrap();
+        let payloads = vec![SessionPayload::ToolExecutionFinished {
+            turn_id: 1,
+            call_id: "call-1".to_owned(),
+            invocation: inspect_invocation("src/main.rs"),
+            outcome: inspect_outcome("src/main.rs", &["fn main() {}"]),
+            raw_input: SessionToolInput::Freeform("read src/main.rs 1-20".to_owned()),
+            raw_output: "model-visible output".to_owned(),
+        }];
+        let session_id = create_session_fork(&root, &payloads).unwrap();
 
         let startup = resolve_session_startup(
             &root,
-            ResumeSelection::SessionId(session_id.as_str().to_string()),
+            ResumeSelection::SessionId(session_id.as_str().to_owned()),
         )
         .unwrap();
 
         assert!(matches!(
-            &startup.initial_transcript_entries[0].payload,
-            harness_runtime_api::TranscriptPayload::ToolCall {
-                call_id,
-                name,
-                input: harness_runtime_api::TranscriptToolInput::Unspecified(input),
-            } if call_id == "call-old"
-                && name == "terminal_open"
-                && input == "command: cargo test"
+            &startup.initial_transcript_entries[..],
+            [harness_runtime_api::TranscriptSnapshotEntry {
+                payload: harness_runtime_api::TranscriptPayload::ToolActivity(
+                    harness_runtime_api::ToolActivity {
+                        call_id,
+                        phase: harness_runtime_api::ToolActivityPhase::Finished { .. },
+                        ..
+                    }
+                ),
+                ..
+            }] if call_id == "call-1"
         ));
+
         std::fs::remove_dir_all(root).unwrap();
     }
 

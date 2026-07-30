@@ -347,14 +347,17 @@ where
     C: StreamingClient + 'static,
 {
     send_event(&sender, ModelEvent::Started, &cancellation).await?;
+    let tools = Arc::clone(&attempt.request.tools);
     let mut stream = client.start(attempt).await.map_err(map_stream_error)?;
-    let mut decoder = ResponsesEventDecoder::with_max_event_bytes(configuration.max_event_bytes)
-        .map_err(|error| {
-            AttemptFailure::Failure(ModelFailure {
-                kind: ModelFailureKind::Protocol,
-                message: error.to_string(),
-            })
-        })?;
+    let mut decoder =
+        ResponsesEventDecoder::with_tools(configuration.max_event_bytes, &tools).map_err(
+            |error| {
+                AttemptFailure::Failure(ModelFailure {
+                    kind: ModelFailureKind::Protocol,
+                    message: error.to_string(),
+                })
+            },
+        )?;
 
     loop {
         let next = tokio::select! {
@@ -368,7 +371,7 @@ where
 
         let Some(next) = next else {
             return Err(AttemptFailure::Interrupted(
-                "model stream ended without a terminal outcome".to_owned(),
+                missing_terminal_outcome(&decoder),
             ));
         };
         let chunk = next.map_err(map_stream_error)?;
@@ -403,7 +406,7 @@ where
                 }
                 if !terminal_seen {
                     return Err(AttemptFailure::Interrupted(
-                        "model stream ended without a terminal outcome".to_owned(),
+                        missing_terminal_outcome(&decoder),
                     ));
                 }
                 return Ok(());
@@ -411,6 +414,21 @@ where
         }
     }
 }
+fn missing_terminal_outcome(decoder: &ResponsesEventDecoder) -> String {
+    let mut message = match decoder.last_stream_marker() {
+        Some(marker) => format!(
+            "model stream ended without a terminal outcome; last Responses event or marker: `{marker}`"
+        ),
+        None => {
+            "model stream ended without a terminal outcome; no Responses event was decoded".to_owned()
+        }
+    };
+    if let Some(response_id) = decoder.response_id() {
+        message.push_str(&format!("; response id: `{response_id}`"));
+    }
+    message
+}
+
 
 async fn send_event(
     sender: &mpsc::Sender<ModelEvent>,

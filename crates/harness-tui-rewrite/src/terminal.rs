@@ -1,6 +1,9 @@
 //! Terminal capability acquisition, restoration, and clipboard output.
 
-use std::io::{self, Stdout, Write};
+use std::{
+    io::{self, Stdout, Write},
+    time::Instant,
+};
 
 use crossterm::{
     cursor::MoveTo,
@@ -11,9 +14,16 @@ use crossterm::{
     execute,
     terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect};
+use ratatui::{
+    Terminal,
+    backend::{Backend, CrosstermBackend},
+};
 
-use crate::{display::ClipboardText, view::PreparedFrame};
+use crate::{
+    app::Application,
+    display::ClipboardText,
+    view::{PreparedFrame, prepare, render},
+};
 
 /// Terminal capabilities acquired by the session in acquisition order.
 #[derive(Debug, Default)]
@@ -120,17 +130,13 @@ impl TerminalSession {
         Acquisition::begin()?.acquire()?.finish()
     }
 
-    /// Returns the current terminal frame area.
-    pub(crate) fn area(&self) -> io::Result<Rect> {
-        let size = self.terminal.size()?;
-        Ok(Rect::new(0, 0, size.width, size.height))
-    }
-
-    /// Renders one prepared immutable frame.
-    pub(crate) fn draw(&mut self, prepared: &PreparedFrame) -> io::Result<()> {
-        self.terminal
-            .draw(|frame| crate::view::render(frame, prepared))
-            .map(|_| ())
+    /// Prepares and renders one frame against Ratatui's current post-resize area.
+    pub(crate) fn draw(
+        &mut self,
+        application: &mut Application,
+        now: Instant,
+    ) -> io::Result<PreparedFrame> {
+        draw_application_frame(&mut self.terminal, application, now)
     }
 
     /// Clears the physical terminal screen and invalidates Ratatui's frame buffer.
@@ -142,6 +148,20 @@ impl TerminalSession {
     pub(crate) fn copy_to_clipboard(&mut self, text: &ClipboardText) -> io::Result<()> {
         write_osc52(self.terminal.backend_mut(), text)
     }
+}
+
+fn draw_application_frame<B: Backend>(
+    terminal: &mut Terminal<B>,
+    application: &mut Application,
+    now: Instant,
+) -> io::Result<PreparedFrame> {
+    let mut prepared = None;
+    terminal.draw(|frame| {
+        let next = prepare(application, frame.area(), now);
+        render(frame, &next);
+        prepared = Some(next);
+    })?;
+    Ok(prepared.expect("successful terminal draw invokes the render callback"))
 }
 
 impl Drop for TerminalSession {
@@ -191,6 +211,53 @@ fn base64_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::{backend::TestBackend, layout::Rect};
+
+    use crate::domain::{ExternalText, InitialState, ModelState};
+
+    #[test]
+    fn draw_prepares_render_and_interaction_geometry_after_autoresize() {
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        let mut application = Application::import(InitialState {
+            session_id: ExternalText::new("session"),
+            thread_title: ExternalText::new("thread"),
+            provider: None,
+            model: ModelState {
+                model: ExternalText::new("model"),
+                reasoning_effort: None,
+                service_tier: None,
+            },
+            developer_mode: false,
+            response_streaming: false,
+            last_ttft_ms: None,
+            transcript: Vec::new(),
+            prompt: String::new(),
+            prompt_cursor: 0,
+            queued_steering: None,
+            agents: Vec::new(),
+            active_activity_ids: Vec::new(),
+        })
+        .unwrap();
+
+        terminal.backend_mut().resize(12, 6);
+        let prepared =
+            draw_application_frame(&mut terminal, &mut application, Instant::now()).unwrap();
+
+        assert_eq!(terminal.backend().buffer().area, Rect::new(0, 0, 12, 6));
+        assert_eq!(prepared.prompt_width(), 10);
+        for area in [
+            prepared.areas().transcript,
+            prepared.areas().transcript_content,
+            prepared.areas().activity,
+            prepared.areas().prompt,
+            prepared.areas().prompt_content,
+            prepared.areas().status,
+        ] {
+            assert!(area.right() <= 12);
+            assert!(area.bottom() <= 6);
+        }
+    }
+
 
     #[test]
     fn base64_encoding_covers_partial_groups() {

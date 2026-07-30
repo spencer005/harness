@@ -41,7 +41,7 @@ pub fn list_sessions(root: &Path) -> Result<Vec<SessionMeta>, CliError> {
         let mut title = String::new();
         let mut initial_entries = Vec::new();
         if let Ok(content) = fs::read_to_string(&path) {
-            if let Ok(records) = serde_json::from_str::<Vec<crate::SerializableRecord>>(&content) {
+            if let Ok(records) = crate::deserialize_session_records(&content) {
                 for record in &records {
                     if let Some(entry) = harness_conversation_runtime::project_transcript_record(
                         &crate::from_serializable_record(

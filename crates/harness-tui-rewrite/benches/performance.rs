@@ -19,6 +19,12 @@ mod display;
 mod domain;
 #[path = "../src/input/mod.rs"]
 mod input;
+#[path = "../src/picker.rs"]
+mod picker;
+#[path = "../src/runtime/mod.rs"]
+mod runtime;
+#[path = "../src/terminal.rs"]
+mod terminal;
 #[path = "../src/transcript/mod.rs"]
 mod transcript;
 #[path = "../src/view.rs"]

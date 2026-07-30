@@ -17,6 +17,7 @@ portable-pty.workspace = true
 regex.workspace = true
 serde = { workspace = true, features = ["derive"] }
 sonic-rs.workspace = true
+similar.workspace = true
 thiserror.workspace = true
 tiktoken-rs.workspace = true
 tokio.workspace = true

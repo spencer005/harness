@@ -1275,6 +1275,14 @@ pub enum ResponsesApiError {
     },
 }
 
+/// Returns whether an HTTP status is eligible for one automatic request retry.
+pub fn is_auto_retryable_http_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS | StatusCode::INTERNAL_SERVER_ERROR
+    )
+}
+
 impl ResponsesApiError {
     /// Return a human-readable error description including HTTP bodies when available.
     pub fn describe(&self) -> String {
@@ -1305,6 +1313,10 @@ impl ResponsesApiError {
                 ..
             }
         )
+    }
+    /// Returns true if the backend returned a status eligible for one automatic retry.
+    pub fn is_auto_retryable_http(&self) -> bool {
+        matches!(self, Self::Http { status, .. } if is_auto_retryable_http_status(*status))
     }
 
     /// Returns true if the error requires a reconnection.
@@ -2572,6 +2584,7 @@ mod obsolete_tests {
         assert_eq!(messages.len(), 2);
         server.await.unwrap();
     }
+
 
     #[tokio::test]
     async fn websocket_connection_limit_error_reconnects_and_retries() {

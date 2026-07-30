@@ -3,77 +3,121 @@ use std::{
     io::{Read, Seek, SeekFrom},
 };
 
-use super::{ShellWord, resolve};
+use harness_tool_api::{
+    InspectByteSearchRequest, InspectByteSearchResult, InspectBytesRequest, InspectBytesResult,
+    InspectJobSuccess,
+};
 
-pub(crate) fn execute(
-    workspace: &super::WorkspaceRoot,
-    args: &[ShellWord],
-) -> Result<String, String> {
+use super::{InspectCommandOutput, ShellWord, resolve};
+
+pub(crate) fn prepare(args: &[ShellWord]) -> Result<InspectBytesRequest, String> {
     if args.len() != 2 {
         return Err(
             "failed to parse `inspect` input: usage: `bytes <path> <offset>+<length>`".into(),
         );
     }
     let (offset, length) = range(&args[1].value)?;
-    let (name, path) = resolve(workspace, &args[0].value)?;
+    Ok(InspectBytesRequest {
+        path: args[0].value.clone(),
+        offset,
+        length,
+    })
+}
+
+pub(crate) fn execute(
+    workspace: &super::WorkspaceRoot,
+    request: &InspectBytesRequest,
+) -> Result<InspectCommandOutput, String> {
+    let (name, path) = resolve(workspace, &request.path)?;
     let mut file = fs::File::open(&path).map_err(|e| format!("failed to read {path:?}: {e}"))?;
     let size = file
         .metadata()
         .map_err(|e| format!("failed to inspect {name}: {e}"))?
         .len();
-    if offset > size {
+    if request.offset > size {
         return Err(format!(
-            "failed to read {name}: offset {offset} is beyond file size {size}"
+            "failed to read {name}: offset {} is beyond file size {size}",
+            request.offset
         ));
     }
-    file.seek(SeekFrom::Start(offset))
+    file.seek(SeekFrom::Start(request.offset))
         .map_err(|e| format!("failed to seek {name}: {e}"))?;
-    let actual = length.min((size - offset) as usize);
+    let actual = request.length.min((size - request.offset) as usize);
     let mut data = vec![0; actual];
     file.read_exact(&mut data)
         .map_err(|e| format!("failed to read {name}: {e}"))?;
-    let mut output = format!(
-        "{name} {} bytes\nrange: {offset}+{actual}\n{}\n",
+    let mut model = format!(
+        "{name} {} bytes\nrange: {}+{actual}\n{}\n",
         size,
+        request.offset,
         hex(&data)
     );
-    if offset + (actual as u64) < size {
-        output.push_str(&format!("next: {}+{length}\n", offset + actual as u64));
+    let next_offset = (request.offset + (actual as u64) < size)
+        .then_some(request.offset + actual as u64);
+    if let Some(next) = next_offset {
+        model.push_str(&format!("next: {next}+{}\n", request.length));
     }
-    Ok(output)
+    Ok(InspectCommandOutput {
+        model,
+        result: InspectJobSuccess::Bytes(InspectBytesResult {
+            path: name,
+            file_size: size,
+            offset: request.offset,
+            bytes: data,
+            next_offset,
+        }),
+    })
 }
 
-pub(crate) fn search(
-    workspace: &super::WorkspaceRoot,
-    args: &[ShellWord],
-) -> Result<String, String> {
+pub(crate) fn prepare_search(args: &[ShellWord]) -> Result<InspectByteSearchRequest, String> {
     if args.len() != 2 {
         return Err("failed to parse `inspect` input: usage: `byte-search <path> <hex>`".into());
     }
-    let pattern = decode(&args[1].value)?;
-    let (_, path) = resolve(workspace, &args[0].value)?;
+    Ok(InspectByteSearchRequest {
+        path: args[0].value.clone(),
+        pattern: decode(&args[1].value)?,
+    })
+}
+
+pub(crate) fn execute_search(
+    workspace: &super::WorkspaceRoot,
+    request: &InspectByteSearchRequest,
+) -> Result<InspectCommandOutput, String> {
+    let (name, path) = resolve(workspace, &request.path)?;
     let data = fs::read(&path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
-    let mut output = String::new();
-    let mut count = 0;
-    if pattern.len() <= data.len() {
-        for start in 0..=data.len() - pattern.len() {
-            if data[start..start + pattern.len()] == pattern {
-                if count < 100 {
-                    output.push_str(&format!("{start}\n"));
+    let mut offsets = Vec::new();
+    let mut total_matches = 0;
+    if request.pattern.len() <= data.len() {
+        for start in 0..=data.len() - request.pattern.len() {
+            if data[start..start + request.pattern.len()] == request.pattern {
+                if offsets.len() < 100 {
+                    offsets.push(start as u64);
                 }
-                count += 1;
+                total_matches += 1;
             }
         }
     }
-    if count == 0 {
-        output.push_str("no results\n");
-    } else if count > 100 {
-        output.push_str(&format!(
-            "[byte-search output truncated: showing first 100 of {count} offsets]\n"
+    let mut model = String::new();
+    for offset in &offsets {
+        model.push_str(&format!("{offset}\n"));
+    }
+    if total_matches == 0 {
+        model.push_str("no results\n");
+    } else if total_matches > offsets.len() {
+        model.push_str(&format!(
+            "[byte-search output truncated: showing first 100 of {total_matches} offsets]\n"
         ));
     }
-    Ok(output)
+    Ok(InspectCommandOutput {
+        model,
+        result: InspectJobSuccess::ByteSearch(InspectByteSearchResult {
+            path: name,
+            offsets,
+            total_matches,
+        }),
+    })
 }
+
 fn range(value: &str) -> Result<(u64, usize), String> {
     let (offset, length) = value
         .split_once('+')
@@ -89,6 +133,7 @@ fn range(value: &str) -> Result<(u64, usize), String> {
     }
     Ok((offset, length))
 }
+
 fn decode(value: &str) -> Result<Vec<u8>, String> {
     if value.is_empty() || value.len() % 2 != 0 {
         return Err("hex sequence must contain a non-empty even number of digits".into());
@@ -103,6 +148,7 @@ fn decode(value: &str) -> Result<Vec<u8>, String> {
         })
         .collect()
 }
+
 fn digit(value: u8) -> Option<u8> {
     match value {
         b'0'..=b'9' => Some(value - b'0'),
@@ -111,6 +157,7 @@ fn digit(value: u8) -> Option<u8> {
         _ => None,
     }
 }
+
 fn hex(data: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut out = vec![0u8; data.len() * 2];

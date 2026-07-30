@@ -16,7 +16,9 @@ use crate::{
         PromptImportError, PromptPosition, RawInput, VerticalDirection,
     },
     picker::{MessageEditorState, RewindPickerState, SessionMeta, SessionPickerState},
-    transcript::{Transcript, TranscriptPosition, TranscriptScrollDirection},
+    transcript::{
+        Transcript, TranscriptEntryId, TranscriptPosition, TranscriptScrollDirection,
+    },
 };
 
 const TRANSCRIPT_SELECTION_SCROLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -200,6 +202,10 @@ pub(crate) enum UserCommand {
     /// Begin transcript mouse selection.
     BeginTranscriptSelection {
         position: Option<TranscriptPosition>,
+    },
+    /// Toggle typed detail for one tool activity.
+    ToggleToolActivity {
+        entry: TranscriptEntryId,
     },
     /// Continue the active mouse selection.
     DragSelection {
@@ -687,7 +693,7 @@ impl Application {
                     }
                 }
                 UserCommand::PickerConfirm => {
-                    if let Some(mut picker) = self.session_picker.take() {
+                    if let Some(picker) = self.session_picker.take() {
                         let filtered = picker.filtered_sessions();
                         let selected_id = picker
                             .list_state
@@ -695,20 +701,20 @@ impl Application {
                             .and_then(|i| filtered.get(i).map(|(s, _)| s.id.clone()));
                         if let Some(id) = selected_id {
                             return vec![AppEffect::Runtime {
-                                request: RuntimeRequest::SubmitInput {
+                                request: RuntimeRequest::ExecuteCommand {
                                     text: format!("/resume {}", id),
                                 },
                                 completion: DeliveryCompletion::None,
                             }];
                         }
-                    } else if let Some(mut picker) = self.rewind_picker.take() {
+                    } else if let Some(picker) = self.rewind_picker.take() {
                         let selected_seq = picker
                             .list_state
                             .selected()
                             .and_then(|i| picker.options.get(i).map(|o| o.sequence));
                         if let Some(seq) = selected_seq {
                             return vec![AppEffect::Runtime {
-                                request: RuntimeRequest::SubmitInput {
+                                request: RuntimeRequest::ExecuteCommand {
                                     text: format!("/rewind before:{}", seq),
                                 },
                                 completion: DeliveryCompletion::None,
@@ -743,7 +749,7 @@ impl Application {
                     }
                 }
                 UserCommand::PickerDelete => {
-                    if let Some(mut picker) = self.message_editor.take() {
+                    if let Some(picker) = self.message_editor.take() {
                         let selected_sequence = picker
                             .list_state
                             .selected()
@@ -751,7 +757,7 @@ impl Application {
                             .map(|message| message.sequence);
                         if let Some(sequence) = selected_sequence {
                             return vec![AppEffect::Runtime {
-                                request: RuntimeRequest::SubmitInput {
+                                request: RuntimeRequest::ExecuteCommand {
                                     text: format!("/edit delete {}", sequence),
                                 },
                                 completion: DeliveryCompletion::None,
@@ -891,6 +897,10 @@ impl Application {
                 } else {
                     self.transcript.clear_selection();
                 }
+            }
+            UserCommand::ToggleToolActivity { entry } => {
+                self.interaction.focus = Focus::Transcript;
+                self.transcript.toggle_tool_activity(entry);
             }
             UserCommand::DragSelection {
                 prompt_position,
@@ -1126,6 +1136,11 @@ impl Application {
                     self.set_notice(format!("runtime transcript protocol violation: {}", error));
                 }
             }
+            DomainEvent::ToolActivityChanged(activity) => {
+                if let Err(error) = self.transcript.update_tool_activity(activity) {
+                    self.set_notice(format!("runtime transcript protocol violation: {}", error));
+                }
+            }
             DomainEvent::TranscriptPage {
                 entries,
                 next_before_sequence,
@@ -1144,14 +1159,8 @@ impl Application {
                     self.set_notice(format!("runtime transcript protocol violation: {}", error));
                 }
             },
-            DomainEvent::TranscriptCommitted {
-                reasoning_sequence,
-                assistant_sequence,
-            } => {
-                if let Err(error) = self
-                    .transcript
-                    .reconcile_commit(reasoning_sequence, assistant_sequence)
-                {
+            DomainEvent::TranscriptCommitted { sequences } => {
+                if let Err(error) = self.transcript.reconcile_commit(sequences) {
                     self.set_notice(format!("runtime transcript protocol violation: {}", error));
                 }
             }
@@ -1199,6 +1208,11 @@ impl Application {
                     self.set_notice(format!("runtime transcript protocol violation: {}", error));
                 }
             }
+            DomainEvent::ThinkingBlockStarted => {
+                if let Err(error) = self.transcript.start_thinking_block() {
+                    self.set_notice(format!("runtime transcript protocol violation: {}", error));
+                }
+            }
             DomainEvent::ThinkingDelta(delta) => {
                 if let Err(error) = self.transcript.append_thinking_delta(delta) {
                     self.set_notice(format!("runtime transcript protocol violation: {}", error));
@@ -1229,20 +1243,46 @@ impl Application {
                     self.agentic_started_at = Some(Instant::now());
                 }
                 self.session.compaction_working = true;
-                self.transcript
-                    .append(crate::domain::TranscriptPayload::Event(ExternalText::new(
-                        "compact: in progress".to_string(),
-                    )));
+                if let Err(error) = self.transcript.begin_compaction_stream() {
+                    self.set_notice(format!("runtime transcript protocol violation: {}", error));
+                }
+            }
+            DomainEvent::CompactionDelta(delta) => {
+                if let Err(error) = self.transcript.append_compaction_delta(delta) {
+                    self.set_notice(format!("runtime transcript protocol violation: {}", error));
+                }
             }
             DomainEvent::CompactionCompleted(summary) => {
                 self.session.compaction_working = false;
                 if !self.session.agentic_loop_working {
                     self.agentic_started_at = None;
                 }
-                self.transcript
-                    .append(crate::domain::TranscriptPayload::Event(ExternalText::new(
-                        format!("compact: {}", summary.as_str()),
-                    )));
+                if let Err(error) = self.transcript.finish_compaction_stream(summary) {
+                    self.set_notice(format!("runtime transcript protocol violation: {}", error));
+                }
+            }
+            DomainEvent::CompactionFailed(message) => {
+                self.session.compaction_working = false;
+                if !self.session.agentic_loop_working {
+                    self.agentic_started_at = None;
+                }
+                if let Err(error) = self.transcript.finish_compaction_stream(ExternalText::new(
+                    format!("failed: {}", message.as_str()),
+                )) {
+                    self.set_notice(format!("runtime transcript protocol violation: {}", error));
+                }
+            }
+            DomainEvent::CompactionCancelled => {
+                self.session.compaction_working = false;
+                if !self.session.agentic_loop_working {
+                    self.agentic_started_at = None;
+                }
+                if let Err(error) = self
+                    .transcript
+                    .finish_compaction_stream(ExternalText::new("cancelled".to_owned()))
+                {
+                    self.set_notice(format!("runtime transcript protocol violation: {}", error));
+                }
             }
             DomainEvent::SteeringChanged(queued) => {
                 self.session.queued_steering = queued;
@@ -1386,9 +1426,14 @@ impl Application {
             return Vec::new();
         };
         let text = submission.text().to_string();
+        let request = if text.starts_with('/') && !text.starts_with("//") {
+            RuntimeRequest::ExecuteCommand { text }
+        } else {
+            RuntimeRequest::SubmitInput { text }
+        };
         self.interaction.prompt_delivery_pending = true;
         vec![AppEffect::Runtime {
-            request: RuntimeRequest::SubmitInput { text },
+            request,
             completion: DeliveryCompletion::Prompt(submission.token()),
         }]
     }
@@ -1496,6 +1541,97 @@ mod tests {
     }
 
     #[test]
+    fn completed_tool_activity_updates_the_running_entry_and_preserves_expansion() {
+        let mut app = Application::import(initial()).unwrap();
+        let invocation = harness_tool_api::ToolInvocation::Goal(
+            harness_tool_api::Prepared::Ready(harness_tool_api::GoalRequest),
+        );
+        app.apply_domain_event(DomainEvent::AppendTranscript(TranscriptSnapshotEntry {
+            sequence: Some(10),
+            payload: TranscriptPayload::ToolActivity(crate::domain::ToolActivity {
+                call_id: ExternalText::new("call-1"),
+                invocation: invocation.clone(),
+                raw_input: ExternalText::new("complete"),
+                raw_input_encoding: crate::domain::ToolInputEncoding::Freeform,
+                phase: crate::domain::ToolActivityPhase::Running,
+            }),
+        }));
+
+        let entry = app
+            .transcript
+            .entries()
+            .next()
+            .expect("running activity is appended")
+            .id();
+        assert!(app.transcript.toggle_tool_activity(entry));
+
+        app.apply_domain_event(DomainEvent::ToolActivityChanged(
+            crate::domain::ToolActivity {
+                call_id: ExternalText::new("call-1"),
+                invocation,
+                raw_input: ExternalText::new("complete"),
+                raw_input_encoding: crate::domain::ToolInputEncoding::Freeform,
+                phase: crate::domain::ToolActivityPhase::Finished {
+                    outcome: harness_tool_api::ToolOutcome::Goal(
+                        harness_tool_api::GoalResult,
+                    ),
+                    raw_output: ExternalText::new("Goal completed."),
+                },
+            },
+        ));
+
+        let entries = app.transcript.entries().collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id(), entry);
+        assert!(entries[0].tool_expanded());
+        assert!(matches!(
+            entries[0].payload(),
+            TranscriptPayload::ToolActivity(crate::domain::ToolActivity {
+                phase: crate::domain::ToolActivityPhase::Finished {
+                    outcome: harness_tool_api::ToolOutcome::Goal(_),
+                    ..
+                },
+                ..
+            })
+        ));
+    }
+ 
+    #[test]
+    fn tool_activity_completion_without_running_entry_surfaces_protocol_violation() {
+        let mut app = Application::import(initial()).unwrap();
+
+        app.apply_domain_event(DomainEvent::ToolActivityChanged(
+            crate::domain::ToolActivity {
+                call_id: ExternalText::new("missing-call"),
+                invocation: harness_tool_api::ToolInvocation::Goal(
+                    harness_tool_api::Prepared::Ready(harness_tool_api::GoalRequest),
+                ),
+                raw_input: ExternalText::new("complete"),
+                raw_input_encoding: crate::domain::ToolInputEncoding::Freeform,
+                phase: crate::domain::ToolActivityPhase::Finished {
+                    outcome: harness_tool_api::ToolOutcome::Goal(
+                        harness_tool_api::GoalResult,
+                    ),
+                    raw_output: ExternalText::new("Goal completed."),
+                },
+            },
+        ));
+
+        let entries = app.transcript.entries().collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(
+            entries[0].payload(),
+            TranscriptPayload::Error {
+                category: crate::domain::RuntimeFailureCategory::Command,
+                message,
+            } if message
+                .as_str()
+                .contains("runtime transcript protocol violation")
+                && message.as_str().contains("missing-call")
+        ));
+    }
+
+    #[test]
     fn prompt_submission_is_transactional_across_delivery() {
         let mut app = Application::import(initial()).unwrap();
         app.handle_user_command(insert("hello"));
@@ -1523,6 +1659,104 @@ mod tests {
         app.apply_domain_event(DomainEvent::AssistantTextDelta(ExternalText::new("orphan")));
         assert_eq!(app.transcript.entries().count(), 1);
     }
+    #[test]
+    #[test]
+    fn streamed_reasoning_and_assistant_blocks_keep_event_order_after_commit() {
+        let mut app = Application::import(initial()).unwrap();
+
+        for event in [
+            DomainEvent::ResponseStreamStarted,
+            DomainEvent::ThinkingBlockStarted,
+            DomainEvent::ThinkingDelta(ExternalText::new("plan ")),
+            DomainEvent::ThinkingDelta(ExternalText::new("one")),
+            DomainEvent::AssistantTextDelta(ExternalText::new("answer ")),
+            DomainEvent::AssistantTextDelta(ExternalText::new("one")),
+            DomainEvent::ThinkingBlockStarted,
+            DomainEvent::ThinkingDelta(ExternalText::new("plan two")),
+            DomainEvent::AssistantTextDelta(ExternalText::new("answer two")),
+            DomainEvent::TranscriptCommitted {
+                sequences: vec![10, 11, 12, 13],
+            },
+            DomainEvent::ResponseStreamCompleted,
+        ] {
+            app.apply_domain_event(event);
+        }
+
+        let entries = app.into_final_state().transcript;
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.sequence)
+                .collect::<Vec<_>>(),
+            [Some(10), Some(11), Some(12), Some(13)]
+        );
+        assert!(matches!(
+            &entries[0].payload,
+            TranscriptPayload::Thinking(text) if text.as_str() == "plan one"
+        ));
+        assert!(matches!(
+            &entries[1].payload,
+            TranscriptPayload::Message {
+                role: MessageRole::Assistant,
+                text,
+            } if text.as_str() == "answer one"
+        ));
+        assert!(matches!(
+            &entries[2].payload,
+            TranscriptPayload::Thinking(text) if text.as_str() == "plan two"
+        ));
+        assert!(matches!(
+            &entries[3].payload,
+            TranscriptPayload::Message {
+                role: MessageRole::Assistant,
+                text,
+            } if text.as_str() == "answer two"
+        ));
+    }
+
+    #[test]
+    fn compaction_output_streams_into_one_entry_and_each_terminal_state_closes_it() {
+        let mut app = Application::import(initial()).unwrap();
+
+        app.apply_domain_event(DomainEvent::CompactionStarted);
+        app.apply_domain_event(DomainEvent::CompactionDelta(ExternalText::new(
+            "first ".to_owned(),
+        )));
+        app.apply_domain_event(DomainEvent::CompactionDelta(ExternalText::new(
+            "second".to_owned(),
+        )));
+        app.apply_domain_event(DomainEvent::CompactionCompleted(ExternalText::new(
+            "first second".to_owned(),
+        )));
+        assert!(!app.session.compaction_working);
+
+        app.apply_domain_event(DomainEvent::CompactionStarted);
+        app.apply_domain_event(DomainEvent::CompactionDelta(ExternalText::new(
+            "partial".to_owned(),
+        )));
+        app.apply_domain_event(DomainEvent::CompactionFailed(ExternalText::new(
+            "stream interrupted".to_owned(),
+        )));
+        assert!(!app.session.compaction_working);
+
+        app.apply_domain_event(DomainEvent::CompactionStarted);
+        app.apply_domain_event(DomainEvent::CompactionCancelled);
+        assert!(!app.session.compaction_working);
+
+        let entries = app.transcript.entries().collect::<Vec<_>>();
+        assert!(matches!(
+            entries[0].payload(),
+            TranscriptPayload::Event(text) if text.as_str() == "compact: first second"
+        ));
+        assert!(matches!(
+            entries[1].payload(),
+            TranscriptPayload::Event(text) if text.as_str() == "compact: partial"
+        ));
+        assert!(matches!(
+            entries[2].payload(),
+            TranscriptPayload::Event(text) if text.as_str() == "compact: cancelled"
+        ));
+    }
 
     #[test]
     fn streaming_enter_submits_input_for_backend_routing() {
@@ -1539,6 +1773,43 @@ mod tests {
             } if text == "steer"
         ));
     }
+
+    #[test]
+    fn streaming_slash_submission_routes_to_the_command_dispatcher() {
+        let mut state = initial();
+        state.response_streaming = true;
+        let mut app = Application::import(state).unwrap();
+        app.handle_user_command(insert("/model next-model high"));
+
+        let effects = app.handle_user_command(UserCommand::Submit);
+
+        assert!(matches!(
+            &effects[0],
+            AppEffect::Runtime {
+                request: RuntimeRequest::ExecuteCommand { text },
+                ..
+            } if text == "/model next-model high"
+        ));
+    }
+
+    #[test]
+    fn double_slash_submission_remains_prompt_input() {
+        let mut state = initial();
+        state.response_streaming = true;
+        let mut app = Application::import(state).unwrap();
+        app.handle_user_command(insert("// not a command"));
+
+        let effects = app.handle_user_command(UserCommand::Submit);
+
+        assert!(matches!(
+            &effects[0],
+            AppEffect::Runtime {
+                request: RuntimeRequest::SubmitInput { text },
+                ..
+            } if text == "// not a command"
+        ));
+    }
+
 
     #[test]
     fn test_slash_command_autocompleting_status() {
@@ -1759,28 +2030,6 @@ mod tests {
     }
 
     #[test]
-    fn message_editor_loads_exact_native_tool_input_into_the_prompt() {
-        let mut app = Application::import(initial()).unwrap();
-        app.apply_domain_event(DomainEvent::OpenMessageEditor(vec![
-            crate::picker::EditableMessage {
-                sequence: 42,
-                role: harness_runtime_api::EditableMessageRole::Tool {
-                    name: "inspect".to_string(),
-                },
-                text: "read src/main.rs".to_string(),
-            },
-        ]));
-
-        assert!(
-            app.handle_user_command(UserCommand::PickerConfirm)
-                .is_empty()
-        );
-
-        assert_eq!(app.prompt().text(), "/edit 42 read src/main.rs");
-        assert!(app.message_editor.is_none());
-    }
-
-    #[test]
     fn message_editor_delete_submits_the_selected_sequence() {
         let mut app = Application::import(initial()).unwrap();
         app.apply_domain_event(DomainEvent::OpenMessageEditor(vec![
@@ -1796,7 +2045,7 @@ mod tests {
         assert!(matches!(
             effects.as_slice(),
             [AppEffect::Runtime {
-                request: RuntimeRequest::SubmitInput { text },
+                request: RuntimeRequest::ExecuteCommand { text },
                 completion: DeliveryCompletion::None,
             }] if text == "/edit delete 42"
         ));

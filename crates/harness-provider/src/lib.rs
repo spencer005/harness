@@ -450,6 +450,18 @@ mod tests {
                 Ok(())
             })
         }
+
+        fn load(
+            &self,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<Option<ProviderSelection>, ProviderError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async { Ok(None) })
+        }
     }
 
     #[tokio::test]
@@ -783,6 +795,12 @@ pub struct ProviderProfile {
     /// Provider-wide default for whether multiple system/developer messages are allowed.
     #[serde(default = "default_true")]
     pub allow_multiple_system_messages: bool,
+    /// Whether native freeform/custom tool definitions are supported.
+    ///
+    /// When omitted, Responses drivers support them and Chat Completions drivers
+    /// use function-tool compatibility encoding.
+    #[serde(default)]
+    pub supports_freeform_tool_input: Option<bool>,
     /// Provider-wide default for whether responses should be stored (`store: true`).
     #[serde(default = "default_true")]
     pub store: bool,

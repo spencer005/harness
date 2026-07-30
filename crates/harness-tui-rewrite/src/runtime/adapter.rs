@@ -8,7 +8,7 @@ use harness_runtime_api::{
 use crate::domain::{
     ActivityState, ActivityStatus, AgentId, AgentState, AgentStatus, ContextUsage, DomainEvent,
     ExternalText, PersistedTranscriptEntry, ProviderKind, ProviderState, ProviderTransport,
-    RuntimeRequest, ToolInvocationKind, ToolOutputKind, TranscriptPayload,
+    RuntimeRequest, ToolActivity, ToolActivityPhase, ToolInputEncoding, TranscriptPayload,
 };
 
 pub(super) fn adapt_runtime_event(event: RuntimeEvent) -> DomainEvent {
@@ -18,6 +18,9 @@ pub(super) fn adapt_runtime_event(event: RuntimeEvent) -> DomainEvent {
                 sequence: entry.sequence,
                 payload: convert_payload(entry.payload),
             })
+        }
+        RuntimeEvent::ToolActivityChanged(activity) => {
+            DomainEvent::ToolActivityChanged(convert_tool_activity(activity))
         }
         RuntimeEvent::TranscriptPageLoaded(page) => {
             let entries = page
@@ -37,13 +40,9 @@ pub(super) fn adapt_runtime_event(event: RuntimeEvent) -> DomainEvent {
         RuntimeEvent::TranscriptReplaced(entries) => DomainEvent::ReplaceTranscript(
             entries.into_iter().map(convert_snapshot_entry).collect(),
         ),
-        RuntimeEvent::TranscriptCommitted {
-            reasoning_sequence,
-            assistant_sequence,
-        } => DomainEvent::TranscriptCommitted {
-            reasoning_sequence,
-            assistant_sequence,
-        },
+        RuntimeEvent::TranscriptCommitted { sequences } => {
+            DomainEvent::TranscriptCommitted { sequences }
+        }
         RuntimeEvent::SessionChanged(session_id) => {
             DomainEvent::SessionChanged(ExternalText::new(session_id))
         }
@@ -61,13 +60,21 @@ pub(super) fn adapt_runtime_event(event: RuntimeEvent) -> DomainEvent {
         RuntimeEvent::AssistantTextDelta(delta) => {
             DomainEvent::AssistantTextDelta(ExternalText::new(delta))
         }
+        RuntimeEvent::ReasoningStarted => DomainEvent::ThinkingBlockStarted,
         RuntimeEvent::ReasoningSummaryDelta(delta) | RuntimeEvent::ReasoningContentDelta(delta) => {
             DomainEvent::ThinkingDelta(ExternalText::new(delta))
         }
         RuntimeEvent::CompactionStarted => DomainEvent::CompactionStarted,
+        RuntimeEvent::CompactionDelta(delta) => {
+            DomainEvent::CompactionDelta(ExternalText::new(delta))
+        }
         RuntimeEvent::CompactionCompleted(summary) => {
             DomainEvent::CompactionCompleted(ExternalText::new(summary))
         }
+        RuntimeEvent::CompactionFailed(message) => {
+            DomainEvent::CompactionFailed(ExternalText::new(message))
+        }
+        RuntimeEvent::CompactionCancelled => DomainEvent::CompactionCancelled,
         RuntimeEvent::ResponseFinished(outcome) => match outcome {
             harness_model_api::ModelTerminalOutcome::Completed(_) => {
                 DomainEvent::ResponseStreamCompleted
@@ -134,6 +141,8 @@ pub(super) fn adapt_runtime_event(event: RuntimeEvent) -> DomainEvent {
 pub(super) fn export_runtime_request(request: RuntimeRequest) -> RuntimeCommand {
     match request {
         RuntimeRequest::SubmitInput { text } => RuntimeCommand::SubmitPrompt { text },
+        RuntimeRequest::ExecuteCommand { text } => RuntimeCommand::ExecuteCommand { text },
+
         RuntimeRequest::QueueSteering { text } => RuntimeCommand::QueueSteering { text },
         RuntimeRequest::Retry => RuntimeCommand::Retry,
         RuntimeRequest::SetToolAvailability { pattern, enabled } => {
@@ -174,30 +183,8 @@ pub fn convert_payload(payload: harness_runtime_api::TranscriptPayload) -> Trans
                 text: ExternalText::new(text),
             }
         }
-        harness_runtime_api::TranscriptPayload::ToolCall {
-            call_id,
-            name,
-            input,
-        } => {
-            let kind = match input {
-                TranscriptToolInput::Freeform(_) => ToolInvocationKind::Freeform,
-                TranscriptToolInput::FunctionJson(_) => ToolInvocationKind::Function,
-                TranscriptToolInput::Unspecified(_) => ToolInvocationKind::Unspecified,
-            };
-            TranscriptPayload::ToolCall {
-                call_id: ExternalText::new(call_id),
-                name: ExternalText::new(name),
-                input: ExternalText::new(input.as_str()),
-                kind,
-            }
-        }
-        harness_runtime_api::TranscriptPayload::ToolResult { call_id, output } => {
-            TranscriptPayload::ToolOutput {
-                call_id: ExternalText::new(call_id),
-                output: ExternalText::new(output),
-                display_output: None,
-                kind: ToolOutputKind::Function,
-            }
+        harness_runtime_api::TranscriptPayload::ToolActivity(activity) => {
+            TranscriptPayload::ToolActivity(convert_tool_activity(activity))
         }
         harness_runtime_api::TranscriptPayload::PlainText(text) => {
             TranscriptPayload::PlainText(ExternalText::new(text))
@@ -214,26 +201,43 @@ pub fn convert_payload(payload: harness_runtime_api::TranscriptPayload) -> Trans
     }
 }
 
+fn convert_tool_activity(activity: harness_runtime_api::ToolActivity) -> ToolActivity {
+    let (raw_input, raw_input_encoding) = match activity.raw_input {
+        TranscriptToolInput::Freeform(input) => (input, ToolInputEncoding::Freeform),
+        TranscriptToolInput::FunctionJson(input) => (input, ToolInputEncoding::FunctionJson),
+        TranscriptToolInput::Unspecified(input) => (input, ToolInputEncoding::Unspecified),
+    };
+    let phase = match activity.phase {
+        harness_runtime_api::ToolActivityPhase::Running => ToolActivityPhase::Running,
+        harness_runtime_api::ToolActivityPhase::Finished {
+            outcome,
+            raw_output,
+        } => ToolActivityPhase::Finished {
+            outcome,
+            raw_output: ExternalText::new(raw_output),
+        },
+    };
+    ToolActivity {
+        call_id: ExternalText::new(activity.call_id),
+        invocation: activity.invocation,
+        raw_input: ExternalText::new(raw_input),
+        raw_input_encoding,
+        phase,
+    }
+}
+
 fn convert_provider(summary: ProviderSummary) -> ProviderState {
     ProviderState {
         display_name: ExternalText::new(summary.display_name),
-        kind: derive_provider_kind(&summary.provider),
-        transport: derive_transport(&summary.transport),
-    }
-}
-
-fn derive_provider_kind(provider_id: &str) -> ProviderKind {
-    match provider_id {
-        "codex" => ProviderKind::Codex,
-        "ollama-cloud" => ProviderKind::OllamaCloud,
-        _ => ProviderKind::HttpsApi,
-    }
-}
-
-fn derive_transport(transport: &str) -> ProviderTransport {
-    match transport.to_lowercase().as_str() {
-        "ws" | "websocket" => ProviderTransport::WebSocket,
-        _ => ProviderTransport::Https,
+        kind: match summary.provider.as_str() {
+            "codex" => ProviderKind::Codex,
+            "ollama-cloud" => ProviderKind::OllamaCloud,
+            _ => ProviderKind::HttpsApi,
+        },
+        transport: match summary.transport.as_str() {
+            "ws" => ProviderTransport::WebSocket,
+            _ => ProviderTransport::Https,
+        },
     }
 }
 
@@ -350,59 +354,52 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_converts_input_encoding_to_kind() {
-        let freeform =
-            adapt_runtime_event(RuntimeEvent::TranscriptAppended(TranscriptSnapshotEntry {
-                sequence: None,
-                payload: harness_runtime_api::TranscriptPayload::ToolCall {
-                    call_id: "call-1".into(),
-                    name: "echo".into(),
-                    input: TranscriptToolInput::Freeform("raw text".into()),
-                },
-            }));
-        let DomainEvent::AppendTranscript(entry) = freeform else {
-            panic!("freeform tool call adapts");
-        };
-        let TranscriptPayload::ToolCall { kind, input, .. } = entry.payload else {
-            panic!("freeform tool call payload adapts");
-        };
-        assert_eq!(kind, super::ToolInvocationKind::Freeform);
-        assert_eq!(input.as_str(), "raw text");
+    fn tool_activity_preserves_raw_input_encoding_separately_from_typed_invocation() {
+        let cases = [
+            (
+                TranscriptToolInput::Freeform("complete".into()),
+                crate::domain::ToolInputEncoding::Freeform,
+            ),
+            (
+                TranscriptToolInput::FunctionJson(r#"{"complete":true}"#.into()),
+                crate::domain::ToolInputEncoding::FunctionJson,
+            ),
+            (
+                TranscriptToolInput::Unspecified("complete".into()),
+                crate::domain::ToolInputEncoding::Unspecified,
+            ),
+        ];
 
-        let function =
-            adapt_runtime_event(RuntimeEvent::TranscriptAppended(TranscriptSnapshotEntry {
-                sequence: None,
-                payload: harness_runtime_api::TranscriptPayload::ToolCall {
-                    call_id: "call-2".into(),
-                    name: "run".into(),
-                    input: TranscriptToolInput::FunctionJson("{\"cmd\":true}".into()),
-                },
-            }));
-        let DomainEvent::AppendTranscript(entry) = function else {
-            panic!("function tool call adapts");
-        };
-        let TranscriptPayload::ToolCall { kind, input, .. } = entry.payload else {
-            panic!("function tool call payload adapts");
-        };
-        assert_eq!(kind, super::ToolInvocationKind::Function);
-        assert_eq!(input.as_str(), "{\"cmd\":true}");
-        let unspecified =
-            adapt_runtime_event(RuntimeEvent::TranscriptAppended(TranscriptSnapshotEntry {
-                sequence: Some(9),
-                payload: harness_runtime_api::TranscriptPayload::ToolCall {
-                    call_id: "call-old".into(),
-                    name: "inspect".into(),
-                    input: TranscriptToolInput::Unspecified("read src/main.rs".into()),
-                },
-            }));
-        let DomainEvent::AppendTranscript(entry) = unspecified else {
-            panic!("persisted tool call adapts");
-        };
-        let TranscriptPayload::ToolCall { kind, input, .. } = entry.payload else {
-            panic!("persisted tool call payload adapts");
-        };
-        assert_eq!(kind, super::ToolInvocationKind::Unspecified);
-        assert_eq!(input.as_str(), "read src/main.rs");
+        for (raw_input, expected_encoding) in cases {
+            let expected_input = raw_input.as_str().to_owned();
+            let event =
+                adapt_runtime_event(RuntimeEvent::TranscriptAppended(TranscriptSnapshotEntry {
+                    sequence: None,
+                    payload: harness_runtime_api::TranscriptPayload::ToolActivity(
+                        harness_runtime_api::ToolActivity {
+                            call_id: "call-1".into(),
+                            invocation: harness_tool_api::ToolInvocation::Goal(
+                                harness_tool_api::Prepared::Ready(harness_tool_api::GoalRequest),
+                            ),
+                            raw_input,
+                            phase: harness_runtime_api::ToolActivityPhase::Running,
+                        },
+                    ),
+                }));
+            let DomainEvent::AppendTranscript(entry) = event else {
+                panic!("tool activity adapts to transcript append");
+            };
+            let TranscriptPayload::ToolActivity(activity) = entry.payload else {
+                panic!("tool activity payload is preserved");
+            };
+
+            assert_eq!(activity.raw_input.as_str(), expected_input);
+            assert_eq!(activity.raw_input_encoding, expected_encoding);
+            assert!(matches!(
+                activity.invocation,
+                harness_tool_api::ToolInvocation::Goal(harness_tool_api::Prepared::Ready(_))
+            ));
+        }
     }
 
     #[test]

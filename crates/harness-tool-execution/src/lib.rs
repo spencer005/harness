@@ -6,7 +6,10 @@
 
 use std::path::{Path, PathBuf};
 
-use harness_tool_api::{ToolExecutionRequest, ToolExecutor, ToolFailure, ToolResult};
+use harness_tool_api::{
+    ToolExecutionRequest, ToolExecutor, ToolFailure, ToolInvocation, ToolPreparationRequest,
+    ToolResult,
+};
 use thiserror::Error;
 
 pub mod edit_file;
@@ -75,6 +78,13 @@ impl<'a> WorkspaceRelativePath<'a> {
 
 /// Provider-independent execution port bound to one workspace capability.
 pub trait WorkspaceToolBackend: Send + Sync {
+    /// Parses one raw request into its built-in invocation contract.
+    fn prepare(
+        &self,
+        workspace: &WorkspaceRoot,
+        request: ToolPreparationRequest,
+    ) -> Result<ToolInvocation, ToolFailure>;
+
     /// Executes one request using the supplied capability and explicit policy.
     fn execute(
         &self,
@@ -102,6 +112,10 @@ impl<B> ToolExecutor for WorkspaceToolExecutor<B>
 where
     B: WorkspaceToolBackend + 'static,
 {
+    fn prepare(&self, request: ToolPreparationRequest) -> Result<ToolInvocation, ToolFailure> {
+        self.backend.prepare(&self.workspace, request)
+    }
+
     fn execute(
         &self,
         request: ToolExecutionRequest,

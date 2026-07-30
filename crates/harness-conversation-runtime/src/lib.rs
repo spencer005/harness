@@ -5,7 +5,8 @@
 //! current-format adapter until the final user-run migration phase.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
+    ops::Range,
     sync::{Arc, RwLock},
 };
 
@@ -16,8 +17,8 @@ use harness_model_api::{
     ProviderGeneration, ResolvedModelRoute,
 };
 use harness_runtime_api::{
-    MessageRole, RuntimeCommand, RuntimeEvent, RuntimeFailureCategory, TranscriptPayload,
-    TranscriptSnapshotEntry, TranscriptToolInput,
+    MessageRole, RuntimeCommand, RuntimeEvent, RuntimeFailureCategory, ToolActivity,
+    ToolActivityPhase, TranscriptPayload, TranscriptSnapshotEntry, TranscriptToolInput,
 };
 use harness_session_store::{
     AppendReceipt, Durability, PageSize, SessionErrorCategory, SessionPayload, SessionRecord,
@@ -25,12 +26,18 @@ use harness_session_store::{
     TranscriptPage as StoredTranscriptPage, TurnOutcome,
 };
 use harness_tool_api::{
-    ToolAvailability, ToolExecutionId, ToolExecutionPolicy, ToolExecutionRequest, ToolExecutor,
-    ToolInput, ToolName, ToolRegistry,
+    GoalResult, ToolAvailability, ToolExecutionFailure, ToolExecutionId, ToolExecutionPolicy,
+    ToolExecutionRequest, ToolExecutor, ToolFailure, ToolFailureCategory, ToolInput,
+    ToolInterruption, ToolInvocation, ToolName, ToolOutcome, ToolPreparationRequest, ToolRegistry,
+    ToolResult,
 };
 use thiserror::Error;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+const INTERRUPTED_TOOL_OUTPUT: &str = "The previous tool execution ended without a recorded \
+output because the session was interrupted. Its completion status is unknown; inspect current \
+state before retrying.";
+const GOAL_COMPLETION_TOOL_OUTPUT: &str = "Goal completed.";
 
 /// Projects one durable record into its frontend transcript representation.
 pub fn project_transcript_record(record: &SessionRecord) -> Option<TranscriptSnapshotEntry> {
@@ -39,10 +46,15 @@ pub fn project_transcript_record(record: &SessionRecord) -> Option<TranscriptSna
             role: MessageRole::User,
             text: text.clone(),
         },
-        SessionPayload::AssistantMessage { text, .. } => TranscriptPayload::Message {
-            role: MessageRole::Assistant,
-            text: text.clone(),
-        },
+        SessionPayload::AssistantMessage { text, .. } => {
+            if text.is_empty() {
+                return None;
+            }
+            TranscriptPayload::Message {
+                role: MessageRole::Assistant,
+                text: text.clone(),
+            }
+        }
         SessionPayload::Reasoning {
             summary, content, ..
         } => {
@@ -67,28 +79,31 @@ pub fn project_transcript_record(record: &SessionRecord) -> Option<TranscriptSna
         },
         SessionPayload::ToolCallAccepted {
             call_id,
-            name,
-            input,
+            invocation,
+            raw_input,
             ..
-        } => TranscriptPayload::ToolCall {
+        } => TranscriptPayload::ToolActivity(ToolActivity {
             call_id: call_id.clone(),
-            name: name.clone(),
-            input: match input {
-                SessionToolInput::Freeform(input) => TranscriptToolInput::Freeform(input.clone()),
-                SessionToolInput::FunctionJson(input) => {
-                    TranscriptToolInput::FunctionJson(input.clone())
-                }
-                SessionToolInput::Unspecified(input) => {
-                    TranscriptToolInput::Unspecified(input.clone())
-                }
-            },
-        },
+            invocation: invocation.clone(),
+            raw_input: transcript_session_tool_input(raw_input),
+            phase: ToolActivityPhase::Running,
+        }),
         SessionPayload::ToolExecutionFinished {
-            call_id, output, ..
-        } => TranscriptPayload::ToolResult {
+            call_id,
+            invocation,
+            outcome,
+            raw_input,
+            raw_output,
+            ..
+        } => TranscriptPayload::ToolActivity(ToolActivity {
             call_id: call_id.clone(),
-            output: output.clone(),
-        },
+            invocation: invocation.clone(),
+            raw_input: transcript_session_tool_input(raw_input),
+            phase: ToolActivityPhase::Finished {
+                outcome: outcome.clone(),
+                raw_output: raw_output.clone(),
+            },
+        }),
         SessionPayload::CompactionCheckpoint { summary, .. } => TranscriptPayload::Thinking {
             text: summary.clone(),
         },
@@ -96,9 +111,9 @@ pub fn project_transcript_record(record: &SessionRecord) -> Option<TranscriptSna
         | SessionPayload::ProviderBinding(_)
         | SessionPayload::TurnStarted { .. }
         | SessionPayload::ModelAttemptStarted { .. }
-        | SessionPayload::ToolExecutionStarted { .. }
         | SessionPayload::TurnFinished { .. }
         | SessionPayload::ModelResponseMetadata { .. }
+        | SessionPayload::PreviousResponseInvalidated { .. }
         | SessionPayload::Goal { .. }
         | SessionPayload::SessionClosed => return None,
     };
@@ -106,6 +121,29 @@ pub fn project_transcript_record(record: &SessionRecord) -> Option<TranscriptSna
         sequence: Some(record.sequence),
         payload,
     })
+}
+
+/// Projects records while retaining only the newest state for each tool activity.
+pub fn project_transcript_records(records: &[SessionRecord]) -> Vec<TranscriptSnapshotEntry> {
+    let completed = records
+        .iter()
+        .filter_map(|record| match &record.payload {
+            SessionPayload::ToolExecutionFinished { call_id, .. } => Some(call_id.clone()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+
+    records
+        .iter()
+        .filter(|record| {
+            !matches!(
+                &record.payload,
+                SessionPayload::ToolCallAccepted { call_id, .. }
+                    if completed.contains(call_id)
+            )
+        })
+        .filter_map(project_transcript_record)
+        .collect()
 }
 
 fn persist_tool_input(input: &ToolInput) -> SessionToolInput {
@@ -119,6 +157,14 @@ fn transcript_tool_input(input: &ToolInput) -> TranscriptToolInput {
     match input {
         ToolInput::Freeform(input) => TranscriptToolInput::Freeform(input.clone()),
         ToolInput::FunctionJson(input) => TranscriptToolInput::FunctionJson(input.clone()),
+    }
+}
+
+fn transcript_session_tool_input(input: &SessionToolInput) -> TranscriptToolInput {
+    match input {
+        SessionToolInput::Freeform(input) => TranscriptToolInput::Freeform(input.clone()),
+        SessionToolInput::FunctionJson(input) => TranscriptToolInput::FunctionJson(input.clone()),
+        SessionToolInput::Unspecified(input) => TranscriptToolInput::Unspecified(input.clone()),
     }
 }
 
@@ -201,6 +247,10 @@ pub enum ConversationPhase {
     Cancelling { turn_id: u64, attempt_id: u64 },
     /// A compaction model attempt is active.
     Compacting { compaction_id: u64, attempt_id: u64 },
+    /// A compaction attempt is draining after cancellation was requested.
+    CancellingCompaction { compaction_id: u64, attempt_id: u64 },
+    /// A validated compaction checkpoint is being persisted.
+    CommittingCompaction { compaction_id: u64 },
     /// A turn or lifecycle operation failed and is returning to idle.
     Failed {
         turn_id: Option<u64>,
@@ -255,7 +305,8 @@ impl ActiveModelAttempt {
                 self.phase = AttemptPhase::Streaming;
                 self.assistant_text.push_str(&delta);
             }
-            ModelEvent::ReasoningSummaryDelta(_)
+            ModelEvent::ReasoningStarted
+            | ModelEvent::ReasoningSummaryDelta(_)
             | ModelEvent::ReasoningContentDelta(_)
             | ModelEvent::ReasoningItem(_) => {
                 self.phase = AttemptPhase::Streaming;
@@ -430,9 +481,159 @@ pub struct RuntimeConfiguration {
     pub session_id: harness_session_store::SessionId,
     /// Initial model selection.
     pub model: ModelSelection,
+    /// Whether the selected provider accepts native freeform/custom tool definitions.
+    pub freeform_tool_input: bool,
     /// Runtime ports.
     pub ports: RuntimePorts,
 }
+
+#[derive(Debug, Default)]
+struct TransientReasoning {
+    content: String,
+    encrypted_content: Option<String>,
+    summary: String,
+}
+
+#[derive(Debug)]
+enum TransientResponseBlock {
+    Assistant(Range<usize>),
+    Reasoning(TransientReasoning),
+}
+
+#[derive(Debug, Default)]
+struct TransientResponse {
+    assistant: String,
+    blocks: Vec<TransientResponseBlock>,
+}
+
+impl TransientResponse {
+    fn append_assistant(&mut self, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        let start = self.assistant.len();
+        self.assistant.push_str(delta);
+        let end = self.assistant.len();
+        match self.blocks.last_mut() {
+            Some(TransientResponseBlock::Assistant(range)) if range.end == start => {
+                range.end = end;
+            }
+            _ => self
+                .blocks
+                .push(TransientResponseBlock::Assistant(start..end)),
+        }
+    }
+
+    fn start_reasoning(&mut self) {
+        self.blocks.push(TransientResponseBlock::Reasoning(
+            TransientReasoning::default(),
+        ));
+    }
+
+    fn append_reasoning_content(&mut self, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        self.reasoning_mut().content.push_str(delta);
+    }
+
+    fn append_reasoning_summary(&mut self, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        self.reasoning_mut().summary.push_str(delta);
+    }
+
+    fn complete_reasoning(
+        &mut self,
+        item: harness_model_api::ModelReasoning,
+    ) -> (Option<String>, Option<String>) {
+        let reasoning = self.reasoning_mut();
+        let content = item.content.filter(|content| !content.is_empty()).and_then(|content| {
+            reasoning.content.is_empty().then(|| {
+                reasoning.content = content.clone();
+                content
+            })
+        });
+        let summary = item.summary.filter(|summary| !summary.is_empty()).and_then(|summary| {
+            reasoning.summary.is_empty().then(|| {
+                reasoning.summary = summary.clone();
+                summary
+            })
+        });
+        if item.encrypted_content.is_some() {
+            reasoning.encrypted_content = item.encrypted_content;
+        }
+        (content, summary)
+    }
+
+    fn records(&self, turn_id: u64) -> Vec<(SessionPayload, bool)> {
+        let mut records = Vec::with_capacity(self.blocks.len().saturating_add(1));
+        for block in &self.blocks {
+            match block {
+                TransientResponseBlock::Assistant(range) => {
+                    records.push((
+                        SessionPayload::AssistantMessage {
+                            turn_id,
+                            text: self.assistant[range.clone()].to_owned(),
+                        },
+                        true,
+                    ));
+                }
+                TransientResponseBlock::Reasoning(reasoning)
+                    if !reasoning.content.is_empty()
+                        || !reasoning.summary.is_empty()
+                        || reasoning.encrypted_content.is_some() =>
+                {
+                    records.push((
+                        SessionPayload::Reasoning {
+                            turn_id,
+                            content: (!reasoning.content.is_empty())
+                                .then(|| reasoning.content.clone()),
+                            encrypted_content: reasoning.encrypted_content.clone(),
+                            summary: (!reasoning.summary.is_empty())
+                                .then(|| reasoning.summary.clone()),
+                        },
+                        !reasoning.content.is_empty() || !reasoning.summary.is_empty(),
+                    ));
+                }
+                TransientResponseBlock::Reasoning(_) => {}
+            }
+        }
+        if !matches!(
+            records.last(),
+            Some((SessionPayload::AssistantMessage { .. }, _))
+        ) {
+            records.push((
+                SessionPayload::AssistantMessage {
+                    turn_id,
+                    text: String::new(),
+                },
+                false,
+            ));
+        }
+        records
+    }
+
+    fn reasoning_mut(&mut self) -> &mut TransientReasoning {
+        if !matches!(
+            self.blocks.last(),
+            Some(TransientResponseBlock::Reasoning(_))
+        ) {
+            self.start_reasoning();
+        }
+        let Some(TransientResponseBlock::Reasoning(reasoning)) = self.blocks.last_mut() else {
+            unreachable!("a reasoning block was just appended")
+        };
+        reasoning
+    }
+
+    fn clear(&mut self) {
+        self.assistant.clear();
+        self.blocks.clear();
+    }
+}
+
 
 /// Runtime handle for the reducer implementation.
 pub struct ConversationRuntime {
@@ -442,13 +643,11 @@ pub struct ConversationRuntime {
     jobs: JobRegistry,
     writer: Option<RuntimeSessionWriter>,
     canonical_history: Vec<SessionPayload>,
-    transient_assistant: String,
-    transient_reasoning_content: String,
-    transient_reasoning_summary: String,
-    transient_reasoning_encrypted: Option<String>,
+    transient_response: TransientResponse,
     pending_tool_inputs: BTreeMap<String, String>,
     pending_tool_calls: Vec<harness_model_api::ToolCall>,
     active_tool_call: Option<harness_model_api::ToolCall>,
+    active_tool_invocation: Option<ToolInvocation>,
     next_execution_id: u64,
     persist_state: PersistState,
     queued_steering: Vec<String>,
@@ -469,6 +668,7 @@ pub struct ConversationRuntime {
 impl ConversationRuntime {
     /// Constructs a runtime before any storage, model, or tool work starts.
     pub fn new(configuration: RuntimeConfiguration) -> Self {
+        let compatibility_mode = !configuration.freeform_tool_input;
         Self {
             lifecycle: RuntimeLifecycle::Constructed,
             phase: ConversationPhase::Idle,
@@ -476,13 +676,11 @@ impl ConversationRuntime {
             jobs: JobRegistry::new(),
             writer: None,
             canonical_history: Vec::new(),
-            transient_assistant: String::new(),
-            transient_reasoning_content: String::new(),
-            transient_reasoning_summary: String::new(),
-            transient_reasoning_encrypted: None,
+            transient_response: TransientResponse::default(),
             pending_tool_inputs: BTreeMap::new(),
             pending_tool_calls: Vec::new(),
             active_tool_call: None,
+            active_tool_invocation: None,
             next_turn_id: 1,
             next_execution_id: 1,
             persist_state: PersistState::Disabled,
@@ -495,7 +693,7 @@ impl ConversationRuntime {
             model_started: false,
             compaction: None,
             next_compaction_id: 1,
-            compatibility_mode: false,
+            compatibility_mode,
             active_attempt_response_id: None,
         }
     }
@@ -515,6 +713,7 @@ impl ConversationRuntime {
             .await?;
         self.writer = Some(RuntimeSessionWriter::new(writer));
         self.lifecycle = RuntimeLifecycle::Starting;
+        self.close_interrupted_tool_calls().await?;
         Ok(())
     }
 
@@ -523,6 +722,12 @@ impl ConversationRuntime {
         &mut self,
         session_id: harness_session_store::SessionId,
     ) -> Result<(), RuntimeError> {
+        if self.phase != ConversationPhase::Idle {
+            return Err(RuntimeError::InvalidPhase);
+        }
+        if let Some(mut coordinator) = self.compaction.take() {
+            coordinator.cancel();
+        }
         self.configuration.session_id = session_id.clone();
         let history = self.load_persisted_history()?;
         self.restore_history(history)?;
@@ -533,6 +738,64 @@ impl ConversationRuntime {
             .writer(session_id)
             .await?;
         self.writer = Some(RuntimeSessionWriter::new(writer));
+        self.close_interrupted_tool_calls().await?;
+        Ok(())
+    }
+    async fn close_interrupted_tool_calls(&mut self) -> Result<(), RuntimeError> {
+        let mut open_calls = BTreeMap::new();
+        for payload in &self.canonical_history {
+            match payload {
+                SessionPayload::ToolCallAccepted {
+                    turn_id,
+                    call_id,
+                    invocation,
+                    raw_input,
+                } => {
+                    open_calls.insert(
+                        (*turn_id, call_id.clone()),
+                        (invocation.clone(), raw_input.clone()),
+                    );
+                }
+                SessionPayload::ToolExecutionFinished {
+                    turn_id, call_id, ..
+                } => {
+                    open_calls.remove(&(*turn_id, call_id.clone()));
+                }
+                _ => {}
+            }
+        }
+        if open_calls.is_empty() {
+            return Ok(());
+        }
+
+        let records = open_calls
+            .into_iter()
+            .map(
+                |((turn_id, call_id), (invocation, raw_input))| {
+                    SessionPayload::ToolExecutionFinished {
+                        turn_id,
+                        call_id,
+                        invocation,
+                        outcome: ToolOutcome::Interrupted(ToolInterruption {
+                            message: INTERRUPTED_TOOL_OUTPUT.to_string(),
+                        }),
+                        raw_input,
+                        raw_output: INTERRUPTED_TOOL_OUTPUT.to_string(),
+                    }
+                },
+            )
+            .collect::<Vec<_>>();
+        let next_revision = self
+            .canonical_revision
+            .checked_add(1)
+            .ok_or(RuntimeError::IdExhausted)?;
+        self.writer
+            .as_mut()
+            .ok_or(RuntimeError::InvalidLifecycle)?
+            .append(&records, Durability::Durable)
+            .await?;
+        self.canonical_history.extend(records);
+        self.canonical_revision = next_revision;
         Ok(())
     }
 
@@ -599,9 +862,9 @@ impl ConversationRuntime {
                 | SessionPayload::Reasoning { turn_id, .. }
                 | SessionPayload::Error { turn_id, .. }
                 | SessionPayload::ToolCallAccepted { turn_id, .. }
-                | SessionPayload::ToolExecutionStarted { turn_id, .. }
                 | SessionPayload::ToolExecutionFinished { turn_id, .. }
-                | SessionPayload::TurnFinished { turn_id, .. } => {
+                | SessionPayload::TurnFinished { turn_id, .. }
+                | SessionPayload::PreviousResponseInvalidated { turn_id } => {
                     highest_turn_id = highest_turn_id.max(*turn_id);
                 }
                 SessionPayload::Metadata(_)
@@ -807,10 +1070,20 @@ impl ConversationRuntime {
         &mut self,
         text: String,
     ) -> Result<Vec<RuntimeEffect>, RuntimeError> {
+        let cancelled_compaction = if let Some(mut coordinator) = self.compaction.take() {
+            coordinator.cancel();
+            true
+        } else {
+            false
+        };
         let persisted_text = text.clone();
         let receipt = self.submit_prompt(text).await?;
         let start_model = self.start_model_request().await?;
-        let mut effects = vec![
+        let mut effects = Vec::with_capacity(start_model.len() + 3);
+        if cancelled_compaction {
+            effects.push(RuntimeEffect::Emit(RuntimeEvent::CompactionCancelled));
+        }
+        effects.extend([
             RuntimeEffect::Emit(RuntimeEvent::AgenticLoopStarted),
             RuntimeEffect::Emit(RuntimeEvent::TranscriptAppended(
                 harness_runtime_api::TranscriptSnapshotEntry {
@@ -821,7 +1094,7 @@ impl ConversationRuntime {
                     },
                 },
             )),
-        ];
+        ]);
         effects.extend(start_model);
         Ok(effects)
     }
@@ -840,7 +1113,18 @@ impl ConversationRuntime {
                 turn_id,
                 attempt_id,
             } => self.interrupt(*turn_id, *attempt_id),
-            ConversationPhase::Cancelling { .. } => Ok(()),
+            ConversationPhase::Compacting {
+                compaction_id,
+                attempt_id,
+            } => {
+                self.phase = ConversationPhase::CancellingCompaction {
+                    compaction_id: *compaction_id,
+                    attempt_id: *attempt_id,
+                };
+                Ok(())
+            }
+            ConversationPhase::Cancelling { .. }
+            | ConversationPhase::CancellingCompaction { .. } => Ok(()),
             _ => Ok(()),
         }
     }
@@ -903,10 +1187,14 @@ impl ConversationRuntime {
             .any(|payload| !matches!(payload, SessionPayload::CompactionCheckpoint { .. }));
         if exceeds_compaction_threshold && has_uncompacted_history {
             self.phase = ConversationPhase::Idle;
-            self.begin_compaction(
-                "Summarize the conversation for continuation, preserving requirements, decisions, current state, and unfinished work."
-                    .to_owned(),
-            )?;
+            if self.compaction.is_some() {
+                self.redo_compaction_with_instruction(None)?;
+            } else {
+                self.begin_compaction(
+                    "Summarize the conversation for continuation, preserving requirements, decisions, current state, and unfinished work."
+                        .to_owned(),
+                )?;
+            }
             return Ok(vec![
                 RuntimeEffect::Emit(RuntimeEvent::CompactionStarted),
                 self.start_compaction_request()?,
@@ -935,9 +1223,7 @@ impl ConversationRuntime {
         self.canonical_revision = next_revision;
         self.pending_tool_inputs.clear();
         self.pending_tool_calls.clear();
-        self.transient_reasoning_content.clear();
-        self.transient_reasoning_summary.clear();
-        self.transient_reasoning_encrypted = None;
+        self.transient_response.clear();
         self.take_queued_steering();
         self.model_started = false;
         let attempt_id = harness_model_api::ModelAttemptId(attempt_id);
@@ -978,7 +1264,7 @@ impl ConversationRuntime {
         delta: String,
     ) -> Result<(), RuntimeError> {
         self.ensure_model_attempt(turn_id, attempt_id)?;
-        self.transient_assistant.push_str(&delta);
+        self.transient_response.append_assistant(&delta);
         Ok(())
     }
 
@@ -994,6 +1280,9 @@ impl ConversationRuntime {
         let source = coordinator
             .source()
             .ok_or(RuntimeError::CompactionRedoUnavailable)?;
+        if source.revision != self.canonical_revision {
+            return Err(RuntimeError::StaleCompaction);
+        }
         let instruction = coordinator
             .instruction()
             .ok_or(RuntimeError::CompactionNotActive)?;
@@ -1010,6 +1299,9 @@ impl ConversationRuntime {
             &source.history,
             instruction,
         )?;
+        if request.history_revision != source.revision {
+            return Err(RuntimeError::RequestRevisionMismatch);
+        }
         if request.provider_generation != self.configuration.ports.compaction_route.generation {
             return Err(RuntimeError::ProviderGenerationMismatch);
         }
@@ -1038,10 +1330,32 @@ impl ConversationRuntime {
         if let ConversationPhase::Compacting {
             compaction_id,
             attempt_id: active_attempt,
+        }
+        | ConversationPhase::CancellingCompaction {
+            compaction_id,
+            attempt_id: active_attempt,
         } = self.phase
         {
             if active_attempt != attempt_id {
                 return Err(RuntimeError::InvalidPhase);
+            }
+            if matches!(self.phase, ConversationPhase::CancellingCompaction { .. }) {
+                return match event {
+                    ModelEvent::Terminal(_) => self.finish_compaction_cancellation().await,
+                    ModelEvent::Warning(message) => {
+                        Ok(vec![RuntimeEffect::Emit(RuntimeEvent::Warning(message))])
+                    }
+                    ModelEvent::Started
+                    | ModelEvent::AssistantTextDelta(_)
+                    | ModelEvent::ReasoningStarted
+                    | ModelEvent::ReasoningSummaryDelta(_)
+                    | ModelEvent::ReasoningContentDelta(_)
+                    | ModelEvent::ReasoningItem(_)
+                    | ModelEvent::ToolInputDelta(_)
+                    | ModelEvent::ToolCall(_)
+                    | ModelEvent::Metadata(_)
+                    | ModelEvent::Usage(_) => Ok(Vec::new()),
+                };
             }
             return match event {
                 ModelEvent::Started => {
@@ -1050,55 +1364,58 @@ impl ConversationRuntime {
                     }
                     self.model_started = true;
                     Ok(Vec::new())
-                }
+                },
                 ModelEvent::AssistantTextDelta(delta) => {
                     self.record_compaction_delta(&delta)?;
-                    Ok(Vec::new())
+                    Ok(vec![RuntimeEffect::Emit(RuntimeEvent::CompactionDelta(
+                        delta,
+                    ))])
+                }
+                ModelEvent::Terminal(ModelTerminalOutcome::Completed(_)) => {
+                    self.model_started = false;
+                    match self.finish_compaction() {
+                        Ok(()) => {
+                            self.phase =
+                                ConversationPhase::CommittingCompaction { compaction_id };
+                            Ok(vec![RuntimeEffect::CommitCompaction { compaction_id }])
+                        }
+                        Err(error) => {
+                            self.fail_compaction_attempt(
+                                harness_runtime_api::RuntimeFailureCategory::Model,
+                                error.to_string(),
+                            )
+                            .await
+                        }
+                    }
                 }
                 ModelEvent::Terminal(outcome) => {
-                    let started = self.model_started;
                     self.model_started = false;
-                    self.phase = ConversationPhase::Idle;
-                    if !started {
-                        return Ok(vec![
-                            RuntimeEffect::Emit(RuntimeEvent::AgenticLoopCompleted),
-                            RuntimeEffect::Emit(RuntimeEvent::Failure(
-                                harness_runtime_api::RuntimeFailure {
-                                    category: harness_runtime_api::RuntimeFailureCategory::Protocol,
-                                    message: "compaction stream completed before it started"
-                                        .to_string(),
-                                },
-                            )),
-                        ]);
-                    }
-                    match outcome {
-                        ModelTerminalOutcome::Completed(completion) => {
-                            self.finish_compaction()?;
-                            let summary = self
-                                .compaction
-                                .as_ref()
-                                .and_then(compaction::CompactionCoordinator::validated_summary)
-                                .ok_or(RuntimeError::CompactionInvalidResult)?
-                                .to_owned();
-                            Ok(vec![RuntimeEffect::CommitCompaction {
-                                compaction_id,
-                                summary,
-                            }])
-                        }
-                        other => Ok(vec![
-                            RuntimeEffect::Emit(RuntimeEvent::AgenticLoopCompleted),
-                            RuntimeEffect::Emit(RuntimeEvent::Failure(
-                                harness_runtime_api::RuntimeFailure {
-                                    category: harness_runtime_api::RuntimeFailureCategory::Model,
-                                    message: format!("compaction failed: {other:?}"),
-                                },
-                            )),
-                        ]),
-                    }
+                    let (category, message) = match outcome {
+                        ModelTerminalOutcome::Interrupted(interruption) => (
+                            harness_runtime_api::RuntimeFailureCategory::Model,
+                            interruption.reason,
+                        ),
+                        ModelTerminalOutcome::Cancelled(cancellation) => (
+                            harness_runtime_api::RuntimeFailureCategory::Model,
+                            cancellation.reason,
+                        ),
+                        ModelTerminalOutcome::Failed(failure) => (
+                            if failure.kind == harness_model_api::ModelFailureKind::Protocol {
+                                harness_runtime_api::RuntimeFailureCategory::Protocol
+                            } else {
+                                harness_runtime_api::RuntimeFailureCategory::Model
+                            },
+                            failure.message,
+                        ),
+                        ModelTerminalOutcome::Completed(_) => unreachable!(),
+                    };
+                    self.fail_compaction_attempt(category, message).await
                 }
                 ModelEvent::Warning(message) => {
                     Ok(vec![RuntimeEffect::Emit(RuntimeEvent::Warning(message))])
                 }
+                ModelEvent::ReasoningStarted
+                |
                 ModelEvent::ReasoningSummaryDelta(_)
                 | ModelEvent::ReasoningContentDelta(_)
                 | ModelEvent::ReasoningItem(_)
@@ -1124,41 +1441,38 @@ impl ConversationRuntime {
                     delta,
                 ))])
             }
+            ModelEvent::ReasoningStarted => {
+                self.ensure_model_attempt(turn_id, attempt_id)?;
+                self.transient_response.start_reasoning();
+                Ok(vec![RuntimeEffect::Emit(RuntimeEvent::ReasoningStarted)])
+            }
             ModelEvent::ReasoningSummaryDelta(delta) => {
                 self.ensure_model_attempt(turn_id, attempt_id)?;
-                self.transient_reasoning_summary.push_str(&delta);
+                self.transient_response.append_reasoning_summary(&delta);
                 Ok(vec![RuntimeEffect::Emit(
                     RuntimeEvent::ReasoningSummaryDelta(delta),
                 )])
             }
             ModelEvent::ReasoningContentDelta(delta) => {
                 self.ensure_model_attempt(turn_id, attempt_id)?;
-                self.transient_reasoning_content.push_str(&delta);
+                self.transient_response.append_reasoning_content(&delta);
                 Ok(vec![RuntimeEffect::Emit(
                     RuntimeEvent::ReasoningContentDelta(delta),
                 )])
             }
             ModelEvent::ReasoningItem(item) => {
                 self.ensure_model_attempt(turn_id, attempt_id)?;
-                let mut effects = Vec::new();
-                if let Some(content) = item.content {
-                    if self.transient_reasoning_content.is_empty() {
-                        self.transient_reasoning_content = content.clone();
-                        effects.push(RuntimeEffect::Emit(RuntimeEvent::ReasoningContentDelta(
-                            content,
-                        )));
-                    }
+                let (content, summary) = self.transient_response.complete_reasoning(item);
+                let mut effects = Vec::with_capacity(2);
+                if let Some(content) = content {
+                    effects.push(RuntimeEffect::Emit(RuntimeEvent::ReasoningContentDelta(
+                        content,
+                    )));
                 }
-                if let Some(summary) = item.summary {
-                    if self.transient_reasoning_summary.is_empty() {
-                        self.transient_reasoning_summary = summary.clone();
-                        effects.push(RuntimeEffect::Emit(RuntimeEvent::ReasoningSummaryDelta(
-                            summary,
-                        )));
-                    }
-                }
-                if item.encrypted_content.is_some() {
-                    self.transient_reasoning_encrypted = item.encrypted_content;
+                if let Some(summary) = summary {
+                    effects.push(RuntimeEffect::Emit(RuntimeEvent::ReasoningSummaryDelta(
+                        summary,
+                    )));
                 }
                 Ok(effects)
             }
@@ -1180,18 +1494,8 @@ impl ConversationRuntime {
                     return Err(RuntimeError::DuplicateToolCall);
                 }
                 self.pending_tool_inputs.remove(&call.call_id);
-                let transcript = RuntimeEffect::Emit(RuntimeEvent::TranscriptAppended(
-                    harness_runtime_api::TranscriptSnapshotEntry {
-                        sequence: None,
-                        payload: harness_runtime_api::TranscriptPayload::ToolCall {
-                            call_id: call.call_id.clone(),
-                            name: call.name.clone(),
-                            input: transcript_tool_input(&call.input),
-                        },
-                    },
-                ));
                 self.pending_tool_calls.push(call);
-                Ok(vec![transcript])
+                Ok(Vec::new())
             }
             ModelEvent::Metadata(metadata) => {
                 self.ensure_model_attempt(turn_id, attempt_id)?;
@@ -1229,22 +1533,25 @@ impl ConversationRuntime {
     /// Persists a validated compaction checkpoint before replacing active history.
     pub async fn commit_compaction(
         &mut self,
-        _compaction_id: u64,
-        summary: String,
+        compaction_id: u64,
     ) -> Result<Vec<RuntimeEffect>, RuntimeError> {
-        if self.phase != ConversationPhase::Idle {
+        if self.phase != (ConversationPhase::CommittingCompaction { compaction_id }) {
             return Err(RuntimeError::InvalidPhase);
         }
-        let coordinator = self
+        let result = self
             .compaction
             .as_ref()
-            .ok_or(RuntimeError::CompactionNotActive)?;
-        let source = coordinator
-            .source()
-            .ok_or(RuntimeError::CompactionRedoUnavailable)?
+            .ok_or(RuntimeError::CompactionNotActive)?
+            .validated()
+            .map_err(|_| RuntimeError::CompactionInvalidResult)?
             .clone();
-        let source_revision = source.revision;
-        let turn_id = source
+        if result.source.revision != self.canonical_revision {
+            self.phase = ConversationPhase::Idle;
+            return Err(RuntimeError::StaleCompaction);
+        }
+
+        let turn_id = result
+            .source
             .history
             .iter()
             .rev()
@@ -1254,42 +1561,46 @@ impl ConversationRuntime {
                 | SessionPayload::ModelAttemptStarted { turn_id, .. }
                 | SessionPayload::AssistantMessage { turn_id, .. }
                 | SessionPayload::Reasoning { turn_id, .. }
-                | SessionPayload::Error { turn_id, .. }
                 | SessionPayload::ToolCallAccepted { turn_id, .. }
-                | SessionPayload::ToolExecutionStarted { turn_id, .. }
                 | SessionPayload::ToolExecutionFinished { turn_id, .. }
+                | SessionPayload::PreviousResponseInvalidated { turn_id }
                 | SessionPayload::ModelResponseMetadata { turn_id, .. }
                 | SessionPayload::TurnFinished { turn_id, .. } => Some(*turn_id),
                 _ => None,
             })
             .unwrap_or(0);
         let record = SessionPayload::CompactionCheckpoint {
-            source_revision,
-            summary: summary.clone(),
+            source_revision: result.source.revision,
+            summary: result.summary.clone(),
         };
         let next_revision = self
             .canonical_revision
             .checked_add(1)
             .ok_or(RuntimeError::IdExhausted)?;
-        self.writer
+        if let Err(error) = self
+            .writer
             .as_mut()
             .ok_or(RuntimeError::InvalidLifecycle)?
             .append(std::slice::from_ref(&record), Durability::Durable)
             .await
-            .map_err(RuntimeError::Session)?;
-        self.canonical_history.clear();
-        self.canonical_history.push(record);
-        self.canonical_revision = next_revision;
+        {
+            self.phase = ConversationPhase::Idle;
+            return Err(RuntimeError::Session(error));
+        }
+
         self.compaction
             .as_mut()
             .ok_or(RuntimeError::CompactionNotActive)?
             .commit()
             .map_err(|_| RuntimeError::CompactionInvalidResult)?;
+        self.canonical_history.clear();
+        self.canonical_history.push(record);
+        self.canonical_revision = next_revision;
         self.compaction = None;
         self.request_loop_stopped = false;
         self.phase = ConversationPhase::PreparingAttempt { turn_id };
         Ok(vec![
-            RuntimeEffect::Emit(RuntimeEvent::CompactionCompleted(summary)),
+            RuntimeEffect::Emit(RuntimeEvent::CompactionCompleted(result.summary)),
             RuntimeEffect::ContinueModel { turn_id },
         ])
     }
@@ -1313,24 +1624,18 @@ impl ConversationRuntime {
             .canonical_revision
             .checked_add(1)
             .ok_or(RuntimeError::IdExhausted)?;
-        let has_reasoning = !self.transient_reasoning_content.is_empty()
-            || !self.transient_reasoning_summary.is_empty()
-            || self.transient_reasoning_encrypted.is_some();
-        let mut records = Vec::with_capacity(2);
-        if has_reasoning {
-            records.push(SessionPayload::Reasoning {
-                turn_id,
-                content: (!self.transient_reasoning_content.is_empty())
-                    .then(|| self.transient_reasoning_content.clone()),
-                encrypted_content: self.transient_reasoning_encrypted.clone(),
-                summary: (!self.transient_reasoning_summary.is_empty())
-                    .then(|| self.transient_reasoning_summary.clone()),
-            });
-        }
-        records.push(SessionPayload::AssistantMessage {
-            turn_id,
-            text: self.transient_assistant.clone(),
-        });
+        let response_records = self.transient_response.records(turn_id);
+        let displayed_offsets = response_records
+            .iter()
+            .enumerate()
+            .filter_map(|(offset, (_, displayed))| displayed.then_some(offset))
+            .map(u64::try_from)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| RuntimeError::IdExhausted)?;
+        let mut records = response_records
+            .into_iter()
+            .map(|(record, _)| record)
+            .collect::<Vec<_>>();
         if let Some(resp_id) = self.active_attempt_response_id.take() {
             records.push(SessionPayload::ModelResponseMetadata {
                 turn_id,
@@ -1366,22 +1671,23 @@ impl ConversationRuntime {
                 return Err(error.into());
             }
         };
-        let reasoning_sequence = has_reasoning.then(|| *receipt.sequences.start());
-        let assistant_sequence = *receipt.sequences.end();
+        let first_sequence = *receipt.sequences.start();
+        let sequences = displayed_offsets
+            .into_iter()
+            .map(|offset| {
+                first_sequence
+                    .checked_add(offset)
+                    .ok_or(RuntimeError::IdExhausted)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
         self.canonical_history.extend(records);
         self.canonical_revision = next_revision;
-        self.transient_assistant.clear();
-        self.transient_reasoning_content.clear();
-        self.transient_reasoning_summary.clear();
-        self.transient_reasoning_encrypted = None;
+        self.transient_response.clear();
         self.model_started = false;
         self.phase = ConversationPhase::PreparingContinuation { turn_id };
         Ok(vec![
-            RuntimeEffect::Emit(RuntimeEvent::TranscriptCommitted {
-                reasoning_sequence,
-                assistant_sequence,
-            }),
+            RuntimeEffect::Emit(RuntimeEvent::TranscriptCommitted { sequences }),
             RuntimeEffect::ContinueTurn { turn_id },
         ])
     }
@@ -1391,17 +1697,22 @@ impl ConversationRuntime {
         if self.phase != (ConversationPhase::PreparingContinuation { turn_id }) {
             return Err(RuntimeError::InvalidPhase);
         }
-        if !self.pending_tool_calls.is_empty() {
+        let abandoned_tool_calls = self.request_loop_stopped && !self.pending_tool_calls.is_empty();
+        if !self.pending_tool_calls.is_empty() && !abandoned_tool_calls {
             return Err(RuntimeError::PendingToolCalls);
         }
         let next_revision = self
             .canonical_revision
             .checked_add(1)
             .ok_or(RuntimeError::IdExhausted)?;
-        let records = vec![SessionPayload::TurnFinished {
+        let mut records = Vec::with_capacity(usize::from(abandoned_tool_calls) + 1);
+        if abandoned_tool_calls {
+            records.push(SessionPayload::PreviousResponseInvalidated { turn_id });
+        }
+        records.push(SessionPayload::TurnFinished {
             turn_id,
             outcome: TurnOutcome::Completed,
-        }];
+        });
         match self
             .writer
             .as_mut()
@@ -1412,6 +1723,9 @@ impl ConversationRuntime {
             Ok(receipt) => {
                 self.canonical_history.extend(records);
                 self.canonical_revision = next_revision;
+                if abandoned_tool_calls {
+                    self.pending_tool_calls.clear();
+                }
                 self.phase = ConversationPhase::Idle;
                 Ok(receipt)
             }
@@ -1568,10 +1882,7 @@ impl ConversationRuntime {
 
         self.canonical_history.extend(records);
         self.canonical_revision = next_revision;
-        self.transient_assistant.clear();
-        self.transient_reasoning_content.clear();
-        self.transient_reasoning_summary.clear();
-        self.transient_reasoning_encrypted = None;
+        self.transient_response.clear();
         self.model_started = false;
         self.phase = ConversationPhase::Idle;
 
@@ -1619,7 +1930,13 @@ impl ConversationRuntime {
         command: RuntimeCommand,
     ) -> Result<Vec<RuntimeEffect>, RuntimeError> {
         match command {
+            RuntimeCommand::ExecuteCommand { .. } => {
+                Err(RuntimeError::CommandDispatcherRequired)
+            }
             RuntimeCommand::SubmitPrompt { text } => {
+                if text.starts_with('/') && !text.starts_with("//") {
+                    return Err(RuntimeError::CommandDispatcherRequired);
+                }
                 if self.phase != ConversationPhase::Idle {
                     if self.lifecycle != RuntimeLifecycle::Ready {
                         return Err(RuntimeError::InvalidLifecycle);
@@ -1662,7 +1979,6 @@ impl ConversationRuntime {
                         // actual turn and must not hide a retryable input or tool result.
                         SessionPayload::TurnFinished { .. }
                         | SessionPayload::ModelAttemptStarted { .. }
-                        | SessionPayload::ToolExecutionStarted { .. }
                         | SessionPayload::TurnStarted { .. } => {}
                         SessionPayload::InputMessage { turn_id, .. }
                         | SessionPayload::ToolCallAccepted { turn_id, .. }
@@ -1715,8 +2031,13 @@ impl ConversationRuntime {
                 ])
             }
             RuntimeCommand::CancelCompaction => {
+                let attempt_active = self.compaction_attempt_active();
                 self.cancel_compaction()?;
-                Ok(Vec::new())
+                if attempt_active {
+                    Ok(Vec::new())
+                } else {
+                    Ok(vec![RuntimeEffect::Emit(RuntimeEvent::CompactionCancelled)])
+                }
             }
             RuntimeCommand::QueueSteering { text } => {
                 if self.lifecycle != RuntimeLifecycle::Ready {
@@ -1729,6 +2050,7 @@ impl ConversationRuntime {
                     &self.phase,
                     ConversationPhase::AwaitingModel { .. }
                         | ConversationPhase::PreparingContinuation { .. }
+                        | ConversationPhase::Compacting { .. }
                 ) {
                     return Err(RuntimeError::InvalidPhase);
                 }
@@ -1755,7 +2077,17 @@ impl ConversationRuntime {
                     } => {
                         self.interrupt(*turn_id, *attempt_id)?;
                     }
-                    ConversationPhase::Cancelling { .. } => {}
+                    ConversationPhase::Compacting {
+                        compaction_id,
+                        attempt_id,
+                    } => {
+                        self.phase = ConversationPhase::CancellingCompaction {
+                            compaction_id: *compaction_id,
+                            attempt_id: *attempt_id,
+                        };
+                    }
+                    ConversationPhase::Cancelling { .. }
+                    | ConversationPhase::CancellingCompaction { .. } => {}
                     _ => {
                         self.request_loop_stopped = true;
                     }
@@ -1765,6 +2097,9 @@ impl ConversationRuntime {
             RuntimeCommand::Interrupt { text } => {
                 if self.lifecycle != RuntimeLifecycle::Ready {
                     return Err(RuntimeError::InvalidLifecycle);
+                }
+                if !text.is_empty() && self.phase == ConversationPhase::Idle {
+                    return self.start_prompt_turn(text).await;
                 }
                 if !text.is_empty() {
                     self.pending_interrupt = Some(text);
@@ -1777,19 +2112,30 @@ impl ConversationRuntime {
                     return Err(RuntimeError::InvalidLifecycle);
                 }
                 if self.queued_steering.is_empty() {
-                    return Err(RuntimeError::NoQueuedSteering);
+                    return Ok(vec![RuntimeEffect::Emit(RuntimeEvent::SteeringChanged(
+                        None,
+                    ))]);
                 }
-                self.pending_interrupt = Some(std::mem::take(&mut self.queued_steering).join("\n"));
+                let text = std::mem::take(&mut self.queued_steering).join("\n");
+                let mut effects = vec![RuntimeEffect::Emit(RuntimeEvent::SteeringChanged(None))];
+                if self.phase == ConversationPhase::Idle {
+                    effects.extend(self.start_prompt_turn(text).await?);
+                    return Ok(effects);
+                }
+                self.pending_interrupt = Some(text);
                 self.request_interrupt_boundary()?;
-                Ok(vec![RuntimeEffect::Emit(RuntimeEvent::SteeringChanged(
-                    None,
-                ))])
+                Ok(effects)
             }
             RuntimeCommand::SetModel { selection } => {
                 if self.lifecycle != RuntimeLifecycle::Ready {
                     return Err(RuntimeError::InvalidLifecycle);
                 }
-                if self.phase != ConversationPhase::Idle {
+                if !matches!(
+                    self.phase,
+                    ConversationPhase::Idle
+                        | ConversationPhase::PreparingAttempt { .. }
+                        | ConversationPhase::PreparingContinuation { .. }
+                ) {
                     return Err(RuntimeError::InvalidPhase);
                 }
                 if self.configuration.ports.model_route.selection != selection {
@@ -1846,7 +2192,7 @@ impl ConversationRuntime {
         }
     }
 
-    /// Persists the next queued tool call before allowing its executor to run.
+    /// Parses and persists the next queued tool call before allowing its executor to run.
     pub async fn accept_next_tool_call(
         &mut self,
         turn_id: u64,
@@ -1860,10 +2206,23 @@ impl ConversationRuntime {
             .ok_or(RuntimeError::NoPendingToolCall)?
             .clone();
         let tool = ToolName::new(call.name.clone()).map_err(|_| RuntimeError::UnknownTool)?;
-        if self.configuration.ports.tool_registry.get(&tool).is_none() {
-            return Err(RuntimeError::UnknownTool);
-        }
+        let advertised = self
+            .configuration
+            .ports
+            .tool_registry
+            .get(&tool)
+            .ok_or(RuntimeError::UnknownTool)?;
+        let route = advertised.executor.clone();
+        let invocation = self
+            .tool_executor()?
+            .prepare(ToolPreparationRequest {
+                tool: tool.clone(),
+                route: route.clone(),
+                input: call.input.clone(),
+            })
+            .map_err(tool_preparation_error)?;
         let call_id = call.call_id.clone();
+        let raw_input = persist_tool_input(&call.input);
 
         let execution_id = self.next_execution_id;
         self.next_execution_id = execution_id
@@ -1884,19 +2243,24 @@ impl ConversationRuntime {
         let tool_call_record = SessionPayload::ToolCallAccepted {
             turn_id,
             call_id: call_id.clone(),
-            name: call.name.clone(),
-            input: persist_tool_input(&call.input),
+            invocation: invocation.clone(),
+            raw_input: raw_input.clone(),
         };
+        let completed_goal = ToolOutcome::Goal(GoalResult);
         let records = if goal_completion {
-            vec![tool_call_record]
-        } else {
             vec![
                 tool_call_record,
-                SessionPayload::ToolExecutionStarted {
+                SessionPayload::ToolExecutionFinished {
                     turn_id,
                     call_id: call_id.clone(),
+                    invocation: invocation.clone(),
+                    outcome: completed_goal.clone(),
+                    raw_input: raw_input.clone(),
+                    raw_output: GOAL_COMPLETION_TOOL_OUTPUT.to_string(),
                 },
             ]
+        } else {
+            vec![tool_call_record]
         };
         self.phase = ConversationPhase::PersistingToolCall {
             turn_id,
@@ -1921,18 +2285,28 @@ impl ConversationRuntime {
         self.canonical_history.extend(records);
         self.canonical_revision = next_revision;
         self.pending_tool_calls.remove(0);
+        let activity = ToolActivity {
+            call_id: call_id.clone(),
+            invocation: invocation.clone(),
+            raw_input: transcript_tool_input(&call.input),
+            phase: if goal_completion {
+                ToolActivityPhase::Finished {
+                    outcome: completed_goal,
+                    raw_output: GOAL_COMPLETION_TOOL_OUTPUT.to_string(),
+                }
+            } else {
+                ToolActivityPhase::Running
+            },
+        };
         let transcript = RuntimeEffect::Emit(RuntimeEvent::TranscriptAppended(
-            harness_runtime_api::TranscriptSnapshotEntry {
+            TranscriptSnapshotEntry {
                 sequence: None,
-                payload: harness_runtime_api::TranscriptPayload::ToolCall {
-                    call_id: call.call_id.clone(),
-                    name: call.name.clone(),
-                    input: transcript_tool_input(&call.input),
-                },
+                payload: TranscriptPayload::ToolActivity(activity),
             },
         ));
         if goal_completion {
             self.active_tool_call = None;
+            self.active_tool_invocation = None;
             self.phase = ConversationPhase::PreparingContinuation { turn_id };
             self.complete_persist()?;
             self.complete_turn(turn_id).await?;
@@ -1942,15 +2316,22 @@ impl ConversationRuntime {
             ]);
         }
         self.active_tool_call = Some(call);
+        self.active_tool_invocation = Some(invocation.clone());
         self.phase = ConversationPhase::ExecutingTool {
             turn_id,
             execution_id,
             call_id: call_id.clone(),
         };
-        let request = self.active_tool_execution_request(ToolExecutionPolicy {
-            deadline_ms: 30_000,
-            cancellable: true,
-        })?;
+        let request = ToolExecutionRequest {
+            execution_id: ToolExecutionId(execution_id),
+            tool,
+            route,
+            invocation,
+            policy: ToolExecutionPolicy {
+                deadline_ms: 30_000,
+                cancellable: true,
+            },
+        };
         Ok(vec![
             transcript,
             RuntimeEffect::ExecuteTool {
@@ -1984,6 +2365,11 @@ impl ConversationRuntime {
             .active_tool_call
             .as_ref()
             .ok_or(RuntimeError::InvalidPhase)?;
+        let invocation = self
+            .active_tool_invocation
+            .as_ref()
+            .ok_or(RuntimeError::InvalidPhase)?
+            .clone();
         let tool = ToolName::new(call.name.clone()).map_err(|_| RuntimeError::UnknownTool)?;
         let advertised = self
             .configuration
@@ -1995,18 +2381,18 @@ impl ConversationRuntime {
             execution_id: ToolExecutionId(execution_id),
             tool,
             route: advertised.executor.clone(),
-            input: call.input.clone(),
+            invocation,
             policy,
         })
     }
 
-    /// Persists a tool result before allowing a continuation request.
+    /// Persists a typed tool result before allowing a continuation request.
     pub async fn commit_tool_result(
         &mut self,
         turn_id: u64,
         execution_id: u64,
         call_id: String,
-        output: String,
+        result: Result<ToolResult, ToolFailure>,
     ) -> Result<Vec<RuntimeEffect>, RuntimeError> {
         if self.phase
             != (ConversationPhase::ExecutingTool {
@@ -2018,6 +2404,17 @@ impl ConversationRuntime {
             return Err(RuntimeError::InvalidPhase);
         }
 
+        let call = self
+            .active_tool_call
+            .as_ref()
+            .ok_or(RuntimeError::InvalidPhase)?;
+        let invocation = self
+            .active_tool_invocation
+            .as_ref()
+            .ok_or(RuntimeError::InvalidPhase)?
+            .clone();
+        let raw_input = persist_tool_input(&call.input);
+        let result = materialize_tool_result(result);
         let next_revision = self
             .canonical_revision
             .checked_add(1)
@@ -2025,7 +2422,10 @@ impl ConversationRuntime {
         let records = vec![SessionPayload::ToolExecutionFinished {
             turn_id,
             call_id: call_id.clone(),
-            output: output.clone(),
+            invocation: invocation.clone(),
+            outcome: result.outcome.clone(),
+            raw_input: raw_input.clone(),
+            raw_output: result.model_output.clone(),
         }];
         self.phase = ConversationPhase::PersistingToolResult {
             turn_id,
@@ -2051,12 +2451,16 @@ impl ConversationRuntime {
         self.canonical_history.extend(records);
         self.canonical_revision = next_revision;
         self.active_tool_call = None;
-        let transcript = RuntimeEffect::Emit(RuntimeEvent::TranscriptAppended(
-            harness_runtime_api::TranscriptSnapshotEntry {
-                sequence: None,
-                payload: harness_runtime_api::TranscriptPayload::ToolResult { call_id, output },
+        self.active_tool_invocation = None;
+        let transcript = RuntimeEffect::Emit(RuntimeEvent::ToolActivityChanged(ToolActivity {
+            call_id,
+            invocation,
+            raw_input: transcript_session_tool_input(&raw_input),
+            phase: ToolActivityPhase::Finished {
+                outcome: result.outcome,
+                raw_output: result.model_output,
             },
-        ));
+        }));
         if self.pending_tool_calls.is_empty() {
             self.phase = ConversationPhase::PreparingAttempt { turn_id };
             Ok(vec![transcript, RuntimeEffect::ContinueModel { turn_id }])
@@ -2075,7 +2479,6 @@ impl ConversationRuntime {
             return Err(RuntimeError::InvalidPhase);
         }
         if self.request_loop_stopped {
-            self.pending_tool_calls.clear();
             self.active_tool_call = None;
             self.queued_steering.clear();
             self.complete_turn(turn_id).await?;
@@ -2136,13 +2539,9 @@ impl ConversationRuntime {
         Ok(self.apply_transcript_page(page))
     }
 
-    /// Projects one persisted page into exactly representable frontend entries.
+    /// Projects one persisted page while coalescing completed tool activities.
     pub fn apply_transcript_page(&self, page: StoredTranscriptPage) -> RuntimeEffect {
-        let entries = page
-            .entries
-            .iter()
-            .filter_map(project_transcript_record)
-            .collect();
+        let entries = project_transcript_records(&page.entries);
 
         RuntimeEffect::Emit(RuntimeEvent::TranscriptPageLoaded(
             harness_runtime_api::TranscriptPage {
@@ -2182,9 +2581,22 @@ impl ConversationRuntime {
         Ok(())
     }
 
-    /// Returns whether a compaction model attempt is active.
+    /// Returns whether a compaction model attempt is active or draining cancellation.
     pub fn compaction_attempt_active(&self) -> bool {
-        matches!(self.phase, ConversationPhase::Compacting { .. })
+        matches!(
+            self.phase,
+            ConversationPhase::Compacting { .. }
+                | ConversationPhase::CancellingCompaction { .. }
+        )
+    }
+
+    /// Returns whether the active transport should receive cancellation.
+    pub fn model_cancellation_requested(&self) -> bool {
+        matches!(
+            self.phase,
+            ConversationPhase::Cancelling { .. }
+                | ConversationPhase::CancellingCompaction { .. }
+        )
     }
 
     /// Retries the active model attempt using function-tool compatibility encoding.
@@ -2300,12 +2712,62 @@ impl ConversationRuntime {
         self.model_started
     }
 
-    /// Returns a failed compaction attempt to the idle state while retaining its source.
-    pub fn fail_compaction_attempt(&mut self) {
-        if self.compaction_attempt_active() {
-            self.phase = ConversationPhase::Idle;
-            self.model_started = false;
+    /// Fails the active compaction and preserves its source unless an interrupt starts a new turn.
+    pub async fn fail_compaction_attempt(
+        &mut self,
+        category: harness_runtime_api::RuntimeFailureCategory,
+        message: String,
+    ) -> Result<Vec<RuntimeEffect>, RuntimeError> {
+        if matches!(self.phase, ConversationPhase::CancellingCompaction { .. }) {
+            return self.finish_compaction_cancellation().await;
         }
+        if !self.compaction_attempt_active() {
+            return Err(RuntimeError::InvalidPhase);
+        }
+        self.compaction
+            .as_mut()
+            .ok_or(RuntimeError::CompactionNotActive)?
+            .fail()
+            .map_err(|_| RuntimeError::CompactionNotActive)?;
+        self.phase = ConversationPhase::Idle;
+        self.model_started = false;
+
+        let mut effects = vec![
+            RuntimeEffect::Emit(RuntimeEvent::CompactionFailed(message.clone())),
+            RuntimeEffect::Emit(RuntimeEvent::AgenticLoopCompleted),
+            RuntimeEffect::Emit(RuntimeEvent::Failure(
+                harness_runtime_api::RuntimeFailure { category, message },
+            )),
+        ];
+        if let Some(text) = self.pending_interrupt.take() {
+            if let Some(mut coordinator) = self.compaction.take() {
+                coordinator.cancel();
+            }
+            effects.extend(self.start_prompt_turn(text).await?);
+        }
+        Ok(effects)
+    }
+
+    async fn finish_compaction_cancellation(
+        &mut self,
+    ) -> Result<Vec<RuntimeEffect>, RuntimeError> {
+        if !matches!(self.phase, ConversationPhase::CancellingCompaction { .. }) {
+            return Err(RuntimeError::InvalidPhase);
+        }
+        let mut coordinator = self
+            .compaction
+            .take()
+            .ok_or(RuntimeError::CompactionNotActive)?;
+        coordinator.cancel();
+        self.phase = ConversationPhase::Idle;
+        self.model_started = false;
+
+        let mut effects = vec![
+            RuntimeEffect::Emit(RuntimeEvent::CompactionCancelled),
+            RuntimeEffect::Emit(RuntimeEvent::AgenticLoopCompleted),
+        ];
+        effects.extend(self.start_pending_interrupt().await?);
+        Ok(effects)
     }
 
     /// Adds one streamed compaction fragment to the staged result.
@@ -2337,22 +2799,49 @@ impl ConversationRuntime {
         &mut self,
         instruction: Option<String>,
     ) -> Result<(), RuntimeError> {
-        self.compaction
-            .as_mut()
-            .ok_or(RuntimeError::CompactionNotActive)?
-            .redo_with_instruction(instruction)
-            .map_err(|_| RuntimeError::CompactionRedoUnavailable)
-    }
-
-    /// Cancels staged compaction and preserves the active canonical history.
-    pub fn cancel_compaction(&mut self) -> Result<(), RuntimeError> {
+        if self.phase != ConversationPhase::Idle {
+            return Err(RuntimeError::InvalidPhase);
+        }
         let coordinator = self
             .compaction
             .as_mut()
             .ok_or(RuntimeError::CompactionNotActive)?;
-        coordinator.cancel();
-        self.compaction = None;
-        Ok(())
+        if coordinator
+            .source()
+            .is_some_and(|source| source.revision != self.canonical_revision)
+        {
+            return Err(RuntimeError::StaleCompaction);
+        }
+        coordinator
+            .redo_with_instruction(instruction)
+            .map_err(|_| RuntimeError::CompactionRedoUnavailable)
+    }
+
+    /// Cancels staged compaction immediately when idle or begins draining an active attempt.
+    pub fn cancel_compaction(&mut self) -> Result<(), RuntimeError> {
+        if self.compaction.is_none() {
+            return Err(RuntimeError::CompactionNotActive);
+        }
+        match self.phase {
+            ConversationPhase::Idle => {
+                if let Some(mut coordinator) = self.compaction.take() {
+                    coordinator.cancel();
+                }
+                Ok(())
+            }
+            ConversationPhase::Compacting {
+                compaction_id,
+                attempt_id,
+            } => {
+                self.phase = ConversationPhase::CancellingCompaction {
+                    compaction_id,
+                    attempt_id,
+                };
+                Ok(())
+            }
+            ConversationPhase::CancellingCompaction { .. } => Ok(()),
+            _ => Err(RuntimeError::InvalidPhase),
+        }
     }
 
     /// Returns whether a compaction transaction is staged.
@@ -2368,9 +2857,9 @@ impl ConversationRuntime {
         Ok(RuntimeEvent::ShutdownComplete)
     }
 
-    /// Returns the transient assistant text that is not yet canonical.
+    /// Returns all transient assistant text that is not yet canonical.
     pub fn transient_assistant(&self) -> &str {
-        &self.transient_assistant
+        &self.transient_response.assistant
     }
 
     /// Returns the current lifecycle.
@@ -2428,14 +2917,17 @@ impl ConversationRuntime {
         std::sync::Arc::clone(&self.configuration.ports.model_transport)
     }
 
-    /// Update the transport and root model route ports in-place.
+    /// Updates the transport, root route, and tool encoding for future requests.
     pub fn update_ports(
         &mut self,
         model_transport: std::sync::Arc<dyn harness_model_api::ModelTransport>,
         model_route: harness_model_api::ResolvedModelRoute,
+        freeform_tool_input: bool,
     ) {
         self.configuration.ports.model_transport = model_transport;
         self.configuration.ports.model_route = model_route;
+        self.configuration.freeform_tool_input = freeform_tool_input;
+        self.compatibility_mode = !freeform_tool_input;
     }
 
     /// Updates the route used for future compaction requests.
@@ -2454,8 +2946,8 @@ impl ConversationRuntime {
             .await
             .map_err(RuntimeError::Session)
     }
-}
 
+}
 /// Immutable compaction plan bound to one canonical history revision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompactionPlan {
@@ -2551,12 +3043,21 @@ pub enum RuntimeError {
     /// A model requests a tool that is not registered.
     #[error("model requested an unknown tool")]
     UnknownTool,
+    /// A built-in tool could not prepare its typed invocation.
+    #[error("tool preparation failed: {0}")]
+    ToolPreparation(String),
     /// A selected model does not match the configured provider route.
     #[error("selected model does not match the configured provider route")]
     ModelRouteSelectionMismatch,
     /// A prompt, steering command, or interrupt contains no text.
     #[error("runtime command text is empty")]
     EmptyCommandText,
+    /// Slash-command text was sent through the conversation input path.
+    #[error(
+        "slash-prefixed command text must use RuntimeCommand::ExecuteCommand; SubmitPrompt sends conversation input to the model"
+    )]
+    CommandDispatcherRequired,
+
     /// A model attempt emits more than one start event.
     #[error("model attempt emitted a duplicate start event")]
     DuplicateModelStart,
@@ -2584,9 +3085,60 @@ pub enum RuntimeError {
     /// The durable tail does not identify a user or tool turn that can be retried.
     #[error("the last durable message cannot be retried")]
     RetryUnavailable,
-    /// No queued steering is available to send immediately.
-    #[error("no queued steering is available")]
-    NoQueuedSteering,
+}
+
+fn tool_preparation_error(failure: ToolFailure) -> RuntimeError {
+    let message = match failure {
+        ToolFailure::InvalidInput(message) | ToolFailure::Execution(message) => message,
+        ToolFailure::TimedOut => "tool preparation timed out".to_owned(),
+        ToolFailure::Cancelled => "tool preparation was cancelled".to_owned(),
+    };
+    RuntimeError::ToolPreparation(message)
+}
+
+fn materialize_tool_result(result: Result<ToolResult, ToolFailure>) -> ToolResult {
+    match result {
+        Ok(result) => result,
+        Err(failure) => {
+            let (message, outcome) = match failure {
+                ToolFailure::InvalidInput(message) => {
+                    let outcome = ToolOutcome::Failed(ToolExecutionFailure {
+                        category: ToolFailureCategory::InvalidInput,
+                        message: message.clone(),
+                    });
+                    (message, outcome)
+                }
+                ToolFailure::TimedOut => {
+                    let message = "The tool timed out before completing.".to_owned();
+                    let outcome = ToolOutcome::Failed(ToolExecutionFailure {
+                        category: ToolFailureCategory::TimedOut,
+                        message: message.clone(),
+                    });
+                    (message, outcome)
+                }
+                ToolFailure::Cancelled => {
+                    let message = "The tool was cancelled.".to_owned();
+                    let outcome = ToolOutcome::Interrupted(ToolInterruption {
+                        message: message.clone(),
+                    });
+                    (message, outcome)
+                }
+                ToolFailure::Execution(message) => {
+                    let outcome = ToolOutcome::Failed(ToolExecutionFailure {
+                        category: ToolFailureCategory::Execution,
+                        message: message.clone(),
+                    });
+                    (message, outcome)
+                }
+            };
+            ToolResult {
+                model_output: format!(
+                    "The tool reported: {message}\n\nReview the error and retry the tool call with corrected input."
+                ),
+                outcome,
+            }
+        }
+    }
 }
 
 fn is_goal_completion_input(input: &str) -> bool {
@@ -2665,8 +3217,6 @@ pub enum RuntimeEffect {
     CommitCompaction {
         /// Compaction identity.
         compaction_id: u64,
-        /// Validated summary text.
-        summary: String,
     },
     /// Commit one completed assistant response.
     CommitAssistant {
@@ -2748,12 +3298,12 @@ mod tests {
         future::Future,
         path::PathBuf,
         pin::Pin,
-        sync::{Mutex, MutexGuard},
+        sync::{Arc, Mutex, MutexGuard},
     };
 
     use harness_model_api::{
-        ModelCancellation, ModelCompletion, ModelInput, ModelMessageRole, ModelRequestId,
-        ProviderId,
+        ModelCancellation, ModelCompletion, ModelInput, ModelInterruption, ModelMessageRole,
+        ModelRequestId, ProviderId, RequestContextUsage,
     };
     use harness_session_store::{SessionId, SessionReader, TranscriptPage};
 
@@ -2906,6 +3456,34 @@ mod tests {
         }
     }
 
+    struct ThresholdRequestBuilder;
+
+    impl ModelRequestBuilder for ThresholdRequestBuilder {
+        fn build(
+            &self,
+            revision: u64,
+            selection: &ModelSelection,
+            provider_generation: ProviderGeneration,
+            history: &[SessionPayload],
+            steering: &[String],
+        ) -> Result<Arc<ModelRequest>, RuntimeError> {
+            let request = HistoryRequestBuilder.build(
+                revision,
+                selection,
+                provider_generation,
+                history,
+                steering,
+            )?;
+            let mut request = Arc::unwrap_or_clone(request);
+            request.context_usage = Some(RequestContextUsage {
+                estimated_input_tokens: 1_000,
+                max_input_tokens: 2_000,
+                compact_at_tokens: 1_000,
+            });
+            Ok(Arc::new(request))
+        }
+    }
+
     struct UnusedModelTransport;
 
     impl ModelTransport for UnusedModelTransport {
@@ -2947,6 +3525,7 @@ mod tests {
         RuntimeConfiguration {
             session_id: SessionId::new("send-now-test").unwrap(),
             model: selection,
+            freeform_tool_input: true,
             ports: RuntimePorts {
                 session_store: Arc::new(store),
                 tool_registry: ToolRegistry::new(),
@@ -2958,6 +3537,175 @@ mod tests {
                 tool_availability: Arc::new(RwLock::new(ToolAvailability::default())),
             },
         }
+    }
+    #[tokio::test]
+    async fn multiple_reasoning_blocks_persist_in_stream_order() {
+        let store = MemorySessionStore::default();
+        let mut runtime = ConversationRuntime::new(runtime_configuration(store.clone()));
+        runtime.begin_startup().await.unwrap();
+        runtime.mark_ready().unwrap();
+
+        let effects = runtime
+            .dispatch_command(RuntimeCommand::SubmitPrompt {
+                text: "solve in stages".to_string(),
+            })
+            .await
+            .unwrap();
+        let (turn_id, attempt_id) = effects
+            .iter()
+            .find_map(|effect| match effect {
+                RuntimeEffect::StartModel {
+                    turn_id, attempt, ..
+                } => Some((*turn_id, attempt.attempt_id.0)),
+                _ => None,
+            })
+            .unwrap();
+
+        let events = [
+            ModelEvent::Started,
+            ModelEvent::ReasoningStarted,
+            ModelEvent::ReasoningSummaryDelta("plan ".to_string()),
+            ModelEvent::ReasoningSummaryDelta("one".to_string()),
+            ModelEvent::ReasoningItem(harness_model_api::ModelReasoning {
+                content: None,
+                encrypted_content: Some("encrypted-one".to_string()),
+                summary: Some("plan one".to_string()),
+            }),
+            ModelEvent::AssistantTextDelta("answer ".to_string()),
+            ModelEvent::AssistantTextDelta("one".to_string()),
+            ModelEvent::ReasoningStarted,
+            ModelEvent::ReasoningSummaryDelta("plan two".to_string()),
+            ModelEvent::ReasoningItem(harness_model_api::ModelReasoning {
+                content: None,
+                encrypted_content: Some("encrypted-two".to_string()),
+                summary: Some("plan two".to_string()),
+            }),
+            ModelEvent::AssistantTextDelta("answer two".to_string()),
+        ];
+        for event in events {
+            runtime
+                .dispatch_model_event(turn_id, attempt_id, event)
+                .await
+                .unwrap();
+        }
+
+        let terminal_effects = runtime
+            .dispatch_model_event(
+                turn_id,
+                attempt_id,
+                ModelEvent::Terminal(ModelTerminalOutcome::Completed(ModelCompletion {
+                    text: "answer oneanswer two".to_string(),
+                    usage: None,
+                })),
+            )
+            .await
+            .unwrap();
+        assert!(terminal_effects.iter().any(|effect| matches!(
+            effect,
+            RuntimeEffect::CommitAssistant {
+                turn_id: committed_turn,
+                attempt_id: committed_attempt,
+            } if *committed_turn == turn_id && *committed_attempt == attempt_id
+        )));
+
+        let commit_effects = runtime.commit_assistant(turn_id, attempt_id).await.unwrap();
+        let committed_sequences = commit_effects
+            .iter()
+            .find_map(|effect| match effect {
+                RuntimeEffect::Emit(RuntimeEvent::TranscriptCommitted { sequences }) => {
+                    Some(sequences.clone())
+                }
+                _ => None,
+            })
+            .unwrap();
+
+        let records = store.records();
+        let response_records = records
+            .iter()
+            .filter_map(|record| match &record.payload {
+                SessionPayload::Reasoning { summary, .. } => {
+                    Some((record.sequence, format!("thinking:{}", summary.as_deref().unwrap())))
+                }
+                SessionPayload::AssistantMessage { text, .. } => {
+                    Some((record.sequence, format!("assistant:{text}")))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            response_records
+                .iter()
+                .map(|(_, text)| text.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "thinking:plan one",
+                "assistant:answer one",
+                "thinking:plan two",
+                "assistant:answer two",
+            ]
+        );
+        assert_eq!(
+            committed_sequences,
+            response_records
+                .iter()
+                .map(|(sequence, _)| *sequence)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    async fn idle_runtime_with_history() -> (ConversationRuntime, MemorySessionStore) {
+        let store = MemorySessionStore::default();
+        let mut runtime = ConversationRuntime::new(runtime_configuration(store.clone()));
+        runtime.begin_startup().await.unwrap();
+        runtime.mark_ready().unwrap();
+
+        let effects = runtime
+            .dispatch_command(RuntimeCommand::SubmitPrompt {
+                text: "history to compact".to_string(),
+            })
+            .await
+            .unwrap();
+        let (turn_id, attempt_id) = effects
+            .iter()
+            .find_map(|effect| match effect {
+                RuntimeEffect::StartModel {
+                    turn_id, attempt, ..
+                } => Some((*turn_id, attempt.attempt_id.0)),
+                _ => None,
+            })
+            .unwrap();
+        runtime
+            .finish_model_attempt(
+                turn_id,
+                attempt_id,
+                ModelTerminalOutcome::Interrupted(ModelInterruption {
+                    reason: "seed history".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+
+        (runtime, store)
+    }
+
+    async fn start_test_compaction(runtime: &mut ConversationRuntime) -> (u64, u64) {
+        runtime
+            .dispatch_command(RuntimeCommand::Compact {
+                instruction: "preserve active requirements".to_string(),
+            })
+            .await
+            .unwrap()
+            .into_iter()
+            .find_map(|effect| match effect {
+                RuntimeEffect::StartCompaction {
+                    compaction_id,
+                    attempt,
+                    ..
+                } => Some((compaction_id, attempt.attempt_id.0)),
+                _ => None,
+            })
+            .unwrap()
     }
 
     async fn runtime_with_queued_send() -> (
@@ -3136,7 +3884,97 @@ mod tests {
             } if *input_turn == turn_id + 1 && text == "send this now"
         )));
     }
- 
+
+    #[tokio::test]
+    async fn model_switch_at_a_continuation_boundary_updates_the_next_attempt() {
+        let store = MemorySessionStore::default();
+        let mut runtime = ConversationRuntime::new(runtime_configuration(store));
+        runtime.begin_startup().await.unwrap();
+        runtime.mark_ready().unwrap();
+        let effects = runtime
+            .dispatch_command(RuntimeCommand::SubmitPrompt {
+                text: "first prompt".to_string(),
+            })
+            .await
+            .unwrap();
+        let (turn_id, attempt_id) = effects
+            .iter()
+            .find_map(|effect| match effect {
+                RuntimeEffect::StartModel {
+                    turn_id, attempt, ..
+                } => Some((*turn_id, attempt.attempt_id.0)),
+                _ => None,
+            })
+            .unwrap();
+        runtime
+            .dispatch_model_event(turn_id, attempt_id, ModelEvent::Started)
+            .await
+            .unwrap();
+        runtime
+            .dispatch_model_event(
+                turn_id,
+                attempt_id,
+                ModelEvent::AssistantTextDelta("first response".to_string()),
+            )
+            .await
+            .unwrap();
+        runtime
+            .finish_model_attempt(
+                turn_id,
+                attempt_id,
+                ModelTerminalOutcome::Completed(ModelCompletion {
+                    text: "first response".to_string(),
+                    usage: None,
+                }),
+            )
+            .await
+            .unwrap();
+        runtime.commit_assistant(turn_id, attempt_id).await.unwrap();
+        runtime
+            .dispatch_command(RuntimeCommand::QueueSteering {
+                text: "continue".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let provider = ProviderId::new("test-provider").unwrap();
+        let next_selection =
+            ModelSelection::new(provider.clone(), "next-model", Some("high".to_string()), None);
+        let next_route = ResolvedModelRoute::new(
+            provider,
+            ProviderGeneration(2),
+            "next-route",
+            next_selection.clone(),
+        )
+        .unwrap();
+        runtime.update_ports(runtime.active_transport(), next_route.clone(), true);
+        runtime.update_compaction_route(next_route);
+        runtime
+            .dispatch_command(RuntimeCommand::SetModel {
+                selection: next_selection.clone(),
+            })
+            .await
+            .unwrap();
+
+        let effects = runtime.continue_turn(turn_id).await.unwrap();
+        assert!(matches!(
+            effects.as_slice(),
+            [RuntimeEffect::ContinueModel { turn_id: effect_turn }]
+                if *effect_turn == turn_id
+        ));
+        let effects = runtime.start_model_request().await.unwrap();
+        let next_attempt = effects
+            .iter()
+            .find_map(|effect| match effect {
+                RuntimeEffect::StartModel { attempt, route, .. } => Some((attempt, route)),
+                _ => None,
+            })
+            .unwrap();
+
+        assert_eq!(next_attempt.0.request.selection, next_selection);
+        assert_eq!(next_attempt.1.selection, next_selection);
+    }
+
     #[tokio::test]
     async fn warning_does_not_end_the_active_model_attempt() {
         let store = MemorySessionStore::default();
@@ -3164,9 +4002,7 @@ mod tests {
             .dispatch_model_event(
                 turn_id,
                 attempt_id,
-                ModelEvent::Warning(
-                    "ignored unknown Responses event type: response.future".into(),
-                ),
+                ModelEvent::Warning("ignored unknown Responses event type: response.future".into()),
             )
             .await
             .unwrap();
@@ -3213,7 +4049,10 @@ mod tests {
             },
         ];
 
-        let effects = runtime.dispatch_command(RuntimeCommand::Retry).await.unwrap();
+        let effects = runtime
+            .dispatch_command(RuntimeCommand::Retry)
+            .await
+            .unwrap();
 
         assert!(matches!(
             effects.as_slice(),
@@ -3226,5 +4065,345 @@ mod tests {
             runtime.phase(),
             &ConversationPhase::PreparingAttempt { turn_id: 7 }
         );
+    }
+
+    #[tokio::test]
+    async fn retry_restarts_failed_automatic_compaction() {
+        let (mut runtime, _store) = idle_runtime_with_history().await;
+        runtime.configuration.ports.request_builder = Arc::new(ThresholdRequestBuilder);
+
+        let (_, attempt_id) = start_test_compaction(&mut runtime).await;
+        runtime
+            .dispatch_model_event(
+                0,
+                attempt_id,
+                ModelEvent::Terminal(ModelTerminalOutcome::Failed(
+                    harness_model_api::ModelFailure {
+                        kind: harness_model_api::ModelFailureKind::Protocol,
+                        message: "model stream ended without a terminal outcome".to_owned(),
+                    },
+                )),
+            )
+            .await
+            .unwrap();
+        assert_eq!(runtime.phase(), &ConversationPhase::Idle);
+        assert!(runtime.has_compaction());
+
+        let retry_effects = runtime
+            .dispatch_command(RuntimeCommand::Retry)
+            .await
+            .unwrap();
+        assert!(retry_effects
+            .iter()
+            .any(|effect| matches!(effect, RuntimeEffect::ContinueModel { .. })));
+
+        let effects = runtime.start_model_request().await.unwrap();
+        assert!(effects
+            .iter()
+            .any(|effect| matches!(effect, RuntimeEffect::StartCompaction { .. })));
+        assert!(runtime.compaction_attempt_active());
+    }
+
+    #[tokio::test]
+    async fn interrupted_compaction_redo_discards_partial_output() {
+        let (mut runtime, store) = idle_runtime_with_history().await;
+        let (_, attempt_id) = start_test_compaction(&mut runtime).await;
+        runtime
+            .dispatch_model_event(
+                0,
+                attempt_id,
+                ModelEvent::AssistantTextDelta("partial output that must be discarded".to_string()),
+            )
+            .await
+            .unwrap();
+
+        runtime
+            .dispatch_model_event(
+                0,
+                attempt_id,
+                ModelEvent::Terminal(ModelTerminalOutcome::Interrupted(ModelInterruption {
+                    reason: "stream interrupted".to_string(),
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(runtime.phase(), &ConversationPhase::Idle);
+        assert!(runtime.has_compaction());
+
+        let redo_attempt = runtime
+            .dispatch_command(RuntimeCommand::RetryCompaction { instruction: None })
+            .await
+            .unwrap()
+            .into_iter()
+            .find_map(|effect| match effect {
+                RuntimeEffect::StartCompaction { attempt, .. } => Some(attempt.attempt_id.0),
+                _ => None,
+            })
+            .unwrap();
+        let replacement =
+            "Replacement summary preserves the active requirements and unfinished work.";
+        runtime
+            .dispatch_model_event(
+                0,
+                redo_attempt,
+                ModelEvent::AssistantTextDelta(replacement.to_string()),
+            )
+            .await
+            .unwrap();
+        let compaction_id = runtime
+            .dispatch_model_event(
+                0,
+                redo_attempt,
+                ModelEvent::Terminal(ModelTerminalOutcome::Completed(ModelCompletion {
+                    text: replacement.to_string(),
+                    usage: None,
+                })),
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .find_map(|effect| match effect {
+                RuntimeEffect::CommitCompaction { compaction_id } => Some(compaction_id),
+                _ => None,
+            })
+            .unwrap();
+        runtime.commit_compaction(compaction_id).await.unwrap();
+
+        assert!(store.records().iter().any(|record| matches!(
+            &record.payload,
+            SessionPayload::CompactionCheckpoint { summary, .. } if summary == replacement
+        )));
+    }
+
+    #[tokio::test]
+    async fn interrupt_during_compaction_starts_the_next_durable_turn() {
+        let (mut runtime, store) = idle_runtime_with_history().await;
+        let (_, attempt_id) = start_test_compaction(&mut runtime).await;
+        runtime
+            .dispatch_model_event(
+                0,
+                attempt_id,
+                ModelEvent::AssistantTextDelta(
+                    "A complete summary that arrived after cancellation was requested.".to_string(),
+                ),
+            )
+            .await
+            .unwrap();
+
+        runtime
+            .dispatch_command(RuntimeCommand::Interrupt {
+                text: "new user direction".to_string(),
+            })
+            .await
+            .unwrap();
+        let effects = runtime
+            .dispatch_model_event(
+                0,
+                attempt_id,
+                ModelEvent::Terminal(ModelTerminalOutcome::Completed(ModelCompletion {
+                    text: "late completion".to_string(),
+                    usage: None,
+                })),
+            )
+            .await
+            .unwrap();
+
+        assert!(effects
+            .iter()
+            .any(|effect| matches!(effect, RuntimeEffect::Emit(RuntimeEvent::CompactionCancelled))));
+        assert!(effects
+            .iter()
+            .any(|effect| matches!(effect, RuntimeEffect::StartModel { .. })));
+        assert!(!effects
+            .iter()
+            .any(|effect| matches!(effect, RuntimeEffect::CommitCompaction { .. })));
+        assert!(store.records().iter().any(|record| matches!(
+            &record.payload,
+            SessionPayload::InputMessage { text, .. } if text == "new user direction"
+        )));
+        assert!(!store.records().iter().any(|record| matches!(
+            &record.payload,
+            SessionPayload::CompactionCheckpoint { .. }
+        )));
+    }
+
+    #[tokio::test]
+    async fn wrong_compaction_identity_cannot_mutate_storage() {
+        let (mut runtime, store) = idle_runtime_with_history().await;
+        let (_, attempt_id) = start_test_compaction(&mut runtime).await;
+        let summary = "Summary preserves the active task, constraints, and unfinished work.";
+        runtime
+            .dispatch_model_event(
+                0,
+                attempt_id,
+                ModelEvent::AssistantTextDelta(summary.to_string()),
+            )
+            .await
+            .unwrap();
+        let compaction_id = runtime
+            .dispatch_model_event(
+                0,
+                attempt_id,
+                ModelEvent::Terminal(ModelTerminalOutcome::Completed(ModelCompletion {
+                    text: summary.to_string(),
+                    usage: None,
+                })),
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .find_map(|effect| match effect {
+                RuntimeEffect::CommitCompaction { compaction_id } => Some(compaction_id),
+                _ => None,
+            })
+            .unwrap();
+        let records_before = store.records().len();
+
+        assert!(matches!(
+            runtime.commit_compaction(compaction_id + 1).await,
+            Err(RuntimeError::InvalidPhase)
+        ));
+        assert_eq!(store.records().len(), records_before);
+        assert_eq!(
+            runtime.phase(),
+            &ConversationPhase::CommittingCompaction { compaction_id }
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_compaction_revision_cannot_mutate_storage() {
+        let (mut runtime, store) = idle_runtime_with_history().await;
+        let (_, attempt_id) = start_test_compaction(&mut runtime).await;
+        let summary = "Summary preserves the active task, constraints, and unfinished work.";
+        runtime
+            .dispatch_model_event(
+                0,
+                attempt_id,
+                ModelEvent::AssistantTextDelta(summary.to_string()),
+            )
+            .await
+            .unwrap();
+        let compaction_id = runtime
+            .dispatch_model_event(
+                0,
+                attempt_id,
+                ModelEvent::Terminal(ModelTerminalOutcome::Completed(ModelCompletion {
+                    text: summary.to_string(),
+                    usage: None,
+                })),
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .find_map(|effect| match effect {
+                RuntimeEffect::CommitCompaction { compaction_id } => Some(compaction_id),
+                _ => None,
+            })
+            .unwrap();
+        runtime.canonical_revision += 1;
+        let records_before = store.records().len();
+
+        assert!(matches!(
+            runtime.commit_compaction(compaction_id).await,
+            Err(RuntimeError::StaleCompaction)
+        ));
+        assert_eq!(store.records().len(), records_before);
+        assert_eq!(runtime.phase(), &ConversationPhase::Idle);
+        assert!(runtime.has_compaction());
+    }
+
+    #[tokio::test]
+    async fn switching_sessions_discards_staged_compaction() {
+        let (mut runtime, _) = idle_runtime_with_history().await;
+        let (_, attempt_id) = start_test_compaction(&mut runtime).await;
+        runtime
+            .dispatch_model_event(
+                0,
+                attempt_id,
+                ModelEvent::Terminal(ModelTerminalOutcome::Interrupted(ModelInterruption {
+                    reason: "retain source for redo".to_string(),
+                })),
+            )
+            .await
+            .unwrap();
+        assert!(runtime.has_compaction());
+
+        let next_session = SessionId::new("next-session").unwrap();
+        runtime.switch_session(next_session.clone()).await.unwrap();
+
+        assert_eq!(runtime.session_id(), next_session);
+        assert!(!runtime.has_compaction());
+    }
+
+    #[tokio::test]
+    async fn stale_send_queued_steering_reconciles_without_cancelling() {
+        let store = MemorySessionStore::default();
+        let mut runtime = ConversationRuntime::new(runtime_configuration(store));
+        runtime.begin_startup().await.unwrap();
+        runtime.mark_ready().unwrap();
+        runtime
+            .dispatch_command(RuntimeCommand::SubmitPrompt {
+                text: "active prompt".to_string(),
+            })
+            .await
+            .unwrap();
+        let phase_before = runtime.phase().clone();
+
+        let effects = runtime
+            .dispatch_command(RuntimeCommand::SendQueuedSteering)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            effects.as_slice(),
+            [RuntimeEffect::Emit(RuntimeEvent::SteeringChanged(None))]
+        ));
+        assert_eq!(runtime.phase(), &phase_before);
+        assert!(!runtime.model_cancellation_requested());
+    }
+
+    #[tokio::test]
+    async fn queued_steering_left_idle_by_compaction_failure_submits_immediately() {
+        let (mut runtime, store) = idle_runtime_with_history().await;
+        let (_, attempt_id) = start_test_compaction(&mut runtime).await;
+        runtime
+            .dispatch_command(RuntimeCommand::QueueSteering {
+                text: "queued next direction".to_string(),
+            })
+            .await
+            .unwrap();
+        runtime
+            .dispatch_model_event(
+                0,
+                attempt_id,
+                ModelEvent::Terminal(ModelTerminalOutcome::Interrupted(ModelInterruption {
+                    reason: "compaction failed".to_string(),
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(runtime.phase(), &ConversationPhase::Idle);
+
+        let effects = runtime
+            .dispatch_command(RuntimeCommand::SendQueuedSteering)
+            .await
+            .unwrap();
+
+        assert!(runtime.queued_steering().is_empty());
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            RuntimeEffect::StartModel { attempt, .. }
+                if attempt.request.input.iter().any(|input| matches!(
+                    input,
+                    ModelInput::Message {
+                        role: ModelMessageRole::User,
+                        text,
+                    } if text == "queued next direction"
+                ))
+        )));
+        assert!(store.records().iter().any(|record| matches!(
+            &record.payload,
+            SessionPayload::InputMessage { text, .. } if text == "queued next direction"
+        )));
     }
 }

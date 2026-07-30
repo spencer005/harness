@@ -12,15 +12,20 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     pin::Pin,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use harness_tool_api::{
-    InvalidToolName, ToolCapabilities, ToolExecutionRequest, ToolExecutor, ToolFailure, ToolInput,
-    ToolPresentation, ToolResult, ToolSpec,
+    DiffHunk, DiffLine, DiffLineKind, EditFileResult, EditOperationOutcome, FileChange,
+    FileChangeKind, InvalidToolName, Prepared, ToolCapabilities, ToolExecutionFailure,
+    ToolExecutionRequest, ToolExecutor, ToolFailure, ToolFailureCategory, ToolInvocation,
+    ToolOutcome, ToolPreparationRequest, ToolResult, ToolSpec,
+};
+use similar::{ChangeTag, TextDiff};
+
+pub use harness_tool_api::{
+    EditFileRequest as Request, EditInsertPosition as InsertPosition,
+    EditLineAnchor as LineAnchor, EditOperation as Operation, EditSegment as Segment,
 };
 
 use crate::WorkspaceRoot;
@@ -93,14 +98,32 @@ impl Executor {
     }
 }
 
-::inventory::submit! {
-    crate::inventory::ToolRegistration {
-        spec,
-        executor: |workspace| Arc::new(Executor::new(workspace)),
-    }
-}
 
 impl ToolExecutor for Executor {
+    fn prepare(&self, request: ToolPreparationRequest) -> Result<ToolInvocation, ToolFailure> {
+        if request.tool.as_str() != NAME || request.route.identifier != NAME {
+            return Err(ToolFailure::Execution(format!(
+                "executor route does not match `{NAME}` for tool {}",
+                request.tool.as_str()
+            )));
+        }
+        let input = match request.input.decode_freeform() {
+            Ok(input) => input,
+            Err(error) => {
+                return Ok(ToolInvocation::EditFile(Prepared::Rejected(
+                    harness_tool_api::ToolInputRejection {
+                        message: error.to_string(),
+                    },
+                )));
+            }
+        };
+        let prepared = match parse_input(&input) {
+            Ok(request) => Prepared::Ready(request),
+            Err(message) => Prepared::Rejected(harness_tool_api::ToolInputRejection { message }),
+        };
+        Ok(ToolInvocation::EditFile(prepared))
+    }
+
     fn execute(
         &self,
         request: ToolExecutionRequest,
@@ -114,76 +137,27 @@ impl ToolExecutor for Executor {
 
         let workspace = self.workspace.clone();
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || execute(&workspace, &request.input))
+            let prepared = match request.invocation {
+                ToolInvocation::EditFile(Prepared::Ready(prepared)) => prepared,
+                ToolInvocation::EditFile(Prepared::Rejected(rejection)) => {
+                    return Ok(rejected_result(rejection.message));
+                }
+                invocation => {
+                    return Err(ToolFailure::Execution(format!(
+                        "`{NAME}` received prepared invocation for `{}`",
+                        invocation.tool().name()
+                    )));
+                }
+            };
+            tokio::task::spawn_blocking(move || execute(&workspace, &prepared))
                 .await
-                .map_err(|error| ToolFailure::Execution(error.to_string()))?
+                .map_err(|error| ToolFailure::Execution(error.to_string()))
         })
     }
 }
 
-/// Parsed collection of file operations.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Request {
-    /// Operations are applied in the order they appear in the input.
-    pub operations: Vec<Operation>,
-}
 
-/// One file operation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Operation {
-    /// Creates a new file and its missing parent directories.
-    Add { path: String, body: String },
-    /// Removes a file, symlink, or explicitly marked directory.
-    Remove { path: String },
-    /// Moves a file or directory to another workspace-relative path.
-    Move { from: String, to: String },
-    /// Applies one or more anchor-based edits to an existing text file.
-    Edit {
-        path: String,
-        segments: Vec<Segment>,
-    },
-}
-
-/// One anchor-based edit within an existing file.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Segment {
-    /// Replaces an inclusive range of lines.
-    Replace {
-        start: LineAnchor,
-        end: LineAnchor,
-        body: String,
-    },
-    /// Deletes an inclusive range of lines.
-    Delete { start: LineAnchor, end: LineAnchor },
-    /// Inserts text relative to one anchor.
-    Insert {
-        position: InsertPosition,
-        anchor: LineAnchor,
-        body: String,
-    },
-}
-
-/// Position used by an insertion segment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InsertPosition {
-    /// Insert before the anchor line.
-    Before,
-    /// Insert after the anchor line.
-    After,
-    /// Insert after the current final line.
-    Append,
-}
-
-/// Line number and vocabulary word identifying one source line.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LineAnchor {
-    /// One-based source line number.
-    pub line_number: usize,
-    /// Compact vocabulary identifier for the source line.
-    pub hash: u8,
-}
-
-fn validate_body_line(line: &str) -> Result<(), String> {
+fn validate_body_line(_line: &str) -> Result<(), String> {
     // ERROR PRONE CODE, do not reenable
     // let trimmed = line.trim_start();
     // let first = match trimmed.split_whitespace().next() {
@@ -244,61 +218,267 @@ fn invalid_edit_header(line: &str) -> String {
     }
 }
 
-/// Parses and executes one `edit_file` request.
-pub fn execute(workspace: &WorkspaceRoot, input: &ToolInput) -> Result<ToolResult, ToolFailure> {
-    let request = match parse_input(input.as_str()) {
-        Ok(request) => request,
-        Err(message) => return Ok(output(message.clone(), message)),
-    };
+/// Executes one prepared `edit_file` request.
+pub fn execute(workspace: &WorkspaceRoot, request: &Request) -> ToolResult {
+    let applied = apply_request(workspace, request);
+    ToolResult {
+        model_output: applied.model_output,
+        outcome: ToolOutcome::EditFile(applied.result),
+    }
+}
 
-    match apply_request(workspace, &request) {
-        Ok(result) => Ok(output(result.model_output, result.display_output)),
-        Err(message) => Ok(output(message.clone(), message)),
+fn rejected_result(message: String) -> ToolResult {
+    ToolResult {
+        model_output: message.clone(),
+        outcome: ToolOutcome::Failed(ToolExecutionFailure {
+            category: ToolFailureCategory::InvalidInput,
+            message,
+        }),
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AppliedRequest {
     model_output: String,
-    display_output: String,
+    result: EditFileResult,
 }
 
-fn output(model_output: String, display_output: String) -> ToolResult {
-    ToolResult {
-        model_output,
-        presentation: Some(ToolPresentation {
-            label: NAME.to_string(),
-            display: Some(display_output),
-        }),
-        artifacts: Vec::new(),
-    }
-}
-
-fn apply_request(workspace: &WorkspaceRoot, request: &Request) -> Result<AppliedRequest, String> {
+fn apply_request(workspace: &WorkspaceRoot, request: &Request) -> AppliedRequest {
     let mut errors = Vec::new();
+    let mut outcomes = Vec::with_capacity(request.operations.len());
 
     for (index, operation) in request.operations.iter().enumerate() {
-        if let Err(message) = apply_operation(workspace, operation) {
-            errors.push(format!("{} {}", index + 1, compact_error(&message)));
+        let operation_index = index + 1;
+        let observation = match OperationObservation::capture(workspace, operation) {
+            Ok(observation) => observation,
+            Err(message) => {
+                errors.push(format!("{operation_index} {}", compact_error(&message)));
+                outcomes.push(EditOperationOutcome::Failed {
+                    operation_index,
+                    message,
+                });
+                continue;
+            }
+        };
+        match apply_operation(workspace, operation) {
+            Ok(()) => outcomes.push(EditOperationOutcome::Succeeded(
+                observation.file_change(),
+            )),
+            Err(message) => {
+                errors.push(format!("{operation_index} {}", compact_error(&message)));
+                if observation.mutated() {
+                    outcomes.push(EditOperationOutcome::PartiallySucceeded {
+                        operation_index,
+                        change: observation.file_change(),
+                        message,
+                    });
+                } else {
+                    outcomes.push(EditOperationOutcome::Failed {
+                        operation_index,
+                        message,
+                    });
+                }
+            }
         }
     }
 
-    if errors.is_empty() {
-        return Ok(AppliedRequest {
-            model_output: "ok".to_string(),
-            display_output: "ok".to_string(),
-        });
+    let model_output = if errors.is_empty() {
+        "ok".to_string()
+    } else {
+        let mut output = String::from("edit errors\n");
+        output.push_str(&errors.join("\n"));
+        output.push('\n');
+        output
+    };
+    AppliedRequest {
+        model_output,
+        result: EditFileResult {
+            operations: outcomes,
+        },
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileSnapshot {
+    exists: bool,
+    bytes: Option<Vec<u8>>,
+}
+
+impl FileSnapshot {
+    fn capture(path: &Path) -> Self {
+        let Ok(metadata) = fs::symlink_metadata(path) else {
+            return Self {
+                exists: false,
+                bytes: None,
+            };
+        };
+        Self {
+            exists: true,
+            bytes: metadata.is_file().then(|| fs::read(path).ok()).flatten(),
+        }
     }
 
-    let mut model_output = String::from("edit errors\n");
-    model_output.push_str(&errors.join("\n"));
-    if !model_output.ends_with('\n') {
-        model_output.push('\n');
+    fn text(&self) -> Option<&str> {
+        self.bytes
+            .as_deref()
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
     }
-    Ok(AppliedRequest {
-        model_output: model_output.clone(),
-        display_output: model_output,
-    })
+}
+
+struct OperationObservation {
+    kind: FileChangeKind,
+    old_path: Option<String>,
+    new_path: Option<String>,
+    old_file: Option<PathBuf>,
+    new_file: Option<PathBuf>,
+    old_before: FileSnapshot,
+    new_before: FileSnapshot,
+}
+
+impl OperationObservation {
+    fn capture(workspace: &WorkspaceRoot, operation: &Operation) -> Result<Self, String> {
+        let (kind, old_path, new_path) = match operation {
+            Operation::Add { path, .. } => (FileChangeKind::Added, None, Some(path.clone())),
+            Operation::Remove { path } => (FileChangeKind::Removed, Some(path.clone()), None),
+            Operation::Move { from, to } => {
+                (FileChangeKind::Moved, Some(from.clone()), Some(to.clone()))
+            }
+            Operation::Edit { path, .. } => (
+                FileChangeKind::Modified,
+                Some(path.clone()),
+                Some(path.clone()),
+            ),
+        };
+        let old_file = old_path
+            .as_deref()
+            .map(|path| resolve_path(workspace, path))
+            .transpose()?;
+        let new_file = new_path
+            .as_deref()
+            .map(|path| resolve_path(workspace, path))
+            .transpose()?;
+        let old_before = old_file
+            .as_deref()
+            .map(FileSnapshot::capture)
+            .unwrap_or(FileSnapshot {
+                exists: false,
+                bytes: None,
+            });
+        let new_before = new_file
+            .as_deref()
+            .map(FileSnapshot::capture)
+            .unwrap_or(FileSnapshot {
+                exists: false,
+                bytes: None,
+            });
+        Ok(Self {
+            kind,
+            old_path,
+            new_path,
+            old_file,
+            new_file,
+            old_before,
+            new_before,
+        })
+    }
+
+    fn after(&self) -> (FileSnapshot, FileSnapshot) {
+        let old = self
+            .old_file
+            .as_deref()
+            .map(FileSnapshot::capture)
+            .unwrap_or(FileSnapshot {
+                exists: false,
+                bytes: None,
+            });
+        let new = self
+            .new_file
+            .as_deref()
+            .map(FileSnapshot::capture)
+            .unwrap_or(FileSnapshot {
+                exists: false,
+                bytes: None,
+            });
+        (old, new)
+    }
+
+    fn mutated(&self) -> bool {
+        let (old_after, new_after) = self.after();
+        self.old_before != old_after || self.new_before != new_after
+    }
+
+    fn file_change(&self) -> FileChange {
+        let (_, new_after) = self.after();
+        let old = match self.kind {
+            FileChangeKind::Added => "",
+            FileChangeKind::Removed | FileChangeKind::Moved | FileChangeKind::Modified => {
+                self.old_before.text().unwrap_or("")
+            }
+        };
+        let new = match self.kind {
+            FileChangeKind::Removed => "",
+            FileChangeKind::Added | FileChangeKind::Moved | FileChangeKind::Modified => {
+                new_after.text().unwrap_or("")
+            }
+        };
+        let (hunks, additions, deletions) = line_diff(old, new);
+        FileChange {
+            kind: self.kind,
+            old_path: self.old_path.clone(),
+            new_path: self.new_path.clone(),
+            hunks,
+            additions,
+            deletions,
+        }
+    }
+}
+
+fn line_diff(old: &str, new: &str) -> (Vec<DiffHunk>, usize, usize) {
+    let diff = TextDiff::from_lines(old, new);
+    let mut additions = 0;
+    let mut deletions = 0;
+    let hunks = diff
+        .grouped_ops(3)
+        .into_iter()
+        .filter_map(|operations| {
+            let first = operations.first()?;
+            let last = operations.last()?;
+            let old_start = first.old_range().start + 1;
+            let old_count = last.old_range().end.saturating_sub(first.old_range().start);
+            let new_start = first.new_range().start + 1;
+            let new_count = last.new_range().end.saturating_sub(first.new_range().start);
+            let mut lines = Vec::new();
+            for operation in operations {
+                for change in diff.iter_changes(&operation) {
+                    let kind = match change.tag() {
+                        ChangeTag::Equal => DiffLineKind::Context,
+                        ChangeTag::Delete => {
+                            deletions += 1;
+                            DiffLineKind::Removed
+                        }
+                        ChangeTag::Insert => {
+                            additions += 1;
+                            DiffLineKind::Added
+                        }
+                    };
+                    lines.push(DiffLine {
+                        kind,
+                        text: change.value().trim_end_matches(['\r', '\n']).to_owned(),
+                        old_line: change.old_index().map(|line| line + 1),
+                        new_line: change.new_index().map(|line| line + 1),
+                    });
+                }
+            }
+            Some(DiffHunk {
+                old_start,
+                old_count,
+                new_start,
+                new_count,
+                lines,
+            })
+        })
+        .collect();
+    (hunks, additions, deletions)
 }
 
 fn compact_error(message: &str) -> String {
@@ -340,6 +520,12 @@ fn resolve_existing_path(workspace: &WorkspaceRoot, path: &str) -> Result<PathBu
             msg.push_str(&format!("\nFiles in `{}`:", correction.deepest_prefix,));
             for entry in &correction.listing {
                 msg.push_str(&format!("\n  {entry}"));
+            }
+            if correction.omitted_entries > 0 {
+                msg.push_str(&format!(
+                    "\n  [... {} additional entries omitted]",
+                    correction.omitted_entries
+                ));
             }
         }
         msg.push('\n');

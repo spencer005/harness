@@ -1,10 +1,12 @@
 //! Capability-rooted workspace inspection.
 
-use std::{fs, path::PathBuf, pin::Pin, sync::Arc};
+use std::{path::PathBuf, pin::Pin};
 
 use harness_tool_api::{
-    InvalidToolName, ToolCapabilities, ToolExecutionRequest, ToolExecutor, ToolFailure, ToolInput,
-    ToolPresentation, ToolResult, ToolSpec,
+    InspectJobOutcome, InspectJobRequest, InspectJobSuccess, InspectRequest, InspectResult,
+    LineRange, Prepared, ToolCapabilities, ToolExecutionFailure, ToolExecutionRequest,
+    ToolExecutor, ToolFailure, ToolFailureCategory, ToolInvocation, ToolOutcome,
+    ToolPreparationRequest, ToolResult, ToolSpec, InvalidToolName,
 };
 
 use crate::WorkspaceRoot;
@@ -20,7 +22,6 @@ mod shell;
 mod stat;
 mod strings;
 mod which;
-pub use read::{format_read_display, format_read_output};
 pub use shell::{ShellWord, parse_shell_words};
 
 pub const NAME: &str = "inspect";
@@ -32,7 +33,7 @@ read <path> [range ...] — Print file lines. Ranges are `start+count` or `start
 
 list [path] [--depth <n>] [--exact] — List directory entries. Direct children are shown by default; directories end in `/`, symlinks use `->`, text files show line counts, and other files show rounded whole-unit sizes. `--exact` also shows exact byte sizes for text files and uses exact sizes for other files. Output is limited to 500 entries.
 
-stat <path> [path ...] [--exact] [--metadata] — Show stat-like size, modification time, and permissions without following symlinks. `--exact` prints exact byte sizes and subsecond timestamps. `--metadata` includes uncommon ownership, inode, device, link, access/change time, and block fields.
+stat <path> [path ...] [--metadata] — Show stat-like size, modification time, and permissions without following symlinks. `--metadata` includes uncommon ownership, inode, device, link, access/change time, and block fields.
 
 bytes <path> <offset>+<length> — Read a bounded byte range as contiguous lowercase hex without separators. Recognize it; don't decode it. Your immediate read is usually right. Decode byte by byte only to resolve ambiguity or verify an exact detail. Reads are limited to 16384 bytes; offsets and requested lengths use exact byte counts, while total size uses a rounded whole-unit representation.
 
@@ -42,7 +43,7 @@ strings <path> [literal] — Index printable UTF-8 runs of at least four charact
 
 elf <path> [summary|sections|segments|symbols [literal]|relocations [literal]|dynamic [literal]|address <virtual>|offset <file>] — Inspect ELF structure without disassembling. The default summary reports class, architecture, endianness, kind, entry mapping, and interpreter. Other queries report exact file/virtual ranges, symbols, relocations, dynamic tags/imports, or translate between virtual addresses and file offsets. Symbol, relocation, and dynamic literals filter output.
 
-search <pattern> [path ...] — Regex search; returns matches with file names grouped once and line numbers. Patterns with regex metacharacters are treated as regex; plain identifiers are literal. Example: `search fn .*(needle|pin) src tests` or `search TODO src --exclude *.generated.rs`. Options: `-F` literal, `-i` ignore-case, `-g/--glob <glob>` include filter, `--exclude <glob>` exclude filter (repeatable), `--files` list paths.
+search <pattern> [path/glob ...] — Regex search; returns matches with file names grouped once and line numbers. Positional wildcards constrain paths without shell expansion. Common `rg` forms are supported: `-e/--regexp`, `-F/--fixed-strings`, `-i/--ignore-case`, `-s/--case-sensitive`, `-S/--smart-case`, `-g/--glob`, `-l/--files-with-matches`, `--exclude`, `--files`, and `--`. `--files` lists searchable paths without requiring a pattern. Output defaults to 100 results; use `--max <n>` to change it.
 
 which <query> — Fuzzy-search executable commands in PATH and print command names with resolved paths.
 
@@ -56,23 +57,9 @@ pwd — Print working directory."#;
 
 pub const LARK_GRAMMAR: &str = "start: command\ncommand: /(?s).+/";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InspectReadOutputRequest {
-    pub path: String,
-    pub start_line: usize,
-    pub line_count: usize,
-}
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InspectReadNextRecord {
-    pub start_line: usize,
-    pub line_count: usize,
-}
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InspectReadDisplayRecord {
-    pub path: String,
-    pub start_line: usize,
-    pub lines: Vec<String>,
-    pub next: Option<InspectReadNextRecord>,
+pub(super) struct InspectCommandOutput {
+    model: String,
+    result: InspectJobSuccess,
 }
 
 pub fn edit_line_hash(line: &str) -> u8 {
@@ -121,41 +108,73 @@ impl Executor {
     }
 }
 
-::inventory::submit! {
-    crate::inventory::ToolRegistration {
-        spec,
-        executor: |workspace| Arc::new(Executor::new(workspace)),
-    }
-}
 impl ToolExecutor for Executor {
+    fn prepare(&self, request: ToolPreparationRequest) -> Result<ToolInvocation, ToolFailure> {
+        if request.tool.as_str() != NAME || request.route.identifier != NAME {
+            return Err(ToolFailure::Execution(format!(
+                "executor route does not match `{NAME}` for tool {}",
+                request.tool.as_str()
+            )));
+        }
+        let input = match request.input.decode_freeform() {
+            Ok(input) => input,
+            Err(error) => {
+                return Ok(ToolInvocation::Inspect(Prepared::Rejected(
+                    harness_tool_api::ToolInputRejection {
+                        message: error.to_string(),
+                    },
+                )));
+            }
+        };
+        let prepared = match prepare_input(&input) {
+            Ok(request) => Prepared::Ready(request),
+            Err(message) => {
+                Prepared::Rejected(harness_tool_api::ToolInputRejection { message })
+            }
+        };
+        Ok(ToolInvocation::Inspect(prepared))
+    }
+
     fn execute(
         &self,
         request: ToolExecutionRequest,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<ToolResult, ToolFailure>> + Send + '_>>
     {
         if request.tool.as_str() != NAME || request.route.identifier != NAME {
-            return Box::pin(std::future::ready(Err(ToolFailure::Execution(
-                "executor route does not match `inspect`".into(),
-            ))));
+            return Box::pin(std::future::ready(Err(ToolFailure::Execution(format!(
+                "executor route does not match `{NAME}` for tool {}",
+                request.tool.as_str()
+            )))));
         }
 
         let workspace = self.workspace.clone();
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || execute(&workspace, &request.input))
+            let prepared = match request.invocation {
+                ToolInvocation::Inspect(Prepared::Ready(prepared)) => prepared,
+                ToolInvocation::Inspect(Prepared::Rejected(rejection)) => {
+                    return Ok(rejected_result(rejection.message));
+                }
+                invocation => {
+                    return Err(ToolFailure::Execution(format!(
+                        "`{NAME}` received prepared invocation for `{}`",
+                        invocation.tool().name()
+                    )));
+                }
+            };
+            tokio::task::spawn_blocking(move || execute(&workspace, &prepared))
                 .await
-                .map_err(|error| ToolFailure::Execution(error.to_string()))?
+                .map_err(|error| ToolFailure::Execution(error.to_string()))
         })
     }
 }
 
-pub fn execute(workspace: &WorkspaceRoot, input: &ToolInput) -> Result<ToolResult, ToolFailure> {
-    let lines = input.as_str().lines().collect::<Vec<_>>();
+fn prepare_input(input: &str) -> Result<InspectRequest, String> {
+    let lines = input.lines().collect::<Vec<_>>();
     if lines.iter().all(|line| line.trim().is_empty()) {
-        return Err(ToolFailure::InvalidInput(
-            "failed to parse `inspect` input: at least one command is required".into(),
-        ));
+        return Err("failed to parse `inspect` input: at least one command is required".into());
     }
-    let mut output_text = String::new();
+
+    let mut jobs = Vec::new();
     let mut index = 0;
     while index < lines.len() {
         let line = lines[index].trim();
@@ -163,21 +182,18 @@ pub fn execute(workspace: &WorkspaceRoot, input: &ToolInput) -> Result<ToolResul
             index += 1;
             continue;
         }
+
         if let Some(header) = line.strip_prefix("read ") {
-            let mut header_words = parse_shell_words(header).map_err(|e| {
-                ToolFailure::InvalidInput(format!("failed to parse `inspect` read input: {e}"))
-            })?;
-            if header_words.is_empty() {
-                return Err(ToolFailure::InvalidInput(
-                    "failed to parse `inspect` input: read path is required".into(),
-                ));
+            let mut words = parse_shell_words(header)
+                .map_err(|error| format!("failed to parse `inspect` read input: {error}"))?;
+            if words.is_empty() {
+                return Err("failed to parse `inspect` input: read path is required".into());
             }
-            let path = header_words.remove(0);
-            let mut ranges = header_words
-                .into_iter()
+            let path = words.remove(0).value;
+            let mut ranges = words
+                .iter()
                 .map(|word| parse_range(&word.value))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(ToolFailure::InvalidInput)?;
+                .collect::<Result<Vec<_>, _>>()?;
             index += 1;
             while index < lines.len() {
                 let candidate = lines[index].trim();
@@ -188,91 +204,110 @@ pub fn execute(workspace: &WorkspaceRoot, input: &ToolInput) -> Result<ToolResul
                 if command_start(candidate) {
                     break;
                 }
-                ranges.push(parse_range(candidate).map_err(ToolFailure::InvalidInput)?);
+                ranges.push(parse_range(candidate)?);
                 index += 1;
             }
-            if ranges.is_empty() {
-                let (name, file) =
-                    resolve(workspace, &path.value).map_err(ToolFailure::InvalidInput)?;
-                let text = fs::read(&file)
-                    .map_err(|e| format!("inspect read {name}: {e}"))
-                    .and_then(|bytes| {
-                        String::from_utf8(bytes).map_err(|_| {
-                            format!("inspect read {name}: file is not UTF-8; use `bytes`")
-                        })
-                    })
-                    .map_err(ToolFailure::InvalidInput)?;
-                let total_lines = text.lines().count();
-                let hint = if total_lines > 1000 {
-                    format!(
-                        "\nfile has {total_lines} lines; read the rest with `read {name} 1001-end`\n"
-                    )
-                } else {
-                    String::new()
-                };
-                output_text.push_str(&format_read_output(
-                    &InspectReadOutputRequest {
-                        path: name,
-                        start_line: 1,
-                        line_count: 1000,
-                    },
-                    &text,
-                ));
-                output_text.push_str(&hint);
-                continue;
-            }
-            for (start, count) in ranges {
-                let (name, file) =
-                    resolve(workspace, &path.value).map_err(ToolFailure::InvalidInput)?;
-                let text = fs::read(&file)
-                    .map_err(|e| format!("inspect read {name}: {e}"))
-                    .and_then(|bytes| {
-                        String::from_utf8(bytes).map_err(|_| {
-                            format!("inspect read {name}: file is not UTF-8; use `bytes`")
-                        })
-                    })
-                    .map_err(ToolFailure::InvalidInput)?;
-                output_text.push_str(&format_read_output(
-                    &InspectReadOutputRequest {
-                        path: name,
-                        start_line: start,
-                        line_count: count,
-                    },
-                    &text,
-                ));
-            }
+            jobs.push(InspectJobRequest::Read(
+                harness_tool_api::InspectReadRequest { path, ranges },
+            ));
             continue;
         }
-        let words = parse_shell_words(line).map_err(|e| {
-            ToolFailure::InvalidInput(format!("failed to parse `inspect` input: {e}"))
-        })?;
-        output_text
-            .push_str(&execute_command(workspace, &words).map_err(ToolFailure::InvalidInput)?);
+
+        let words = parse_shell_words(line)
+            .map_err(|error| format!("failed to parse `inspect` input: {error}"))?;
+        jobs.push(prepare_command(&words)?);
         index += 1;
     }
-    Ok(output(output_text, "inspect"))
+
+    Ok(InspectRequest { jobs })
 }
 
-fn execute_command(workspace: &WorkspaceRoot, words: &[ShellWord]) -> Result<String, String> {
+fn prepare_command(words: &[ShellWord]) -> Result<InspectJobRequest, String> {
     let Some(command) = words.first().map(|word| word.value.as_str()) else {
-        return Ok(String::new());
+        return Err("failed to parse `inspect` input: command is required".into());
     };
+    let args = &words[1..];
     match command {
-        "pwd" if words.len() == 1 => Ok(format!("{}\n", workspace.path().display())),
-        "list" | "ls" => list::execute(workspace, &words[1..]),
-        "stat" => stat::execute(workspace, &words[1..]),
-        "bytes" => bytes::execute(workspace, &words[1..]),
-        "byte-search" => bytes::search(workspace, &words[1..]),
-        "strings" => strings::execute(workspace, &words[1..]),
-        "elf" => elf::execute(workspace, &words[1..]),
-        "search" => search::execute(workspace, &words[1..]),
-        "which" => which::execute(&words[1..]),
-        "check" => cargo::check(workspace, &words[1..]),
-        "test" => cargo::test(workspace, &words[1..]),
-        "ps" => process::execute(&words[1..]),
+        "read" => Err("failed to parse `inspect` input: usage: `read <path> [range ...]`".into()),
+        "list" => list::prepare(args).map(InspectJobRequest::List),
+        "stat" => stat::prepare(args).map(InspectJobRequest::Stat),
+        "bytes" => bytes::prepare(args).map(InspectJobRequest::Bytes),
+        "byte-search" => bytes::prepare_search(args).map(InspectJobRequest::ByteSearch),
+        "strings" => strings::prepare(args).map(InspectJobRequest::Strings),
+        "elf" => elf::prepare(args).map(InspectJobRequest::Elf),
+        "search" => search::prepare(args).map(InspectJobRequest::Search),
+        "which" => which::prepare(args).map(InspectJobRequest::Which),
+        "check" => cargo::prepare_check(args).map(InspectJobRequest::Check),
+        "test" => cargo::prepare_test(args).map(InspectJobRequest::Test),
+        "ps" => process::prepare(args).map(InspectJobRequest::Ps),
+        "pwd" if args.is_empty() => Ok(InspectJobRequest::Pwd),
+        "pwd" => Err("failed to parse `inspect` input: usage: `pwd`".into()),
         other => Err(format!(
             "failed to parse `inspect` input: unsupported command `{other}`"
         )),
+    }
+}
+
+fn execute(workspace: &WorkspaceRoot, request: &InspectRequest) -> ToolResult {
+    let mut model_output = String::new();
+    let mut jobs = Vec::with_capacity(request.jobs.len());
+    for job in &request.jobs {
+        match execute_job(workspace, job) {
+            Ok(output) => {
+                model_output.push_str(&output.model);
+                jobs.push(InspectJobOutcome::Succeeded(output.result));
+            }
+            Err(message) => {
+                model_output.push_str(&message);
+                if !message.ends_with('\n') {
+                    model_output.push('\n');
+                }
+                jobs.push(InspectJobOutcome::Failed(ToolExecutionFailure {
+                    category: ToolFailureCategory::Execution,
+                    message,
+                }));
+            }
+        }
+    }
+    ToolResult {
+        model_output,
+        outcome: ToolOutcome::Inspect(InspectResult { jobs }),
+    }
+}
+
+fn execute_job(
+    workspace: &WorkspaceRoot,
+    request: &InspectJobRequest,
+) -> Result<InspectCommandOutput, String> {
+    match request {
+        InspectJobRequest::Read(request) => read::execute(workspace, request),
+        InspectJobRequest::List(request) => list::execute(workspace, request),
+        InspectJobRequest::Stat(request) => stat::execute(workspace, request),
+        InspectJobRequest::Bytes(request) => bytes::execute(workspace, request),
+        InspectJobRequest::ByteSearch(request) => bytes::execute_search(workspace, request),
+        InspectJobRequest::Strings(request) => strings::execute(workspace, request),
+        InspectJobRequest::Elf(request) => elf::execute(workspace, request),
+        InspectJobRequest::Search(request) => search::execute(workspace, request),
+        InspectJobRequest::Which(request) => which::execute(request),
+        InspectJobRequest::Check(request) => cargo::check(workspace, request),
+        InspectJobRequest::Test(request) => cargo::test(workspace, request),
+        InspectJobRequest::Ps(request) => process::execute(request),
+        InspectJobRequest::Pwd => Ok(InspectCommandOutput {
+            model: format!("{}\n", workspace.path().display()),
+            result: InspectJobSuccess::Pwd {
+                path: workspace.path().display().to_string(),
+            },
+        }),
+    }
+}
+
+fn rejected_result(message: String) -> ToolResult {
+    ToolResult {
+        model_output: message.clone(),
+        outcome: ToolOutcome::Failed(ToolExecutionFailure {
+            category: ToolFailureCategory::InvalidInput,
+            message,
+        }),
     }
 }
 
@@ -282,7 +317,6 @@ fn command_start(line: &str) -> bool {
         command,
         "pwd"
             | "list"
-            | "ls"
             | "stat"
             | "bytes"
             | "byte-search"
@@ -297,47 +331,41 @@ fn command_start(line: &str) -> bool {
     )
 }
 
-fn parse_range(value: &str) -> Result<(usize, usize), String> {
+fn parse_range(value: &str) -> Result<LineRange, String> {
     if let Some((start, count)) = value.split_once('+') {
-        let start = shell::parse_positive_usize_value(start).map_err(|_| {
+        let start_line = shell::parse_positive_usize_value(start).map_err(|_| {
             "failed to parse `inspect` input: range start must be a positive integer".to_string()
         })?;
-        let count = shell::parse_positive_usize_value(count).map_err(|_| {
+        let line_count = shell::parse_positive_usize_value(count).map_err(|_| {
             "failed to parse `inspect` input: range count must be a positive integer".to_string()
         })?;
-        return Ok((start, count));
+        return Ok(LineRange {
+            start_line,
+            line_count,
+        });
     }
     if let Some((start, end)) = value.split_once('-') {
-        let start = shell::parse_positive_usize_value(start).map_err(|_| {
+        let start_line = shell::parse_positive_usize_value(start).map_err(|_| {
             "failed to parse `inspect` input: range start must be a positive integer".to_string()
         })?;
-        let count = if end.eq_ignore_ascii_case("end") {
+        let line_count = if end.eq_ignore_ascii_case("end") {
             usize::MAX
         } else {
             let end = shell::parse_positive_usize_value(end).map_err(|_| {
                 "failed to parse `inspect` input: range end must be a positive integer or `end`"
                     .to_string()
             })?;
-            if end < start {
+            if end < start_line {
                 return Err("failed to parse `inspect` input: range end must be >= start".into());
             }
-            end - start + 1
+            end - start_line + 1
         };
-        return Ok((start, count));
+        return Ok(LineRange {
+            start_line,
+            line_count,
+        });
     }
     Err("failed to parse `inspect` input: range must be `start+count` or `start-end`".into())
-}
-
-fn output(text: impl Into<String>, label: &str) -> ToolResult {
-    let text = text.into();
-    ToolResult {
-        model_output: text.clone(),
-        presentation: Some(ToolPresentation {
-            label: label.into(),
-            display: Some(text),
-        }),
-        artifacts: Vec::new(),
-    }
 }
 fn resolve(workspace: &WorkspaceRoot, value: &str) -> Result<(String, PathBuf), String> {
     let relative = workspace
@@ -360,6 +388,12 @@ fn resolve(workspace: &WorkspaceRoot, value: &str) -> Result<(String, PathBuf), 
             for entry in &correction.listing {
                 msg.push_str(&format!("\n  {entry}"));
             }
+            if correction.omitted_entries > 0 {
+                msg.push_str(&format!(
+                    "\n  [... {} additional entries omitted]",
+                    correction.omitted_entries
+                ));
+            }
         }
         msg.push('\n');
         return Err(msg);
@@ -374,4 +408,34 @@ pub(crate) fn positive(value: &str, command: &str) -> Result<usize, String> {
         .ok()
         .filter(|v| *v > 0)
         .ok_or_else(|| format!("inspect {command}: expected a positive integer"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_path_fallback_bounds_files_in_workspace_listing() {
+        let root =
+            std::env::temp_dir().join(format!("inspect-path-fallback-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        for index in 0..40 {
+            std::fs::write(root.join(format!("file-{index:02}.txt")), "").unwrap();
+        }
+        let workspace = WorkspaceRoot::open(&root).unwrap();
+
+        let error = resolve(&workspace, "file-99.txt").unwrap_err();
+
+        assert!(error.contains("Files in `.`:"));
+        assert_eq!(
+            error
+                .lines()
+                .filter(|line| line.starts_with("  file-"))
+                .count(),
+            25
+        );
+        assert!(error.contains("[... 15 additional entries omitted]"));
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

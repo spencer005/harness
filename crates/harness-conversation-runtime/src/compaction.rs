@@ -122,6 +122,34 @@ impl CompactionCoordinator {
         }
     }
 
+    /// Discards partial output while preserving the source for an explicit redo.
+    pub fn fail(&mut self) -> Result<(), CompactionStateError> {
+        let state = std::mem::replace(&mut self.state, CompactionState::Cancelled);
+        match state {
+            CompactionState::Running { draft } => {
+                self.state = CompactionState::Failed {
+                    source: draft.source,
+                    instruction: draft.instruction,
+                };
+                Ok(())
+            }
+            CompactionState::Failed {
+                source,
+                instruction,
+            } => {
+                self.state = CompactionState::Failed {
+                    source,
+                    instruction,
+                };
+                Ok(())
+            }
+            other => {
+                self.state = other;
+                Err(CompactionStateError::NotActive)
+            }
+        }
+    }
+
     /// Finishes the model response and stages a validated result.
     pub fn finish(&mut self) -> Result<&ValidatedCompaction, CompactionValidationError> {
         let state = std::mem::replace(&mut self.state, CompactionState::Cancelled);
@@ -358,6 +386,27 @@ mod tests {
         coordinator.finish().unwrap();
         let committed = coordinator.commit().unwrap();
         assert_eq!(committed.source.revision, 7);
+    }
+
+    #[test]
+    fn interrupted_compaction_discards_partial_output_before_redo() {
+        let source = CompactionSource {
+            revision: 11,
+            history: Vec::new(),
+        };
+        let mut interrupted =
+            CompactionCoordinator::begin(source.clone(), "retain decisions".into()).unwrap();
+        interrupted.push_delta("partial output").unwrap();
+        interrupted.fail().unwrap();
+        assert_eq!(interrupted.source(), Some(&source));
+
+        interrupted.redo().unwrap();
+        interrupted
+            .push_delta("Goal: retain the current task, decisions, and unresolved work.")
+            .unwrap();
+        interrupted.finish().unwrap();
+
+        assert_eq!(interrupted.commit().unwrap().source.revision, 11);
     }
 
     #[test]

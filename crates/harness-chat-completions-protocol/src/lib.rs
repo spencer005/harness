@@ -22,22 +22,18 @@ pub fn encode_request(attempt: &ModelAttempt) -> Result<Value, ChatCompletionsPr
         .tools
         .iter()
         .map(|tool| {
+            let description = tool.function_compatibility_description();
             let parameters = match &tool.input_schema {
                 ToolInputSchema::JsonSchema(schema) => {
                     sonic_rs::from_str(schema.as_str())
                         .map_err(ChatCompletionsProtocolError::InvalidToolSchema)?
                 }
-                ToolInputSchema::FreeformGrammar {
-                    syntax,
-                    definition,
-                } => json!({
+                ToolInputSchema::FreeformGrammar { .. } => json!({
                     "type": "object",
                     "properties": {
                         "input": {
                             "type": "string",
-                            "description": format!(
-                                "Exact freeform tool input. Grammar syntax: {syntax:?}. Native tool instructions:\n{definition}"
-                            )
+                            "description": "Complete raw tool input, passed as one JSON string exactly as specified by the function description."
                         }
                     },
                     "required": ["input"],
@@ -48,7 +44,7 @@ pub fn encode_request(attempt: &ModelAttempt) -> Result<Value, ChatCompletionsPr
                 "type": "function",
                 "function": {
                     "name": tool.name.as_str(),
-                    "description": tool.description,
+                    "description": description,
                     "parameters": parameters
                 }
             }))
@@ -165,12 +161,34 @@ fn encode_messages(input: &[ModelInput]) -> Result<Vec<Value>, ChatCompletionsPr
                 encrypted_content: _,
                 summary,
             } => {
-                pending_reasoning = Some((content.clone(), summary.clone()));
+                match &mut pending_reasoning {
+                    Some((pending_content, pending_summary)) => {
+                        if let Some(content) = content {
+                            pending_content
+                                .get_or_insert_with(String::new)
+                                .push_str(content);
+                        }
+                        if let Some(summary) = summary {
+                            pending_summary
+                                .get_or_insert_with(String::new)
+                                .push_str(summary);
+                        }
+                    }
+                    None => {
+                        pending_reasoning = Some((content.clone(), summary.clone()));
+                    }
+                }
                 index += 1;
             }
         }
     }
     Ok(messages)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolCallEncoding {
+    FunctionJson,
+    WrappedFreeform,
 }
 
 /// Incrementally decodes one streamed Chat Completions response.
@@ -181,7 +199,7 @@ pub struct ChatEventDecoder {
     usage: Option<ModelUsage>,
     response_id: Option<String>,
     finish_reason: Option<String>,
-    freeform_tools: std::collections::BTreeSet<String>,
+    tool_call_encodings: BTreeMap<String, ToolCallEncoding>,
     tool_calls: BTreeMap<u64, PartialToolCall>,
     started: bool,
     terminal_seen: bool,
@@ -195,7 +213,7 @@ struct PartialToolCall {
 }
 
 impl ChatEventDecoder {
-    /// Creates a decoder without advertised freeform tools.
+    /// Creates a decoder without advertised tools.
     pub fn new() -> Self {
         Self::with_tools(DEFAULT_MAX_EVENT_BYTES, &[]).expect("the default event limit is nonzero")
     }
@@ -205,10 +223,17 @@ impl ChatEventDecoder {
         max_event_bytes: usize,
         tools: &[harness_tool_api::ToolDefinition],
     ) -> Result<Self, InvalidEventLimit> {
-        let freeform_tools = tools
+        let tool_call_encodings = tools
             .iter()
-            .filter(|tool| matches!(tool.input_schema, ToolInputSchema::FreeformGrammar { .. }))
-            .map(|tool| tool.name.as_str().to_owned())
+            .map(|tool| {
+                let encoding = match &tool.input_schema {
+                    ToolInputSchema::FreeformGrammar { .. } => {
+                        ToolCallEncoding::WrappedFreeform
+                    }
+                    ToolInputSchema::JsonSchema(_) => ToolCallEncoding::FunctionJson,
+                };
+                (tool.name.as_str().to_owned(), encoding)
+            })
             .collect();
         Ok(Self {
             sse: SseDecoder::new(max_event_bytes)?,
@@ -216,7 +241,7 @@ impl ChatEventDecoder {
             usage: None,
             response_id: None,
             finish_reason: None,
-            freeform_tools,
+            tool_call_encodings,
             tool_calls: BTreeMap::new(),
             started: false,
             terminal_seen: false,
@@ -389,17 +414,21 @@ impl ChatEventDecoder {
                 .ok_or(ChatCompletionsProtocolError::InvalidField(
                     "tool_calls.function.name",
                 ))?;
-            let input = if self.freeform_tools.contains(&name) {
-                let wrapped: Value = sonic_rs::from_str(&partial.arguments)
-                    .map_err(ChatCompletionsProtocolError::InvalidFreeformArguments)?;
-                let input = wrapped.get("input").and_then(Value::as_str).ok_or(
-                    ChatCompletionsProtocolError::InvalidField(
-                        "tool_calls.function.arguments.input",
-                    ),
-                )?;
-                ToolInput::Freeform(input.to_owned())
-            } else {
-                ToolInput::FunctionJson(partial.arguments)
+            let encoding = self.tool_call_encodings.get(&name).ok_or_else(|| {
+                ChatCompletionsProtocolError::UnadvertisedToolCall { name: name.clone() }
+            })?;
+            let input = match encoding {
+                ToolCallEncoding::WrappedFreeform => {
+                    let wrapped: Value = sonic_rs::from_str(&partial.arguments)
+                        .map_err(ChatCompletionsProtocolError::InvalidFreeformArguments)?;
+                    let input = wrapped.get("input").and_then(Value::as_str).ok_or(
+                        ChatCompletionsProtocolError::InvalidField(
+                            "tool_calls.function.arguments.input",
+                        ),
+                    )?;
+                    ToolInput::Freeform(input.to_owned())
+                }
+                ToolCallEncoding::FunctionJson => ToolInput::FunctionJson(partial.arguments),
             };
             events.push(ModelEvent::ToolCall(ToolCall {
                 call_id,
@@ -429,6 +458,11 @@ pub enum ChatCompletionsProtocolError {
     /// SSE framing fails.
     #[error(transparent)]
     Sse(#[from] SseDecodeError),
+    /// A response calls a tool that was not advertised by this request.
+    #[error(
+        "Chat Completions provider returned a call for unadvertised tool `{name}`; valid tool calls must name a tool advertised by this request"
+    )]
+    UnadvertisedToolCall { name: String },
     /// JSON parsing fails.
     #[error("JSON parsing fails: {0}")]
     Json(#[from] sonic_rs::Error),
@@ -453,4 +487,60 @@ pub enum ChatCompletionsProtocolError {
     /// Data arrives after a terminal outcome.
     #[error("Chat Completions stream contains data after its terminal outcome")]
     EventAfterTerminal,
+}
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use harness_model_api::{
+        ModelAttemptId, ModelRequest, ModelRequestId, ModelSelection, ProviderGeneration,
+        ProviderId,
+    };
+
+    use super::*;
+
+    #[test]
+    fn adjacent_reasoning_items_are_preserved_in_one_chat_message() {
+        let provider = ProviderId::new("chat").unwrap();
+        let attempt = ModelAttempt::initial(
+            Arc::new(ModelRequest {
+                request_id: ModelRequestId(1),
+                context_usage: None,
+                provider_generation: ProviderGeneration(1),
+                history_revision: 1,
+                selection: ModelSelection::new(provider, "model", None, None),
+                input: Arc::from([
+                    ModelInput::Reasoning {
+                        content: Some("raw one ".to_string()),
+                        encrypted_content: None,
+                        summary: Some("plan one ".to_string()),
+                    },
+                    ModelInput::Reasoning {
+                        content: Some("raw two".to_string()),
+                        encrypted_content: None,
+                        summary: Some("plan two".to_string()),
+                    },
+                    ModelInput::Message {
+                        role: ModelMessageRole::Assistant,
+                        text: "answer".to_string(),
+                    },
+                ]),
+                tools: Arc::from([]),
+                previous_response_id: None,
+            }),
+            ModelAttemptId(1),
+        );
+
+        let body = encode_request(&attempt).unwrap();
+
+        assert_eq!(
+            body["messages"][0]["reasoning_content"].as_str(),
+            Some("raw one raw two")
+        );
+        assert_eq!(
+            body["messages"][0]["reasoning_summary"].as_str(),
+            Some("plan one plan two")
+        );
+        assert_eq!(body["messages"][0]["content"].as_str(), Some("answer"));
+    }
 }

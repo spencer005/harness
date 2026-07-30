@@ -6,7 +6,7 @@ use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Position, Rect},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, StatefulWidget, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
 use crate::{
@@ -161,6 +161,18 @@ impl PreparedFrame {
         let r = usize::from(point.y.saturating_sub(self.areas.transcript_content.y));
         let c = usize::from(point.x.saturating_sub(self.areas.transcript_content.x));
         self.transcript.position_at(r, c)
+    }
+    /// Resolves a mouse press on a tool activity disclosure marker.
+    pub(crate) fn transcript_tool_disclosure(
+        &self,
+        point: Position,
+    ) -> Option<crate::transcript::TranscriptEntryId> {
+        if !contains(self.areas.transcript_content, point) {
+            return None;
+        }
+        let row = usize::from(point.y.saturating_sub(self.areas.transcript_content.y));
+        let cell = usize::from(point.x.saturating_sub(self.areas.transcript_content.x));
+        self.transcript.tool_disclosure_at(row, cell)
     }
 
     /// Returns whether a mouse event is inside the transcript text area.
@@ -1161,9 +1173,6 @@ fn render_message_editor_overlay(frame: &mut Frame<'_>, prepared: &PreparedFrame
             let role = match &message.role {
                 harness_runtime_api::EditableMessageRole::User => "user".to_string(),
                 harness_runtime_api::EditableMessageRole::Assistant => "assistant".to_string(),
-                harness_runtime_api::EditableMessageRole::Tool { name } => {
-                    format!("tool {name}")
-                }
             };
             let text = message.text.replace(['\r', '\n'], " ");
             ListItem::new(Line::from(Span::styled(

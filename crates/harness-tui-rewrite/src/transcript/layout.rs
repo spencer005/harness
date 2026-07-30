@@ -241,7 +241,7 @@ impl TranscriptLayoutCache {
             .document
             .clone();
         let laid_out = match entry.payload() {
-            crate::domain::TranscriptPayload::ToolOutput { .. } => {
+            crate::domain::TranscriptPayload::ToolActivity(_) => {
                 projection.bound(DocumentLimits::TOOL_OUTPUT).layout(width)
             }
             _ => projection.layout(width),
@@ -267,7 +267,7 @@ impl TranscriptLayoutCache {
         if current {
             return;
         }
-        let projection = presentation::project(entry.payload());
+        let projection = presentation::project(entry.payload(), entry.tool_expanded());
         let selection_text = projection.selectable_text();
         self.projections.insert(
             id,

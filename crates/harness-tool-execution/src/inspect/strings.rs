@@ -1,13 +1,14 @@
 use std::fs;
 
-use super::{ShellWord, resolve};
-pub(crate) fn execute(
-    workspace: &super::WorkspaceRoot,
-    args: &[ShellWord],
-) -> Result<String, String> {
-    let mut path_arg: Option<String> = None;
-    let mut literal: Option<String> = None;
-    let mut max = 100usize;
+use harness_tool_api::{
+    InspectJobSuccess, InspectStringMatch, InspectStringsRequest, InspectStringsResult,
+};
+
+use super::{InspectCommandOutput, ShellWord, resolve};
+
+pub(crate) fn prepare(args: &[ShellWord]) -> Result<InspectStringsRequest, String> {
+    let mut positional = Vec::new();
+    let mut maximum_results = 100usize;
     let mut index = 0;
     while index < args.len() {
         match args[index].value.as_str() {
@@ -16,31 +17,37 @@ pub(crate) fn execute(
                 let value = args
                     .get(index)
                     .ok_or("failed to parse `inspect` input: `--max` needs a value")?;
-                max = super::positive(&value.value, "strings --max")?;
-                index += 1;
+                maximum_results = super::positive(&value.value, "strings --max")?;
             }
             value if value.starts_with('-') => {
-                index += 1;
+                return Err(format!(
+                    "failed to parse `inspect` strings input: unsupported option `{value}`"
+                ));
             }
-            value => {
-                if path_arg.is_none() {
-                    path_arg = Some(value.to_owned());
-                } else if literal.is_none() {
-                    literal = Some(value.to_owned());
-                }
-                index += 1;
-            }
+            value => positional.push(value.to_owned()),
         }
+        index += 1;
     }
-    let path =
-        path_arg.ok_or("failed to parse `inspect` input: usage: `strings <path> [literal]`")?;
-    let (_, path) = resolve(workspace, &path)?;
+    if positional.is_empty() || positional.len() > 2 {
+        return Err("failed to parse `inspect` input: usage: `strings <path> [literal]`".into());
+    }
+    Ok(InspectStringsRequest {
+        path: positional.remove(0),
+        literal: positional.pop(),
+        maximum_results,
+    })
+}
+
+pub(crate) fn execute(
+    workspace: &super::WorkspaceRoot,
+    request: &InspectStringsRequest,
+) -> Result<InspectCommandOutput, String> {
+    let (name, path) = resolve(workspace, &request.path)?;
     let data = fs::read(&path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
-    let literal = literal.as_deref();
-    let mut out = String::new();
+    let mut matches = Vec::new();
     let mut run = Vec::new();
     let mut offset = 0usize;
-    let mut matches = 0;
+    let mut total_matches = 0;
     for (index, byte) in data
         .iter()
         .enumerate()
@@ -54,22 +61,41 @@ pub(crate) fn execute(
         } else {
             if run.len() >= 4 {
                 let text = String::from_utf8_lossy(&run);
-                if literal.is_none_or(|value| text.contains(value)) {
-                    if matches < max {
-                        out.push_str(&format!("{offset} {text}\n"));
+                if request
+                    .literal
+                    .as_deref()
+                    .is_none_or(|value| text.contains(value))
+                {
+                    if matches.len() < request.maximum_results {
+                        matches.push(InspectStringMatch {
+                            offset: offset as u64,
+                            text: text.into_owned(),
+                        });
                     }
-                    matches += 1;
+                    total_matches += 1;
                 }
             }
             run.clear();
         }
     }
-    if matches == 0 {
-        out.push_str("no results\n");
-    } else if matches > max {
-        out.push_str(&format!(
-            "[strings output truncated: showing first {max} results; use --max]\n"
+    let mut model = String::new();
+    for found in &matches {
+        model.push_str(&format!("{} {}\n", found.offset, found.text));
+    }
+    if total_matches == 0 {
+        model.push_str("no results\n");
+    } else if total_matches > matches.len() {
+        model.push_str(&format!(
+            "[strings output truncated: showing first {} results; use --max]\n",
+            request.maximum_results
         ));
     }
-    Ok(out)
+    Ok(InspectCommandOutput {
+        model,
+        result: InspectJobSuccess::Strings(InspectStringsResult {
+            path: name,
+            matches,
+            total_matches,
+        }),
+    })
 }

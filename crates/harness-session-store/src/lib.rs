@@ -9,6 +9,7 @@ use std::{
 };
 
 use thiserror::Error;
+use harness_tool_api::{ToolInvocation, ToolOutcome};
 
 /// Stable identity of a persisted session.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -132,20 +133,21 @@ pub enum SessionPayload {
         category: SessionErrorCategory,
         message: String,
     },
-    /// Tool call is durably accepted.
+/// A parsed tool invocation is durably accepted before execution.
     ToolCallAccepted {
         turn_id: u64,
         call_id: String,
-        name: String,
-        input: SessionToolInput,
+        invocation: ToolInvocation,
+        raw_input: SessionToolInput,
     },
-    /// Tool execution begins.
-    ToolExecutionStarted { turn_id: u64, call_id: String },
-    /// Tool execution finishes.
+    /// Tool execution finishes with independently replayable display data.
     ToolExecutionFinished {
         turn_id: u64,
         call_id: String,
-        output: String,
+        invocation: ToolInvocation,
+        outcome: ToolOutcome,
+        raw_input: SessionToolInput,
+        raw_output: String,
     },
     /// Turn reaches a terminal outcome.
     TurnFinished { turn_id: u64, outcome: TurnOutcome },
@@ -163,6 +165,8 @@ pub enum SessionPayload {
         provider: String,
         response_id: String,
     },
+    /// Cached response continuation must not reuse responses at or before this point.
+    PreviousResponseInvalidated { turn_id: u64 },
     /// Goal state persisted for continuous execution.
     Goal { instruction: String, state: String },
     /// Session closes.

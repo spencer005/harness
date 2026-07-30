@@ -168,6 +168,27 @@ pub enum SseDecodeError {
     InvalidUtf8(#[source] std::str::Utf8Error),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolCallEncoding {
+    FunctionJson,
+    Freeform,
+}
+
+fn tool_call_encodings(
+    tools: &[ToolDefinition],
+) -> std::collections::BTreeMap<String, ToolCallEncoding> {
+    tools
+        .iter()
+        .map(|tool| {
+            let encoding = match &tool.input_schema {
+                ToolInputSchema::FreeformGrammar { .. } => ToolCallEncoding::Freeform,
+                ToolInputSchema::JsonSchema(_) => ToolCallEncoding::FunctionJson,
+            };
+            (tool.name.as_str().to_owned(), encoding)
+        })
+        .collect()
+}
+
 /// Decoder state for one Responses model attempt.
 #[derive(Debug)]
 pub struct ResponsesEventDecoder {
@@ -177,26 +198,36 @@ pub struct ResponsesEventDecoder {
     terminal_seen: bool,
     created_response_id: Option<String>,
     confirmed_response_id: Option<String>,
+    last_stream_marker: Option<String>,
     /// `item_id -> call_id` learned from `response.output_item.added` frames for
     /// function/custom tool calls. Some providers omit `call_id` on
     /// `function_call_arguments.delta` / `custom_tool_call_input.delta` frames
     /// and only send `item_id`, while the later `response.output_item.done`
     /// frame carries the canonical `call_id`. Mapping back through `item_id`
     /// lets the runtime key tool-input deltas under the same identifier that
-    /// the completed `ToolCall` event will use, so the terminal event does not
-    /// trip `IncompleteToolInput` on a stale entry.
+    /// the completed `ToolCall` event will use.
     tool_call_ids: std::collections::HashMap<String, String>,
+    tool_call_encodings: std::collections::BTreeMap<String, ToolCallEncoding>,
 }
 
 impl ResponsesEventDecoder {
-    /// Creates a decoder with the default event-size limit.
+    /// Creates a decoder without any advertised tools.
     pub fn new() -> Self {
         Self::with_max_event_bytes(DEFAULT_MAX_EVENT_BYTES)
             .expect("the default event limit is nonzero")
     }
 
-    /// Creates a decoder with an explicit event-size limit.
+    /// Creates a decoder with an explicit event-size limit and no advertised tools.
     pub fn with_max_event_bytes(max_event_bytes: usize) -> Result<Self, InvalidEventLimit> {
+        Self::with_tools(max_event_bytes, &[])
+    }
+
+    /// Creates a decoder for the exact tools advertised by one request.
+    pub fn with_tools(
+        max_event_bytes: usize,
+        tools: &[ToolDefinition],
+    ) -> Result<Self, InvalidEventLimit> {
+        let tool_call_encodings = tool_call_encodings(tools);
         Ok(Self {
             sse: SseDecoder::new(max_event_bytes)?,
             assistant_text: String::new(),
@@ -204,9 +235,23 @@ impl ResponsesEventDecoder {
             terminal_seen: false,
             created_response_id: None,
             confirmed_response_id: None,
+            last_stream_marker: None,
             tool_call_ids: std::collections::HashMap::new(),
+            tool_call_encodings,
         })
     }
+    /// Returns the last decoded Responses event type or terminal stream marker.
+    pub fn last_stream_marker(&self) -> Option<&str> {
+        self.last_stream_marker.as_deref()
+    }
+    /// Returns the response identity observed in lifecycle or terminal events.
+    pub fn response_id(&self) -> Option<&str> {
+        self.confirmed_response_id
+            .as_deref()
+            .or(self.created_response_id.as_deref())
+    }
+
+
 
     /// Feeds network bytes and returns typed model events.
     pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<ModelEvent>, ProtocolError> {
@@ -230,6 +275,7 @@ impl ResponsesEventDecoder {
 
     fn decode_sse_event(&mut self, payload: &str) -> Result<Vec<ModelEvent>, ProtocolError> {
         if payload.trim() == "[DONE]" {
+            self.last_stream_marker = Some("[DONE]".to_owned());
             return Ok(Vec::new());
         }
 
@@ -238,6 +284,7 @@ impl ResponsesEventDecoder {
             .get("type")
             .and_then(Value::as_str)
             .ok_or(ProtocolError::MissingEventType)?;
+        self.last_stream_marker = Some(event_type.to_owned());
 
         if matches!(event_type, "response.created" | "response.in_progress") {
             let id = value
@@ -260,7 +307,7 @@ impl ResponsesEventDecoder {
             return Ok(events);
         }
 
-        if event_type == "response.completed" {
+        if matches!(event_type, "response.completed" | "response.done") {
             let completed_id = value
                 .get("response")
                 .and_then(|r| r.get("id"))
@@ -308,12 +355,18 @@ impl ResponsesEventDecoder {
                 .and_then(Value::as_str)
                 == Some("reasoning")
         {
+            let mut events = vec![ModelEvent::ReasoningStarted];
             let item = value
                 .get("item")
                 .ok_or(ProtocolError::InvalidField { field: "item" })?;
-            return Ok(vec![ModelEvent::ReasoningItem(decode_reasoning_item(
-                item,
-            )?)]);
+            let reasoning = decode_reasoning_item(item)?;
+            if reasoning.content.is_some()
+                || reasoning.encrypted_content.is_some()
+                || reasoning.summary.is_some()
+            {
+                events.push(ModelEvent::ReasoningItem(reasoning));
+            }
+            return Ok(events);
         }
 
         // Remember the canonical call_id that a tool item will use on its
@@ -393,7 +446,12 @@ impl ResponsesEventDecoder {
             return Ok(Vec::new());
         }
 
-        let event = match decode_event_value(&value, &mut self.assistant_text, &mut self.usage) {
+        let event = match decode_event_value(
+            &value,
+            &mut self.assistant_text,
+            &mut self.usage,
+            &self.tool_call_encodings,
+        ) {
             Ok(event) => event,
             Err(ProtocolError::UnsupportedEvent(event_type)) => {
                 return Ok(vec![ModelEvent::Warning(format!(
@@ -435,7 +493,7 @@ pub enum ProtocolError {
     /// SSE framing fails.
     #[error(transparent)]
     Sse(#[from] SseDecodeError),
-    /// A JSON payload cannot be decoded.
+    /// JSON parsing fails.
     #[error("Responses event is not valid JSON: {0}")]
     Json(#[from] serde_json::Error),
     /// A payload omits its event type.
@@ -444,9 +502,23 @@ pub enum ProtocolError {
     /// A payload uses an unsupported event type.
     #[error("unsupported Responses event type: {0}")]
     UnsupportedEvent(String),
-    /// A required event field is absent or has the wrong type.
+    /// A required field is absent or invalid.
     #[error("Responses event field `{field}` is missing or invalid")]
     InvalidField { field: &'static str },
+    /// A response calls a tool that was not advertised by this request.
+    #[error(
+        "Responses provider returned a call for unadvertised tool `{name}`; valid tool calls must name a tool advertised by this request"
+    )]
+    UnadvertisedToolCall { name: String },
+    /// A response uses a tool-call format different from the request's format.
+    #[error(
+        "Responses provider returned `{received}` for tool `{name}`, but this request advertised it as `{expected}`; return `{expected}` for this request"
+    )]
+    ToolCallFormatMismatch {
+        name: String,
+        expected: &'static str,
+        received: &'static str,
+    },
     /// More than one terminal outcome appears in one stream.
     #[error("Responses stream contains more than one terminal outcome")]
     DuplicateTerminal,
@@ -455,20 +527,23 @@ pub enum ProtocolError {
     InvalidToolSchema { name: String, reason: String },
 }
 
-/// Decodes one complete Responses JSON event.
+/// Decodes one complete Responses JSON event using the tools advertised by its request.
 pub fn decode_event(
     payload: &str,
     assistant_text: &mut String,
     usage: &mut Option<ModelUsage>,
+    tools: &[ToolDefinition],
 ) -> Result<ModelEvent, ProtocolError> {
     let value: Value = serde_json::from_str(payload)?;
-    decode_event_value(&value, assistant_text, usage)
+    let tool_call_encodings = tool_call_encodings(tools);
+    decode_event_value(&value, assistant_text, usage, &tool_call_encodings)
 }
 
 fn decode_event_value(
     value: &Value,
     assistant_text: &mut String,
     usage: &mut Option<ModelUsage>,
+    tool_call_encodings: &std::collections::BTreeMap<String, ToolCallEncoding>,
 ) -> Result<ModelEvent, ProtocolError> {
     let event_type = value
         .get("type")
@@ -478,15 +553,15 @@ fn decode_event_value(
     match event_type {
         "response.created" | "response.in_progress" => Ok(ModelEvent::Started),
         "response.output_text.delta" => {
-            let delta = string_field(&value, "delta")?;
+            let delta = string_field(value, "delta")?;
             assistant_text.push_str(delta);
             Ok(ModelEvent::AssistantTextDelta(delta.to_owned()))
         }
         "response.reasoning_summary_text.delta" => Ok(ModelEvent::ReasoningSummaryDelta(
-            string_field(&value, "delta")?.to_owned(),
+            string_field(value, "delta")?.to_owned(),
         )),
         "response.reasoning_text.delta" => Ok(ModelEvent::ReasoningContentDelta(
-            string_field(&value, "delta")?.to_owned(),
+            string_field(value, "delta")?.to_owned(),
         )),
         "response.function_call_arguments.delta" | "response.custom_tool_call_input.delta" => {
             Ok(ModelEvent::ToolInputDelta(ToolInputDelta {
@@ -496,12 +571,12 @@ fn decode_event_value(
                     .and_then(Value::as_str)
                     .ok_or(ProtocolError::InvalidField { field: "call_id" })?
                     .to_owned(),
-                fragment: string_field(&value, "delta")?.to_owned(),
+                fragment: string_field(value, "delta")?.to_owned(),
             }))
         }
-        "response.output_item.done" => decode_output_item(&value),
-        "response.completed" => {
-            *usage = extract_usage(&value);
+        "response.output_item.done" => decode_output_item(value, tool_call_encodings),
+        "response.completed" | "response.done" => {
+            *usage = extract_usage(value);
             Ok(ModelEvent::Terminal(ModelTerminalOutcome::Completed(
                 ModelCompletion {
                     text: std::mem::take(assistant_text),
@@ -511,7 +586,7 @@ fn decode_event_value(
         }
         "response.incomplete" => Ok(ModelEvent::Terminal(ModelTerminalOutcome::Interrupted(
             ModelInterruption {
-                reason: string_field(&value, "reason")
+                reason: string_field(value, "reason")
                     .unwrap_or("response became incomplete")
                     .to_owned(),
             },
@@ -541,42 +616,63 @@ fn decode_event_value(
     }
 }
 
-fn decode_output_item(value: &Value) -> Result<ModelEvent, ProtocolError> {
+fn decode_output_item(
+    value: &Value,
+    tool_call_encodings: &std::collections::BTreeMap<String, ToolCallEncoding>,
+) -> Result<ModelEvent, ProtocolError> {
     let item = value
         .get("item")
         .ok_or(ProtocolError::InvalidField { field: "item" })?;
-
-    match item.get("type").and_then(Value::as_str) {
-        Some("function_call") => {
-            let call_id = item
-                .get("call_id")
-                .or_else(|| item.get("id"))
-                .and_then(Value::as_str)
-                .ok_or(ProtocolError::InvalidField { field: "call_id" })?
-                .to_owned();
-            Ok(ModelEvent::ToolCall(ToolCall {
-                call_id,
-                name: string_field(item, "name")?.to_owned(),
-                input: ToolInput::FunctionJson(string_field(item, "arguments")?.to_owned()),
-            }))
-        }
-        Some("custom_tool_call") => {
-            let call_id = item
-                .get("call_id")
-                .or_else(|| item.get("id"))
-                .and_then(Value::as_str)
-                .ok_or(ProtocolError::InvalidField { field: "call_id" })?
-                .to_owned();
-            Ok(ModelEvent::ToolCall(ToolCall {
-                call_id,
-                name: string_field(item, "name")?.to_owned(),
-                input: ToolInput::Freeform(string_field(item, "input")?.to_owned()),
-            }))
-        }
-        Some("reasoning") => Ok(ModelEvent::ReasoningItem(decode_reasoning_item(item)?)),
-        Some(item_type) => Err(ProtocolError::UnsupportedEvent(item_type.to_owned())),
-        None => Err(ProtocolError::InvalidField { field: "item.type" }),
+    let item_type = item
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or(ProtocolError::InvalidField { field: "item.type" })?;
+    if item_type == "reasoning" {
+        return Ok(ModelEvent::ReasoningItem(decode_reasoning_item(item)?));
     }
+    if !matches!(item_type, "function_call" | "custom_tool_call") {
+        return Err(ProtocolError::UnsupportedEvent(item_type.to_owned()));
+    }
+
+    let name = string_field(item, "name")?.to_owned();
+    let encoding = tool_call_encodings
+        .get(&name)
+        .ok_or_else(|| ProtocolError::UnadvertisedToolCall { name: name.clone() })?;
+    let input = match (encoding, item_type) {
+        (ToolCallEncoding::FunctionJson, "function_call") => {
+            ToolInput::FunctionJson(string_field(item, "arguments")?.to_owned())
+        }
+        (ToolCallEncoding::Freeform, "custom_tool_call") => {
+            ToolInput::Freeform(string_field(item, "input")?.to_owned())
+        }
+        (ToolCallEncoding::FunctionJson, "custom_tool_call") => {
+            return Err(ProtocolError::ToolCallFormatMismatch {
+                name,
+                expected: "function_call",
+                received: "custom_tool_call",
+            });
+        }
+        (ToolCallEncoding::Freeform, "function_call") => {
+            return Err(ProtocolError::ToolCallFormatMismatch {
+                name,
+                expected: "custom_tool_call",
+                received: "function_call",
+            });
+        }
+        _ => unreachable!("tool item type was validated"),
+    };
+
+    let call_id = item
+        .get("call_id")
+        .or_else(|| item.get("id"))
+        .and_then(Value::as_str)
+        .ok_or(ProtocolError::InvalidField { field: "call_id" })?
+        .to_owned();
+    Ok(ModelEvent::ToolCall(ToolCall {
+        call_id,
+        name,
+        input,
+    }))
 }
 
 fn decode_reasoning_item(item: &Value) -> Result<ModelReasoning, ProtocolError> {
@@ -872,6 +968,43 @@ mod tests {
             .unwrap()
             .is_empty());
     }
+    #[test]
+    fn reasoning_item_lifecycle_preserves_multiple_block_starts() {
+        let mut decoder = ResponsesEventDecoder::new();
+
+        let first_start = decoder
+            .push(
+                b"data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"reasoning\",\"id\":\"r1\"}}\n\n",
+            )
+            .unwrap();
+        assert_eq!(first_start, vec![ModelEvent::ReasoningStarted]);
+
+        let first_delta = decoder
+            .push(
+                b"data: {\"type\":\"response.reasoning_summary_text.delta\",\"item_id\":\"r1\",\"delta\":\"first\"}\n\n",
+            )
+            .unwrap();
+        assert!(matches!(
+            first_delta.as_slice(),
+            [ModelEvent::ReasoningSummaryDelta(text)] if text == "first"
+        ));
+
+        let assistant = decoder
+            .push(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"answer\"}\n\n")
+            .unwrap();
+        assert!(matches!(
+            assistant.as_slice(),
+            [ModelEvent::AssistantTextDelta(text)] if text == "answer"
+        ));
+
+        let second_start = decoder
+            .push(
+                b"data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"reasoning\",\"id\":\"r2\"}}\n\n",
+            )
+            .unwrap();
+        assert_eq!(second_start, vec![ModelEvent::ReasoningStarted]);
+    }
+
  
     #[test]
     fn unknown_event_warns_and_does_not_stop_the_response_stream() {
@@ -902,6 +1035,26 @@ mod tests {
                 if completion.text == "still running"
         ));
     }
+ 
+    #[test]
+    fn websocket_done_event_completes_the_response() {
+        let mut decoder = ResponsesEventDecoder::new();
+        decoder
+            .push(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"complete\"}\n\n")
+            .unwrap();
+
+        let events = decoder
+            .push(b"data: {\"type\":\"response.done\",\"response\":{\"id\":\"done\"}}\n\n")
+            .unwrap();
+
+        assert!(matches!(
+            events.as_slice(),
+            [
+                ModelEvent::Metadata(_),
+                ModelEvent::Terminal(ModelTerminalOutcome::Completed(completion))
+            ] if completion.text == "complete"
+        ));
+    }
 
     #[test]
     fn done_sentinel_does_not_become_completion() {
@@ -929,7 +1082,16 @@ mod tests {
     /// `IncompleteToolInput` on the terminal event.
     #[test]
     fn tool_input_delta_keyed_by_item_id_is_remapped_to_call_id() {
-        let mut decoder = ResponsesEventDecoder::new();
+        let tool = ToolDefinition {
+            name: harness_tool_api::ToolName::new("lookup").unwrap(),
+            description: "Lookup".to_owned(),
+            input_schema: ToolInputSchema::JsonSchema(harness_tool_api::JsonSchema::new(
+                r#"{"type":"object"}"#,
+            )),
+            capabilities: Default::default(),
+        };
+        let mut decoder =
+            ResponsesEventDecoder::with_tools(DEFAULT_MAX_EVENT_BYTES, &[tool]).unwrap();
         // `added` carries both `id` (item_id) and `call_id`.
         decoder
             .push(b"data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"fc-1\",\"call_id\":\"call-xyz\",\"name\":\"lookup\"}}\n\n")
@@ -958,7 +1120,17 @@ mod tests {
     /// aligned so the runtime can clear the pending input on the done frame.
     #[test]
     fn tool_call_without_call_id_falls_back_to_item_id() {
-        let mut decoder = ResponsesEventDecoder::new();
+        let tool = ToolDefinition {
+            name: harness_tool_api::ToolName::new("shell").unwrap(),
+            description: "Shell".to_owned(),
+            input_schema: ToolInputSchema::FreeformGrammar {
+                syntax: GrammarSyntax::Lark,
+                definition: "start: command".to_owned(),
+            },
+            capabilities: Default::default(),
+        };
+        let mut decoder =
+            ResponsesEventDecoder::with_tools(DEFAULT_MAX_EVENT_BYTES, &[tool]).unwrap();
         let events = decoder
             .push(b"data: {\"type\":\"response.custom_tool_call_input.delta\",\"item_id\":\"ctc-1\",\"delta\":\"command: \"}\n\n")
             .unwrap();
@@ -1055,7 +1227,8 @@ mod tests {
         });
         let mut text = String::new();
         let mut usage = None;
-        let event = decode_event(&item_wrapper.to_string(), &mut text, &mut usage).unwrap();
+        let event =
+            decode_event(&item_wrapper.to_string(), &mut text, &mut usage, &[]).unwrap();
         if let ModelEvent::ReasoningItem(reasoning) = event {
             assert_eq!(reasoning.content.as_deref(), Some("raw reasoning step"));
             assert_eq!(

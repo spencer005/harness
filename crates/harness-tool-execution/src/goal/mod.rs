@@ -1,13 +1,12 @@
 //! Persisted-goal completion control.
 
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{future::Future, pin::Pin};
 
 use harness_tool_api::{
-    InvalidToolName, ToolCapabilities, ToolExecutionRequest, ToolExecutor, ToolFailure, ToolResult,
-    ToolSpec,
+    GoalRequest, InvalidToolName, Prepared, ToolCapabilities, ToolExecutionFailure,
+    ToolExecutionRequest, ToolExecutor, ToolFailure, ToolFailureCategory, ToolInvocation,
+    ToolOutcome, ToolPreparationRequest, ToolResult, ToolSpec,
 };
-
-use crate::WorkspaceRoot;
 
 /// Name of the persisted-goal control tool.
 pub const NAME: &str = "goal";
@@ -32,29 +31,53 @@ pub fn spec() -> Result<ToolSpec, InvalidToolName> {
 pub struct Executor;
 
 impl ToolExecutor for Executor {
+    fn prepare(&self, request: ToolPreparationRequest) -> Result<ToolInvocation, ToolFailure> {
+        if request.tool.as_str() != NAME || request.route.identifier != NAME {
+            return Err(ToolFailure::Execution(format!(
+                "executor route does not match `{NAME}` for tool {}",
+                request.tool.as_str()
+            )));
+        }
+        let input = match request.input.decode_freeform() {
+            Ok(input) => input,
+            Err(error) => {
+                return Ok(ToolInvocation::Goal(Prepared::Rejected(
+                    harness_tool_api::ToolInputRejection {
+                        message: error.to_string(),
+                    },
+                )));
+            }
+        };
+        let prepared = if input.trim() == "complete" {
+            Prepared::Ready(GoalRequest)
+        } else {
+            Prepared::Rejected(harness_tool_api::ToolInputRejection {
+                message: "goal expects exactly `complete`".into(),
+            })
+        };
+        Ok(ToolInvocation::Goal(prepared))
+    }
+
     fn execute(
         &self,
         request: ToolExecutionRequest,
     ) -> Pin<Box<dyn Future<Output = Result<ToolResult, ToolFailure>> + Send + '_>> {
-        let result = if request.input.as_str().trim() == "complete" {
-            Ok(ToolResult {
-                model_output: "No persisted goal is active. Do not call the `goal` tool again for this task. Provide the completed response directly as your final answer."
-                    .to_owned(),
-                presentation: None,
-                artifacts: Vec::new(),
-            })
-        } else {
-            Err(ToolFailure::InvalidInput(
-                "goal expects exactly `complete`".into(),
-            ))
+        let message = match request.invocation {
+            ToolInvocation::Goal(Prepared::Ready(_)) => "No persisted goal is active. Do not call the `goal` tool again for this task. Provide the completed response directly as your final answer.".to_owned(),
+            ToolInvocation::Goal(Prepared::Rejected(rejection)) => rejection.message,
+            invocation => {
+                return Box::pin(std::future::ready(Err(ToolFailure::Execution(format!(
+                    "`{NAME}` received prepared invocation for `{}`",
+                    invocation.tool().name()
+                )))));
+            }
         };
-        Box::pin(std::future::ready(result))
-    }
-}
-
-::inventory::submit! {
-    crate::inventory::ToolRegistration {
-        spec,
-        executor: |_workspace: WorkspaceRoot| Arc::new(Executor),
+        Box::pin(std::future::ready(Ok(ToolResult {
+            model_output: message.clone(),
+            outcome: ToolOutcome::Failed(ToolExecutionFailure {
+                category: ToolFailureCategory::InvalidInput,
+                message,
+            }),
+        })))
     }
 }
